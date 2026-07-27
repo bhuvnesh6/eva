@@ -1,0 +1,250 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Eva &mdash; a voice that listens in Hindi and English</title>
+<meta name="description" content="Eva is a real-time bilingual voice agent. Talk to her in Hindi or English and she replies instantly, out loud.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=Inter:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+  :root{
+    --bg:#0B0F19;
+    --surface:#131826;
+    --surface2:#1B2233;
+    --accent:#7C9EFF;
+    --accent2:#FFB86B;
+    --text:#F5F7FA;
+    --muted:#8A93A6;
+    --display:'Space Grotesk', system-ui, sans-serif;
+    --body:'Inter', system-ui, sans-serif;
+    --mono:'IBM Plex Mono', monospace;
+  }
+  *{box-sizing:border-box;}
+  html{scroll-behavior:smooth;}
+  body{
+    margin:0;
+    background:
+      radial-gradient(1200px 600px at 80% -10%, rgba(124,158,255,.16), transparent 60%),
+      radial-gradient(900px 500px at -10% 30%, rgba(255,184,107,.10), transparent 55%),
+      var(--bg);
+    color:var(--text);
+    font-family:var(--body);
+    -webkit-font-smoothing:antialiased;
+  }
+  a{color:inherit;}
+
+  header{
+    display:flex;align-items:center;justify-content:space-between;
+    padding:26px 6vw;
+    max-width:1200px;margin:0 auto;
+  }
+  .brand{display:flex;align-items:center;gap:10px;font-family:var(--display);font-weight:600;letter-spacing:.01em;}
+  .brand .dot{width:10px;height:10px;border-radius:50%;background:var(--accent);box-shadow:0 0 14px 3px rgba(124,158,255,.6);}
+  nav a{font-size:13.5px;color:var(--muted);text-decoration:none;margin-left:26px;}
+  nav a:hover{color:var(--text);}
+
+  .hero{
+    max-width:1200px;margin:0 auto;
+    padding:6vh 6vw 4vh;
+    display:grid;grid-template-columns:1.1fr .9fr;gap:48px;align-items:center;
+  }
+  .eyebrow{
+    font-family:var(--mono);font-size:11.5px;letter-spacing:.14em;text-transform:uppercase;
+    color:var(--accent2);margin-bottom:18px;display:flex;align-items:center;gap:10px;
+  }
+  .eyebrow::before{content:"";width:22px;height:1px;background:var(--accent2);display:inline-block;}
+  h1{
+    font-family:var(--display);font-weight:600;
+    font-size:clamp(34px, 5vw, 58px);line-height:1.04;letter-spacing:-.01em;
+    margin:0 0 20px;
+  }
+  h1 em{font-style:normal;color:var(--accent);}
+  .sub{
+    font-size:16.5px;line-height:1.65;color:var(--muted);max-width:46ch;margin:0 0 30px;
+  }
+  .cta-row{display:flex;gap:14px;flex-wrap:wrap;align-items:center;}
+  .btn{
+    font-family:var(--display);font-weight:600;font-size:14px;
+    padding:14px 22px;border-radius:14px;border:none;cursor:pointer;
+    background:linear-gradient(135deg,var(--accent),#5C7CFF);color:#0B0F19;
+    transition:transform .15s ease, filter .15s ease;
+  }
+  .btn:hover{filter:brightness(1.08);transform:translateY(-1px);}
+  .btn.ghost{
+    background:transparent;color:var(--text);border:1px solid rgba(124,158,255,.35);
+  }
+  .lang-pills{display:flex;gap:8px;margin-top:26px;}
+  .pill{
+    font-family:var(--mono);font-size:11px;color:var(--muted);
+    border:1px solid rgba(255,255,255,.08);padding:6px 12px;border-radius:20px;
+    background:rgba(255,255,255,.02);
+  }
+
+  /* ---- The "face": a breathing voice orb, Eva's signature element ---- */
+  .orb-wrap{display:flex;align-items:center;justify-content:center;position:relative;height:420px;}
+  .orb-ring{
+    position:absolute;border-radius:50%;border:1px solid rgba(124,158,255,.25);
+  }
+  .orb-ring.r1{width:220px;height:220px;animation:breathe 5s ease-in-out infinite;}
+  .orb-ring.r2{width:290px;height:290px;animation:breathe 5s ease-in-out infinite .6s;}
+  .orb-ring.r3{width:360px;height:360px;animation:breathe 5s ease-in-out infinite 1.2s;}
+  @keyframes breathe{
+    0%,100%{opacity:.25;transform:scale(.94);}
+    50%{opacity:.7;transform:scale(1.02);}
+  }
+  .orb-core{
+    width:168px;height:168px;border-radius:50%;position:relative;z-index:2;
+    background:radial-gradient(circle at 34% 28%, #B9CBFF, var(--accent) 55%, #4C68D8 100%);
+    box-shadow:0 0 70px rgba(124,158,255,.55), inset 0 0 40px rgba(255,255,255,.15);
+    animation:float 6s ease-in-out infinite;
+  }
+  @keyframes float{
+    0%,100%{transform:translateY(0);}
+    50%{transform:translateY(-10px);}
+  }
+  .orb-bars{
+    position:absolute;z-index:3;display:flex;align-items:center;gap:4px;height:44px;
+  }
+  .orb-bars span{
+    width:4px;border-radius:3px;background:var(--bg);opacity:.85;
+    animation:wave 1.4s ease-in-out infinite;
+  }
+  .orb-bars span:nth-child(1){height:14px;animation-delay:0s;}
+  .orb-bars span:nth-child(2){height:28px;animation-delay:.12s;}
+  .orb-bars span:nth-child(3){height:40px;animation-delay:.24s;}
+  .orb-bars span:nth-child(4){height:22px;animation-delay:.36s;}
+  .orb-bars span:nth-child(5){height:32px;animation-delay:.48s;}
+  @keyframes wave{
+    0%,100%{transform:scaleY(.4);}
+    50%{transform:scaleY(1);}
+  }
+
+  section{max-width:1200px;margin:0 auto;padding:6vh 6vw;}
+  .divider{max-width:1200px;margin:0 auto;padding:0 6vw;}
+  .divider hr{border:none;border-top:1px solid rgba(255,255,255,.06);}
+
+  .features{
+    display:grid;grid-template-columns:repeat(3,1fr);gap:22px;
+  }
+  .feature{
+    background:linear-gradient(180deg, var(--surface), var(--surface2));
+    border:1px solid rgba(255,255,255,.06);
+    border-radius:18px;padding:24px;
+  }
+  .feature .k{font-family:var(--mono);font-size:11px;color:var(--accent2);letter-spacing:.1em;text-transform:uppercase;margin-bottom:12px;display:block;}
+  .feature h3{font-family:var(--display);font-size:17px;margin:0 0 8px;}
+  .feature p{font-size:13.5px;color:var(--muted);line-height:1.6;margin:0;}
+
+  .embed-note{
+    display:flex;align-items:center;justify-content:space-between;gap:24px;flex-wrap:wrap;
+    background:var(--surface);border:1px solid rgba(255,255,255,.06);border-radius:18px;padding:22px 26px;
+  }
+  .embed-note code{
+    font-family:var(--mono);font-size:12.5px;color:var(--accent2);
+    background:rgba(0,0,0,.35);padding:2px 8px;border-radius:6px;
+  }
+
+  footer{
+    max-width:1200px;margin:0 auto;padding:5vh 6vw 8vh;
+    display:flex;justify-content:space-between;color:var(--muted);font-size:12.5px;
+    flex-wrap:wrap;gap:10px;
+  }
+
+  @media (max-width:860px){
+    .hero{grid-template-columns:1fr;}
+    .orb-wrap{height:280px;order:-1;}
+    .features{grid-template-columns:1fr;}
+  }
+  @media (prefers-reduced-motion: reduce){
+    .orb-ring, .orb-core, .orb-bars span{animation:none !important;}
+  }
+</style>
+</head>
+<body>
+
+  <header>
+    <div class="brand"><span class="dot"></span> Eva</div>
+    <nav>
+      <a href="#how">How it works</a>
+      <a href="#embed">Embed</a>
+    </nav>
+  </header>
+
+  <div class="hero">
+    <div>
+      <div class="eyebrow">Real-time voice agent</div>
+      <h1>A voice that answers <em>as fast</em> as you can speak &mdash; in Hindi or English.</h1>
+      <p class="sub">Eva listens through your mic, understands either language mid-sentence, thinks out loud, and replies in a natural voice &mdash; all in a couple of seconds, no typing required.</p>
+      <div class="cta-row">
+        <button class="btn" id="hero-cta">Start talking to Eva</button>
+        <a class="btn ghost" href="#how">See how it works</a>
+      </div>
+      <div class="lang-pills">
+        <span class="pill">EN &nbsp;English</span>
+        <span class="pill">HI &nbsp;&#2361;&#2367;&#2306;&#2342;&#2368;</span>
+        <span class="pill">Code-switching supported</span>
+      </div>
+    </div>
+
+    <div class="orb-wrap" aria-hidden="true">
+      <div class="orb-ring r3"></div>
+      <div class="orb-ring r2"></div>
+      <div class="orb-ring r1"></div>
+      <div class="orb-core"></div>
+      <div class="orb-bars">
+        <span></span><span></span><span></span><span></span><span></span>
+      </div>
+    </div>
+  </div>
+
+  <div class="divider"><hr></div>
+
+  <section id="how">
+    <div class="features">
+      <div class="feature">
+        <span class="k">01 &middot; Listens</span>
+        <h3>Streaming speech recognition</h3>
+        <p>Your mic audio streams live and is transcribed as you speak, recognizing Hindi and English in the same sentence.</p>
+      </div>
+      <div class="feature">
+        <span class="k">02 &middot; Thinks</span>
+        <h3>Short, spoken-style replies</h3>
+        <p>A language model drafts a concise reply built for the ear, not the eye &mdash; a sentence or two, never a wall of text.</p>
+      </div>
+      <div class="feature">
+        <span class="k">03 &middot; Speaks</span>
+        <h3>Natural streaming voice</h3>
+        <p>The reply is spoken back sentence by sentence in a warm, native-sounding voice, matching whichever language you used.</p>
+      </div>
+    </div>
+  </section>
+
+  <section id="embed">
+    <div class="embed-note">
+      <div>
+        <div style="font-family:var(--display);font-weight:600;margin-bottom:6px;">Add Eva to your own site</div>
+        <div style="color:var(--muted);font-size:13px;max-width:52ch;">Paste one script tag before <code>&lt;/body&gt;</code> and a floating Eva widget appears in the corner of any page.</div>
+      </div>
+      <code>&lt;script src="/widget.js"&gt;&lt;/script&gt;</code>
+    </div>
+  </section>
+
+  <footer>
+    <div>Eva &mdash; bilingual voice agent</div>
+    <div>Speak, and she'll answer.</div>
+  </footer>
+
+  <script>
+    document.getElementById('hero-cta').addEventListener('click', function(){
+      var bubble = document.getElementById('eva-bubble');
+      var panel = document.getElementById('eva-panel');
+      var talk = document.getElementById('eva-talk');
+      if (panel) panel.classList.add('eva-open');
+      if (talk) talk.click();
+      if (bubble) bubble.scrollIntoView({behavior:'smooth', block:'center'});
+    });
+  </script>
+  <script src="/widget.js"></script>
+</body>
+</html>

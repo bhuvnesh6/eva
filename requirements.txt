@@ -1,0 +1,10 @@
+flask==3.0.3
+flask-sock==0.7.0
+gunicorn==22.0.0
+gevent==24.2.1
+python-dotenv==1.0.1
+httpx==0.27.2
+numpy==1.26.4
+sounddevice==0.4.7
+deepgram-sdk>=3.7,<4
+sarvamai>=0.1.9
