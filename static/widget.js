@@ -281,14 +281,38 @@
     }
   }
 
+  var heartbeatTimer = null;
+
+  function startHeartbeat() {
+    stopHeartbeat();
+    heartbeatTimer = setInterval(function () {
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        try { ws.send(JSON.stringify({ type: "ping" })); } catch (e) {}
+      }
+    }, 20000);
+  }
+  function stopHeartbeat() {
+    if (heartbeatTimer) { clearInterval(heartbeatTimer); heartbeatTimer = null; }
+  }
+
   function startTalking() {
     if (isLive) return;
+
+    // Mic access requires a secure context (https://, or http://localhost).
+    // On a plain http://IP:port page, getUserMedia is unavailable and would
+    // otherwise fail silently, leaving the socket open with no audio ever sent.
+    if (!window.isSecureContext || !navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      setStatus("Mic needs HTTPS \u2014 open this page over https://");
+      return;
+    }
+
     isLive = true;
     talkBtn.classList.add("eva-active");
     talkLabel.textContent = "Stop talking";
     bubbleBtn.classList.add("eva-live");
     setStatus("Connecting\u2026");
     connectWs();
+    startHeartbeat();
 
     navigator.mediaDevices.getUserMedia({ audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true } })
       .then(function (stream) {
@@ -329,6 +353,7 @@
 
   function stopTalking(closeSocket) {
     isLive = false;
+    stopHeartbeat();
     talkBtn.classList.remove("eva-active");
     talkLabel.textContent = "Demo \u2014 Talk to " + evaName;
     bubbleBtn.classList.remove("eva-live");
