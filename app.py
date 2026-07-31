@@ -35,6 +35,7 @@ import re
 import sys
 import json
 import time
+import base64
 import queue
 import threading
 
@@ -50,6 +51,9 @@ from deepgram import (
     LiveOptions,
 )
 from sarvamai import SarvamAI
+
+from twilio.rest import Client as TwilioClient
+from twilio.twiml.voice_response import VoiceResponse, Connect
 
 load_dotenv()
 
@@ -73,6 +77,33 @@ DEEPGRAM_API_KEY = os.environ.get("DEEPGRAM_API_KEY")
 MISTRAL_API_KEY = os.environ.get("MISTRAL_API_KEY")
 SARVAM_API_KEY = os.environ.get("SARVAM_API_KEY")
 
+# ---------------- Twilio (phone call) config ----------------
+PHONE_RATE = 8000               # Twilio Media Streams is fixed at 8kHz mu-law
+
+TWILIO_ACCOUNT_SID = os.environ.get("TWILIO_ACCOUNT_SID")
+TWILIO_AUTH_TOKEN = os.environ.get("TWILIO_AUTH_TOKEN")
+# PUBLIC_BASE_URL = your ngrok (or other tunnel) https URL, no trailing slash
+# e.g. https://abcd1234.ngrok-free.app
+PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL", "").rstrip("/")
+
+
+def _e164(num: str) -> str:
+    """Best-effort normalize to E.164 (assumes country code is already included)."""
+    num = (num or "").strip().replace(" ", "").replace("-", "")
+    if num and not num.startswith("+"):
+        num = "+" + num
+    return num
+
+
+TWILIO_PHONE_NUMBER = _e164(os.environ.get("TWILIO_PHONE_NUMBER", ""))  # the Twilio number that calls you
+MY_PHONE_NUMBER = _e164(os.environ.get("MY_PHONE_NUMBER", ""))          # your verified number, gets called
+
+twilio_client = (
+    TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+    if TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN
+    else None
+)
+
 
 def log(stage: str, msg: str):
     ts = time.strftime("%H:%M:%S")
@@ -95,9 +126,11 @@ sock = Sock(app)
 # One EvaSession per WebSocket connection
 # ============================================================
 class EvaSession:
-    def __init__(self, ws, speaker: str = DEFAULT_SPEAKER):
+    def __init__(self, ws, speaker: str = DEFAULT_SPEAKER, mode: str = "browser"):
         self.ws = ws
         self.speaker = speaker
+        self.mode = mode                # "browser" or "phone"
+        self.stream_sid = None          # set once Twilio's "start" event arrives (phone mode only)
         self.ws_lock = threading.Lock()
         self.stop_event = threading.Event()
 
@@ -130,16 +163,29 @@ class EvaSession:
 
     # ---------- outbound helpers ----------
     def _send_json(self, obj):
+        # Twilio's Media Stream socket only understands its own event schema
+        # (media/mark/clear) - our status/transcript chatter is browser-only.
+        if self.mode == "phone":
+            return
         with self.ws_lock:
             try:
                 self.ws.send(json.dumps(obj))
             except Exception:
                 pass
 
-    def _send_audio(self, pcm_bytes: bytes):
+    def _send_audio(self, audio_bytes: bytes):
         with self.ws_lock:
             try:
-                self.ws.send(pcm_bytes)
+                if self.mode == "phone":
+                    if not self.stream_sid:
+                        return
+                    self.ws.send(json.dumps({
+                        "event": "media",
+                        "streamSid": self.stream_sid,
+                        "media": {"payload": base64.b64encode(audio_bytes).decode("ascii")},
+                    }))
+                else:
+                    self.ws.send(audio_bytes)
             except Exception:
                 pass
 
@@ -168,6 +214,11 @@ class EvaSession:
 
     # ---------- lifecycle ----------
     def start(self):
+        if self.mode == "phone":
+            encoding, sample_rate = "mulaw", PHONE_RATE
+        else:
+            encoding, sample_rate = "linear16", MIC_RATE
+
         options = LiveOptions(
             model="nova-3",
             language="multi",
@@ -175,8 +226,8 @@ class EvaSession:
             interim_results=True,
             utterance_end_ms="1000",
             vad_events=True,
-            encoding="linear16",
-            sample_rate=MIC_RATE,
+            encoding=encoding,
+            sample_rate=sample_rate,
             channels=1,
         )
         if not self.dg_connection.start(options):
@@ -198,6 +249,10 @@ class EvaSession:
         """Allow a typed message to skip STT and go straight to the LLM."""
         self._send_json({"type": "user_transcript", "text": text, "final": True})
         self.user_text_q.put(text)
+
+    def speak(self, text: str, lang: str = "en"):
+        """Queue a line straight to TTS, bypassing the LLM (e.g. an opening greeting)."""
+        self.sentence_q.put((text, lang))
 
     def close(self):
         self.stop_event.set()
@@ -292,6 +347,12 @@ class EvaSession:
 
             target_language_code = "hi-IN" if lang == "hi" else "en-IN"
             self._send_json({"type": "status", "state": "speaking"})
+
+            if self.mode == "phone":
+                tts_codec, tts_rate = "mulaw", PHONE_RATE
+            else:
+                tts_codec, tts_rate = "linear16", TTS_SAMPLE_RATE
+
             leftover = b""
             try:
                 for chunk in self.sarvam.text_to_speech.convert_stream(
@@ -299,11 +360,16 @@ class EvaSession:
                     target_language_code=target_language_code,
                     speaker=self.speaker,
                     model=SARVAM_TTS_MODEL,
-                    output_audio_codec="linear16",
-                    speech_sample_rate=TTS_SAMPLE_RATE,
+                    output_audio_codec=tts_codec,
+                    speech_sample_rate=tts_rate,
                 ):
                     if not chunk:
                         continue
+                    if self.mode == "phone":
+                        # mu-law is 1 byte/sample - no alignment needed, send as-is
+                        self._send_audio(chunk)
+                        continue
+                    # linear16 is 2 bytes/sample - keep frames byte-aligned
                     data = leftover + chunk
                     if len(data) % 2 != 0:
                         leftover = data[-1:]
@@ -385,6 +451,94 @@ def eva_ws(ws):
         log("MAIN", "Browser client disconnected.")
 
 
+@app.route("/call-eva")
+def call_eva_page():
+    return render_template("call_eva.html")
+
+
+@app.route("/call", methods=["POST"])
+def trigger_call():
+    """Places an outbound call from your Twilio number to MY_PHONE_NUMBER."""
+    if not twilio_client:
+        return jsonify({"ok": False, "error": "TWILIO_ACCOUNT_SID / TWILIO_AUTH_TOKEN missing in .env"}), 400
+    if not TWILIO_PHONE_NUMBER or not MY_PHONE_NUMBER:
+        return jsonify({"ok": False, "error": "TWILIO_PHONE_NUMBER or MY_PHONE_NUMBER missing in .env"}), 400
+    if not PUBLIC_BASE_URL:
+        return jsonify({
+            "ok": False,
+            "error": "PUBLIC_BASE_URL missing in .env - set it to your ngrok https URL, e.g. https://abcd1234.ngrok-free.app",
+        }), 400
+
+    try:
+        call = twilio_client.calls.create(
+            to=MY_PHONE_NUMBER,
+            from_=TWILIO_PHONE_NUMBER,
+            url=f"{PUBLIC_BASE_URL}/twiml",
+            method="POST",
+        )
+        log("MAIN", f"Outbound call started: {call.sid} -> {MY_PHONE_NUMBER}")
+        return jsonify({"ok": True, "call_sid": call.sid})
+    except Exception as e:
+        log("MAIN", f"Call failed: {e}")
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/twiml", methods=["GET", "POST"])
+def twiml():
+    """Twilio fetches this once the call connects; it tells Twilio to open
+    a Media Stream WebSocket to us so audio can flow both ways."""
+    ws_url = PUBLIC_BASE_URL.replace("https://", "wss://").replace("http://", "ws://") + "/ws/twilio"
+    resp = VoiceResponse()
+    connect = Connect()
+    connect.stream(url=ws_url)
+    resp.append(connect)
+    return str(resp), 200, {"Content-Type": "text/xml"}
+
+
+@sock.route("/ws/twilio")
+def twilio_ws(ws):
+    missing = [n for n, v in [
+        ("DEEPGRAM_API_KEY", DEEPGRAM_API_KEY),
+        ("MISTRAL_API_KEY", MISTRAL_API_KEY),
+        ("SARVAM_API_KEY", SARVAM_API_KEY),
+    ] if not v]
+    if missing:
+        log("MAIN", f"Twilio call rejected, missing keys: {missing}")
+        return
+
+    session = EvaSession(ws, mode="phone")
+    if not session.start():
+        return
+
+    log("MAIN", "Twilio call connected.")
+    try:
+        while True:
+            msg = ws.receive()
+            if msg is None:
+                break
+            try:
+                data = json.loads(msg)
+            except Exception:
+                continue
+
+            event = data.get("event")
+            if event == "start":
+                session.stream_sid = data["start"]["streamSid"]
+                log("MAIN", f"Twilio stream started: {session.stream_sid}")
+                session.speak("Hi, this is Eva. How can I help you today?", "en")
+            elif event == "media":
+                audio = base64.b64decode(data["media"]["payload"])
+                session.feed_audio(audio)
+            elif event == "stop":
+                log("MAIN", "Twilio stream stopped.")
+                break
+    except Exception as e:
+        log("MAIN", f"twilio ws loop error: {e}")
+    finally:
+        session.close()
+        log("MAIN", "Twilio call disconnected.")
+
+
 if __name__ == "__main__":
     missing = [n for n, v in [
         ("DEEPGRAM_API_KEY", DEEPGRAM_API_KEY),
@@ -394,4 +548,4 @@ if __name__ == "__main__":
     if missing:
         print(f"Missing keys in .env: {', '.join(missing)}")
         sys.exit(1)
-    app.run(host="0.0.0.0", port=PORT, debug=False)
+    app.run(host="0.0.0.0", port=PORT, debug=False, threaded=True)
