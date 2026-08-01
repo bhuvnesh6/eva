@@ -9,9 +9,13 @@ Flask app that serves:
                     browser mic (PCM16/16kHz) -> Deepgram STT (streaming)
                     -> Mistral LLM (streaming) -> Sarvam TTS (streaming)
                     -> PCM16/22050Hz audio frames sent back to the browser
+  - "/api/calls"   called by PravaahAI to place an outbound campaign call
+                    (Eva calls the lead, runs the same voice pipeline over
+                    Twilio Media Streams, then POSTs the transcript back to
+                    PravaahAI's callback_url when the call ends)
 
 Each WebSocket connection gets its own EvaSession with its own Deepgram
-connection + history, so multiple visitors can talk to Eva at once.
+connection + history, so multiple visitors/calls can run at once.
 
 Setup:
     pip install -r requirements.txt
@@ -22,6 +26,8 @@ Setup:
         SARVAM_API_KEY=...
         PORT=8420                 (optional, defaults to 8420)
         EVA_SPEAKER=priya         (optional)
+        EVA_API_SECRET=...        (shared secret with PravaahAI)
+        PUBLIC_BASE_URL=https://your-eva-tunnel.ngrok-free.app
 
 Run (dev):
     python app.py
@@ -38,9 +44,12 @@ import time
 import base64
 import queue
 import threading
+import uuid
+from datetime import datetime
 
 import httpx
-from flask import Flask, render_template, send_from_directory, jsonify
+import requests
+from flask import Flask, request, jsonify, render_template, send_from_directory
 from flask_sock import Sock
 from dotenv import load_dotenv
 
@@ -51,9 +60,9 @@ from deepgram import (
     LiveOptions,
 )
 from sarvamai import SarvamAI
-
 from twilio.rest import Client as TwilioClient
 from twilio.twiml.voice_response import VoiceResponse, Connect
+
 
 load_dotenv()
 
@@ -86,6 +95,10 @@ TWILIO_AUTH_TOKEN = os.environ.get("TWILIO_AUTH_TOKEN")
 # e.g. https://abcd1234.ngrok-free.app
 PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL", "").rstrip("/")
 
+# Shared secret used to authenticate requests coming FROM PravaahAI
+# (POST /api/calls) and requests Eva sends back TO PravaahAI's callback_url.
+EVA_API_SECRET = os.environ.get("EVA_API_SECRET", "")
+
 
 def _e164(num: str) -> str:
     """Best-effort normalize to E.164 (assumes country code is already included)."""
@@ -104,6 +117,12 @@ twilio_client = (
     else None
 )
 
+# call_id -> {"agent": {...}, "lead": {...}, "callback_url": "...", "created_at": epoch}
+# Populated by POST /api/calls, consumed by /ws/twilio-outbound/<call_id> once
+# Twilio opens the Media Stream socket for that call.
+_pending_calls_lock = threading.Lock()
+PENDING_CALLS = {}
+
 
 def log(stage: str, msg: str):
     ts = time.strftime("%H:%M:%S")
@@ -118,6 +137,14 @@ def detect_lang(text: str) -> str:
     return "hi" if DEVANAGARI_RE.search(text) else "en"
 
 
+def render_call_vars(text: str, lead: dict) -> str:
+    """Replace {{name}}, {{business_name}}, etc. with lead field values
+    (same merge-tag convention as PravaahAI's templates)."""
+    for key in ("name", "business_name", "email", "phone", "website", "description"):
+        text = text.replace("{{%s}}" % key, str((lead or {}).get(key, "") or ""))
+    return text
+
+
 app = Flask(__name__, template_folder="templates", static_folder="static", static_url_path="/static")
 sock = Sock(app)
 
@@ -126,30 +153,65 @@ sock = Sock(app)
 # One EvaSession per WebSocket connection
 # ============================================================
 class EvaSession:
-    def __init__(self, ws, speaker: str = DEFAULT_SPEAKER, mode: str = "browser"):
+    def __init__(self, ws, speaker: str = DEFAULT_SPEAKER, mode: str = "browser",
+                 call_id: str = None, agent: dict = None, lead: dict = None,
+                 callback_url: str = None):
+        agent = agent or {}
+        lead = lead or {}
+
         self.ws = ws
-        self.speaker = speaker
+        self.speaker = (agent.get("speaker") or speaker or DEFAULT_SPEAKER)
         self.mode = mode                # "browser" or "phone"
         self.stream_sid = None          # set once Twilio's "start" event arrives (phone mode only)
         self.ws_lock = threading.Lock()
         self.stop_event = threading.Event()
 
+        # --- campaign-call metadata (all None/empty for plain browser/dev calls) ---
+        self.call_id = call_id
+        self.agent = agent
+        self.lead = lead
+        self.callback_url = callback_url
+        self.transcript = []           # [{"role": "lead"|"agent", "text": "...", "ts": epoch}]
+        self.call_started_at = None
+        self.hangup_reason = "completed"
+        self._callback_sent = False
+        self._callback_lock = threading.Lock()
+
+        forced_lang = agent.get("language")
+        self.forced_language = forced_lang if forced_lang in ("en", "hi") else None
+        self.max_duration_secs = int(agent.get("max_duration_secs") or 0) or None
+        self.min_duration_secs = int(agent.get("min_duration_secs") or 0) or None
+
         self.user_text_q: "queue.Queue[str]" = queue.Queue()
         self.sentence_q: "queue.Queue[tuple]" = queue.Queue()
 
         self.history = []
-        self.system_prompt = {
-            "role": "system", "content": (
-                "You are Eva, a helpful, concise, warm voice assistant. "
-                "Keep replies short and conversational (1-3 sentences) since they "
-                "will be spoken aloud. "
-                "Language rule: always reply in the SAME language the user just used. "
+
+        custom_prompt = (agent.get("system_prompt") or "").strip()
+        base_prompt = custom_prompt or (
+            "You are Eva, a helpful, concise, warm voice assistant. "
+            "Keep replies short and conversational (1-3 sentences) since they "
+            "will be spoken aloud."
+        )
+        if lead:
+            base_prompt += (
+                f"\n\nYou are speaking with {lead.get('name', 'the lead')} from "
+                f"{lead.get('business_name', 'their business')}. Use their name naturally, don't overuse it."
+            )
+        if self.forced_language == "hi":
+            base_prompt += "\nAlways reply in Hinglish written in English script, mixed lightly with English words."
+        elif self.forced_language == "en":
+            base_prompt += "\nAlways reply in English only."
+        else:
+            base_prompt += (
+                "\nLanguage rule: always reply in the SAME language the user just used. "
                 "If they spoke English, reply only in English. "
                 "If they spoke Hindi (Devanagari script), reply only in Hinglish "
-                "written in english script - mixed with English words little bit. "
-                "Never reply using only emojis or symbols with no words."
+                "written in english script - mixed with English words little bit."
             )
-        }
+        base_prompt += "\nNever reply using only emojis or symbols with no words."
+
+        self.system_prompt = {"role": "system", "content": base_prompt}
 
         config = DeepgramClientOptions(options={"keepalive": "true"})
         self.deepgram = DeepgramClient(DEEPGRAM_API_KEY, config)
@@ -202,6 +264,7 @@ class EvaSession:
         if result.is_final:
             log("STT", f"Final transcript: {transcript}")
             self._send_json({"type": "user_transcript", "text": transcript, "final": True})
+            self.transcript.append({"role": "lead", "text": transcript, "ts": time.time()})
             self.user_text_q.put(transcript)
         else:
             self._send_json({"type": "user_transcript", "text": transcript, "final": False})
@@ -237,6 +300,8 @@ class EvaSession:
 
         threading.Thread(target=self._llm_loop, daemon=True, name="LLM").start()
         threading.Thread(target=self._tts_loop, daemon=True, name="TTS").start()
+        if self.max_duration_secs:
+            threading.Thread(target=self._max_duration_watchdog, daemon=True, name="MaxDuration").start()
         return True
 
     def feed_audio(self, data: bytes):
@@ -248,6 +313,7 @@ class EvaSession:
     def feed_text(self, text: str):
         """Allow a typed message to skip STT and go straight to the LLM."""
         self._send_json({"type": "user_transcript", "text": text, "final": True})
+        self.transcript.append({"role": "lead", "text": text, "ts": time.time()})
         self.user_text_q.put(text)
 
     def speak(self, text: str, lang: str = "en"):
@@ -260,6 +326,42 @@ class EvaSession:
             self.dg_connection.finish()
         except Exception:
             pass
+
+    def _max_duration_watchdog(self):
+        """Hangs the call up once it's run past agent.max_duration_secs."""
+        if self.stop_event.wait(self.max_duration_secs):
+            return  # call already ended naturally
+        log("MAIN", f"Call {self.call_id} hit max duration ({self.max_duration_secs}s), hanging up.")
+        self.hangup_reason = "max_duration_reached"
+        self.close()
+        try:
+            self.ws.close()
+        except Exception:
+            pass
+
+    def _finish_and_callback(self, hangup_reason: str = None):
+        """POSTs the final transcript back to PravaahAI. Safe to call more
+        than once — only fires the HTTP request the first time."""
+        with self._callback_lock:
+            if self._callback_sent or not self.callback_url or not self.call_id:
+                return
+            self._callback_sent = True
+        duration_secs = round(time.time() - self.call_started_at, 1) if self.call_started_at else 0
+        payload = {
+            "call_id": self.call_id,
+            "status": "completed" if self.transcript else "no_response",
+            "hangup_reason": hangup_reason or self.hangup_reason,
+            "duration_secs": duration_secs,
+            "transcript": self.transcript,
+        }
+        try:
+            requests.post(
+                self.callback_url,
+                headers={"X-Eva-Secret": EVA_API_SECRET, "Content-Type": "application/json"},
+                json=payload, timeout=15,
+            )
+        except Exception as e:
+            log("MAIN", f"callback POST failed for {self.call_id}: {e}")
 
     # ---------- LLM loop ----------
     def _trim_history(self):
@@ -294,7 +396,7 @@ class EvaSession:
                 except queue.Empty:
                     continue
 
-                user_lang = detect_lang(user_text)
+                user_lang = self.forced_language or detect_lang(user_text)
                 lang_note = {
                     "role": "system",
                     "content": f"(Reply in {'Hindi (Devanagari)' if user_lang == 'hi' else 'English'} only.)"
@@ -329,6 +431,9 @@ class EvaSession:
                 tail = buffer.strip()
                 if tail and is_speakable(tail):
                     self.sentence_q.put((tail, user_lang))
+
+                if full_reply.strip():
+                    self.transcript.append({"role": "agent", "text": full_reply.strip(), "ts": time.time()})
 
                 self.history.append({"role": "assistant", "content": full_reply})
                 self._trim_history()
@@ -458,7 +563,8 @@ def call_eva_page():
 
 @app.route("/call", methods=["POST"])
 def trigger_call():
-    """Places an outbound call from your Twilio number to MY_PHONE_NUMBER."""
+    """Places an outbound call from your Twilio number to MY_PHONE_NUMBER.
+    (Dev/demo route — real campaign calls go through /api/calls instead.)"""
     if not twilio_client:
         return jsonify({"ok": False, "error": "TWILIO_ACCOUNT_SID / TWILIO_AUTH_TOKEN missing in .env"}), 400
     if not TWILIO_PHONE_NUMBER or not MY_PHONE_NUMBER:
@@ -537,6 +643,148 @@ def twilio_ws(ws):
     finally:
         session.close()
         log("MAIN", "Twilio call disconnected.")
+
+
+# ============================================================
+# Campaign calling API — called by PravaahAI
+# ============================================================
+@app.route("/api/calls", methods=["POST"])
+def api_place_call():
+    """PravaahAI calls this to have Eva place an outbound call to a lead.
+    Body: {call_id, to_number, twilio:{account_sid,auth_token,from_number},
+           agent:{...}, lead:{...}, callback_url}
+    Auth: header X-Eva-Secret must match EVA_API_SECRET.
+    """
+    if not EVA_API_SECRET or request.headers.get("X-Eva-Secret") != EVA_API_SECRET:
+        return jsonify({"ok": False, "error": "Invalid or missing X-Eva-Secret"}), 401
+    if not PUBLIC_BASE_URL:
+        return jsonify({"ok": False, "error": "PUBLIC_BASE_URL not set in Eva's .env"}), 400
+
+    missing = [n for n, v in [
+        ("DEEPGRAM_API_KEY", DEEPGRAM_API_KEY),
+        ("MISTRAL_API_KEY", MISTRAL_API_KEY),
+        ("SARVAM_API_KEY", SARVAM_API_KEY),
+    ] if not v]
+    if missing:
+        return jsonify({"ok": False, "error": f"Eva missing env keys: {', '.join(missing)}"}), 500
+
+    data = request.get_json(silent=True) or {}
+    call_id = data.get("call_id")
+    to_number = data.get("to_number")
+    twilio_creds = data.get("twilio", {}) or {}
+    agent = data.get("agent", {}) or {}
+    lead = data.get("lead", {}) or {}
+    callback_url = data.get("callback_url")
+
+    if not (call_id and to_number and callback_url):
+        return jsonify({"ok": False, "error": "call_id, to_number and callback_url are required"}), 400
+
+    account_sid = twilio_creds.get("account_sid")
+    auth_token = twilio_creds.get("auth_token")
+    from_number = _e164(twilio_creds.get("from_number", ""))
+    if not (account_sid and auth_token and from_number):
+        return jsonify({"ok": False, "error": "Twilio account_sid/auth_token/from_number are required"}), 400
+
+    with _pending_calls_lock:
+        PENDING_CALLS[call_id] = {
+            "agent": agent, "lead": lead, "callback_url": callback_url, "created_at": time.time(),
+        }
+
+    try:
+        call_client = TwilioClient(account_sid, auth_token)
+        call = call_client.calls.create(
+            to=_e164(to_number),
+            from_=from_number,
+            url=f"{PUBLIC_BASE_URL}/twiml/outbound/{call_id}",
+            method="POST",
+        )
+        log("MAIN", f"Outbound campaign call started: {call.sid} -> {to_number} (call_id={call_id})")
+        return jsonify({"ok": True, "call_sid": call.sid})
+    except Exception as e:
+        with _pending_calls_lock:
+            PENDING_CALLS.pop(call_id, None)
+        log("MAIN", f"api_place_call failed: {e}")
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/twiml/outbound/<call_id>", methods=["GET", "POST"])
+def twiml_outbound(call_id):
+    """Twilio fetches this once a campaign call connects; tells Twilio to
+    open a Media Stream WebSocket scoped to this specific call_id."""
+    ws_url = (
+        PUBLIC_BASE_URL.replace("https://", "wss://").replace("http://", "ws://")
+        + f"/ws/twilio-outbound/{call_id}"
+    )
+    resp = VoiceResponse()
+    connect = Connect()
+    connect.stream(url=ws_url)
+    resp.append(connect)
+    return str(resp), 200, {"Content-Type": "text/xml"}
+
+
+@sock.route("/ws/twilio-outbound/<call_id>")
+def twilio_outbound_ws(ws, call_id):
+    with _pending_calls_lock:
+        cfg = PENDING_CALLS.get(call_id)
+    if not cfg:
+        log("MAIN", f"No pending config for call_id={call_id}, closing.")
+        return
+
+    missing = [n for n, v in [
+        ("DEEPGRAM_API_KEY", DEEPGRAM_API_KEY),
+        ("MISTRAL_API_KEY", MISTRAL_API_KEY),
+        ("SARVAM_API_KEY", SARVAM_API_KEY),
+    ] if not v]
+    if missing:
+        log("MAIN", f"Outbound call rejected, missing keys: {missing}")
+        return
+
+    session = EvaSession(
+        ws, mode="phone", call_id=call_id,
+        agent=cfg["agent"], lead=cfg["lead"], callback_url=cfg["callback_url"],
+    )
+    if not session.start():
+        session._finish_and_callback(hangup_reason="failed_to_start")
+        with _pending_calls_lock:
+            PENDING_CALLS.pop(call_id, None)
+        return
+
+    log("MAIN", f"Outbound call {call_id} connected.")
+    try:
+        while True:
+            msg = ws.receive()
+            if msg is None:
+                break
+            try:
+                data = json.loads(msg)
+            except Exception:
+                continue
+
+            event = data.get("event")
+            if event == "start":
+                session.stream_sid = data["start"]["streamSid"]
+                session.call_started_at = time.time()
+                opening = render_call_vars(
+                    cfg["agent"].get("opening_line") or "Hi, do you have a quick minute?",
+                    cfg["lead"],
+                )
+                opening_lang = "hi" if cfg["agent"].get("language") == "hi" else "en"
+                session.speak(opening, opening_lang)
+            elif event == "media":
+                audio = base64.b64decode(data["media"]["payload"])
+                session.feed_audio(audio)
+            elif event == "stop":
+                log("MAIN", f"Outbound call {call_id} stream stopped.")
+                break
+    except Exception as e:
+        log("MAIN", f"twilio-outbound ws loop error: {e}")
+        session.hangup_reason = "error"
+    finally:
+        session.close()
+        session._finish_and_callback()
+        with _pending_calls_lock:
+            PENDING_CALLS.pop(call_id, None)
+        log("MAIN", f"Outbound call {call_id} disconnected.")
 
 
 if __name__ == "__main__":
