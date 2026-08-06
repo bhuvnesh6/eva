@@ -308,16 +308,22 @@ class EvaSession:
         if time.time() < self.barge_in_grace_until:
             return
 
-        # The user just started talking (VAD). If she was speaking, or has
-        # anything queued up to say, that's a barge-in - stop her right now.
-        with self.pending_lock:
-            if self.pending_timer:
-                self.pending_timer.cancel()
-                self.pending_timer = None
-
+        # Only treat this as a real barge-in - and only cancel the pending
+        # response timer - if Eva is actually speaking or has something
+        # queued to say. Otherwise this is just VAD firing on a mid-thought
+        # pause/breath while the user is still talking. Cancelling the
+        # pending timer in that case is the bug: if the user then falls
+        # silent (turn over, waiting for a reply) with no further final
+        # transcript to restart it, the timer never fires again and Eva
+        # goes silent for the rest of the call/session.
         if self.eva_speaking.is_set() or not self.sentence_q.empty():
+            with self.pending_lock:
+                if self.pending_timer:
+                    self.pending_timer.cancel()
+                    self.pending_timer = None
             log("MAIN", f"[{self.call_id or 'browser'}] Barge-in - interrupting Eva.")
             self._interrupt_playback()
+
 
     def _dg_transcript(self, *_a, result=None, **_k):
         if result is None:
