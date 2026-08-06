@@ -87,6 +87,8 @@ MAX_HISTORY_MESSAGES = 16
 # Mimics a natural human turn-taking gap instead of jumping in instantly.
 RESPONSE_DELAY_SECS = float(os.environ.get("EVA_RESPONSE_PAUSE_SECS", 3.5))
 
+BARGE_IN_GRACE_SECS = float(os.environ.get("EVA_BARGE_IN_GRACE_SECS", 2.0))
+
 DEEPGRAM_API_KEY = os.environ.get("DEEPGRAM_API_KEY")
 MISTRAL_API_KEY = os.environ.get("MISTRAL_API_KEY")
 SARVAM_API_KEY = os.environ.get("SARVAM_API_KEY")
@@ -177,6 +179,7 @@ class EvaSession:
         self.pending_lock = threading.Lock()
         self.pending_transcript = ""             # accumulates final STT chunks pre-response
         self.pending_timer = None                # fires RESPONSE_DELAY_SECS after last speech
+        self.barge_in_grace_until = 0.0          # epoch time; ignore VAD barge-in until this passes
 
         # --- campaign-call metadata (all None/empty for plain browser/dev calls) ---
         self.call_id = call_id
@@ -298,6 +301,13 @@ class EvaSession:
         log("STT", "Deepgram connection open.")
 
     def _dg_speech_started(self, *_a, **_k):
+        # Ignore VAD triggers that land inside the protection window right
+        # after Eva was just queued to say something (see BARGE_IN_GRACE_SECS)
+        # - these are almost always a false positive from telephony line
+        # noise at call/stream start, not the caller actually talking.
+        if time.time() < self.barge_in_grace_until:
+            return
+
         # The user just started talking (VAD). If she was speaking, or has
         # anything queued up to say, that's a barge-in - stop her right now.
         with self.pending_lock:
@@ -391,9 +401,18 @@ class EvaSession:
         self.transcript.append({"role": "lead", "text": text, "ts": time.time()})
         self.user_text_q.put(text)
 
+    def _enqueue_sentence(self, text: str, lang: str):
+        """Puts a line on the TTS queue. If the queue was empty, this is the
+        start of a new thing Eva is about to say, so open a short barge-in
+        grace window - protects against a false VAD trigger cutting her off
+        before she's made a sound (see BARGE_IN_GRACE_SECS)."""
+        if self.sentence_q.empty():
+            self.barge_in_grace_until = time.time() + BARGE_IN_GRACE_SECS
+        self.sentence_q.put((text, lang))
+
     def speak(self, text: str, lang: str = "en"):
         """Queue a line straight to TTS, bypassing the LLM (e.g. an opening greeting)."""
-        self.sentence_q.put((text, lang))
+        self._enqueue_sentence(text, lang)
 
     def close(self):
         self.stop_event.set()
@@ -508,7 +527,7 @@ class EvaSession:
 
                         sentence = complete.strip()
                         if sentence and is_speakable(sentence):
-                            self.sentence_q.put((sentence, user_lang))
+                            self._enqueue_sentence(sentence, user_lang)
                         buffer = remainder
                 except Exception as e:
                     log("LLM", f"ERROR: {e}")
@@ -518,7 +537,7 @@ class EvaSession:
                 if not self.interrupt_flag.is_set():
                     tail = buffer.strip()
                     if tail and is_speakable(tail):
-                        self.sentence_q.put((tail, user_lang))
+                        self._enqueue_sentence(tail, user_lang)
 
                 if full_reply.strip():
                     self.transcript.append({"role": "agent", "text": full_reply.strip(), "ts": time.time()})
