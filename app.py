@@ -24,10 +24,11 @@ Setup:
         DEEPGRAM_API_KEY=...
         MISTRAL_API_KEY=...
         SARVAM_API_KEY=...
-        PORT=8420                 (optional, defaults to 8420)
-        EVA_SPEAKER=priya         (optional)
-        EVA_API_SECRET=...        (shared secret with PravaahAI)
+        PORT=8420                    (optional, defaults to 8420)
+        EVA_SPEAKER=priya            (optional)
+        EVA_API_SECRET=...           (shared secret with PravaahAI)
         PUBLIC_BASE_URL=https://your-eva-tunnel.ngrok-free.app
+        EVA_RESPONSE_PAUSE_SECS=3.5  (optional, natural pause before Eva replies)
 
 Run (dev):
     python app.py
@@ -81,6 +82,10 @@ SARVAM_TTS_MODEL = "bulbul:v3"
 DEFAULT_SPEAKER = os.environ.get("EVA_SPEAKER", "priya")
 
 MAX_HISTORY_MESSAGES = 16
+
+# How long Eva waits, after the user goes quiet, before she actually replies.
+# Mimics a natural human turn-taking gap instead of jumping in instantly.
+RESPONSE_DELAY_SECS = float(os.environ.get("EVA_RESPONSE_PAUSE_SECS", 3.5))
 
 DEEPGRAM_API_KEY = os.environ.get("DEEPGRAM_API_KEY")
 MISTRAL_API_KEY = os.environ.get("MISTRAL_API_KEY")
@@ -166,6 +171,13 @@ class EvaSession:
         self.ws_lock = threading.Lock()
         self.stop_event = threading.Event()
 
+        # --- barge-in / turn-taking state ---
+        self.eva_speaking = threading.Event()    # set while audio is actively being sent
+        self.interrupt_flag = threading.Event()  # set when the user barges in mid-response
+        self.pending_lock = threading.Lock()
+        self.pending_transcript = ""             # accumulates final STT chunks pre-response
+        self.pending_timer = None                # fires RESPONSE_DELAY_SECS after last speech
+
         # --- campaign-call metadata (all None/empty for plain browser/dev calls) ---
         self.call_id = call_id
         self.agent = agent
@@ -218,6 +230,7 @@ class EvaSession:
         self.dg_connection = self.deepgram.listen.websocket.v("1")
         self.dg_connection.on(LiveTranscriptionEvents.Open, self._dg_open)
         self.dg_connection.on(LiveTranscriptionEvents.Transcript, self._dg_transcript)
+        self.dg_connection.on(LiveTranscriptionEvents.SpeechStarted, self._dg_speech_started)
         self.dg_connection.on(LiveTranscriptionEvents.Error, self._dg_error)
         self.dg_connection.on(LiveTranscriptionEvents.Close, self._dg_close)
 
@@ -229,6 +242,15 @@ class EvaSession:
         # (media/mark/clear) - our status/transcript chatter is browser-only.
         if self.mode == "phone":
             return
+        with self.ws_lock:
+            try:
+                self.ws.send(json.dumps(obj))
+            except Exception:
+                pass
+
+    def _send_raw(self, obj):
+        """Like _send_json but NOT skipped in phone mode - for real Twilio
+        Media Stream control events (e.g. "clear")."""
         with self.ws_lock:
             try:
                 self.ws.send(json.dumps(obj))
@@ -251,9 +273,40 @@ class EvaSession:
             except Exception:
                 pass
 
+    # ---------- barge-in ----------
+    def _interrupt_playback(self):
+        """Called the instant the user starts talking. Stops Eva immediately:
+        drops anything queued to be spoken, breaks the in-flight TTS stream,
+        and tells the client/Twilio to flush any audio already sent but not
+        yet played."""
+        self.interrupt_flag.set()
+        with self.sentence_q.mutex:
+            self.sentence_q.queue.clear()
+
+        if self.mode == "phone":
+            if self.stream_sid:
+                self._send_raw({"event": "clear", "streamSid": self.stream_sid})
+        else:
+            self._send_json({"type": "interrupt"})
+            self._send_json({"type": "status", "state": "listening"})
+
+        self.eva_speaking.clear()
+
     # ---------- Deepgram callbacks ----------
     def _dg_open(self, *_a, **_k):
         log("STT", "Deepgram connection open.")
+
+    def _dg_speech_started(self, *_a, **_k):
+        # The user just started talking (VAD). If she was speaking, or has
+        # anything queued up to say, that's a barge-in - stop her right now.
+        with self.pending_lock:
+            if self.pending_timer:
+                self.pending_timer.cancel()
+                self.pending_timer = None
+
+        if self.eva_speaking.is_set() or not self.sentence_q.empty():
+            log("MAIN", f"[{self.call_id or 'browser'}] Barge-in - interrupting Eva.")
+            self._interrupt_playback()
 
     def _dg_transcript(self, *_a, result=None, **_k):
         if result is None:
@@ -265,7 +318,7 @@ class EvaSession:
             log("STT", f"Final transcript: {transcript}")
             self._send_json({"type": "user_transcript", "text": transcript, "final": True})
             self.transcript.append({"role": "lead", "text": transcript, "ts": time.time()})
-            self.user_text_q.put(transcript)
+            self._queue_with_pause(transcript)
         else:
             self._send_json({"type": "user_transcript", "text": transcript, "final": False})
 
@@ -274,6 +327,27 @@ class EvaSession:
 
     def _dg_close(self, *_a, **_k):
         log("STT", "Deepgram connection closed.")
+
+    # ---------- natural turn-taking pause ----------
+    def _queue_with_pause(self, transcript: str):
+        """Buffer finalized speech and only hand it to the LLM once the user
+        has been quiet for RESPONSE_DELAY_SECS. Each new final transcript
+        resets the timer, so short mid-thought pauses don't get cut off."""
+        with self.pending_lock:
+            self.pending_transcript = (self.pending_transcript + " " + transcript).strip()
+            if self.pending_timer:
+                self.pending_timer.cancel()
+            self.pending_timer = threading.Timer(RESPONSE_DELAY_SECS, self._flush_pending_transcript)
+            self.pending_timer.daemon = True
+            self.pending_timer.start()
+
+    def _flush_pending_transcript(self):
+        with self.pending_lock:
+            text = self.pending_transcript.strip()
+            self.pending_transcript = ""
+            self.pending_timer = None
+        if text:
+            self.user_text_q.put(text)
 
     # ---------- lifecycle ----------
     def start(self):
@@ -322,6 +396,10 @@ class EvaSession:
 
     def close(self):
         self.stop_event.set()
+        with self.pending_lock:
+            if self.pending_timer:
+                self.pending_timer.cancel()
+                self.pending_timer = None
         try:
             self.dg_connection.finish()
         except Exception:
@@ -396,6 +474,10 @@ class EvaSession:
                 except queue.Empty:
                     continue
 
+                # Fresh turn - clear out any interrupt flag left over from
+                # whatever Eva was saying before this turn started.
+                self.interrupt_flag.clear()
+
                 user_lang = self.forced_language or detect_lang(user_text)
                 lang_note = {
                     "role": "system",
@@ -408,6 +490,10 @@ class EvaSession:
                 try:
                     messages = [self.system_prompt] + self.history + [lang_note]
                     for delta in self._stream_chat(client, messages):
+                        if self.interrupt_flag.is_set():
+                            log("LLM", "Interrupted mid-generation, stopping stream.")
+                            break
+
                         buffer += delta
                         full_reply += delta
                         self._send_json({"type": "assistant_delta", "text": delta})
@@ -428,9 +514,10 @@ class EvaSession:
                     self._send_json({"type": "error", "message": "Eva had trouble thinking that through."})
                     continue
 
-                tail = buffer.strip()
-                if tail and is_speakable(tail):
-                    self.sentence_q.put((tail, user_lang))
+                if not self.interrupt_flag.is_set():
+                    tail = buffer.strip()
+                    if tail and is_speakable(tail):
+                        self.sentence_q.put((tail, user_lang))
 
                 if full_reply.strip():
                     self.transcript.append({"role": "agent", "text": full_reply.strip(), "ts": time.time()})
@@ -450,8 +537,14 @@ class EvaSession:
             if not is_speakable(sentence):
                 continue
 
+            # Dropped mid-flight by a barge-in that happened between this
+            # sentence being queued and us picking it up - skip it.
+            if self.interrupt_flag.is_set():
+                continue
+
             target_language_code = "hi-IN" if lang == "hi" else "en-IN"
             self._send_json({"type": "status", "state": "speaking"})
+            self.eva_speaking.set()
 
             if self.mode == "phone":
                 tts_codec, tts_rate = "mulaw", PHONE_RATE
@@ -468,6 +561,9 @@ class EvaSession:
                     output_audio_codec=tts_codec,
                     speech_sample_rate=tts_rate,
                 ):
+                    if self.interrupt_flag.is_set():
+                        # user started talking mid-sentence - stop right here
+                        break
                     if not chunk:
                         continue
                     if self.mode == "phone":
@@ -486,8 +582,10 @@ class EvaSession:
             except Exception as e:
                 log("TTS", f"ERROR: {e}")
 
+            self.eva_speaking.clear()
+
             # Let the client know this sentence's audio has fully been sent.
-            if self.sentence_q.empty():
+            if self.sentence_q.empty() and not self.interrupt_flag.is_set():
                 self._send_json({"type": "status", "state": "listening"})
 
 
