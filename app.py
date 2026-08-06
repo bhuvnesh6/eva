@@ -216,10 +216,11 @@ class EvaSession:
             base_prompt += "\nAlways reply in English only."
         else:
             base_prompt += (
-                "\nLanguage rule: always reply in the SAME language the user just used. "
-                "If they spoke English, reply only in English. "
-                "If they spoke Hindi (Devanagari script), reply only in Hinglish "
-                "written in english script - mixed with English words little bit."
+                "\nLanguage rule: default to English. Only switch to Hinglish "
+                "(Hindi written in English script, mixed lightly with English words) "
+                "if the user is clearly speaking Hindi (Devanagari script). "
+                "If their message is in English, unclear, or mixed, reply in English. "
+                "Never default to Hindi on your own."
             )
         base_prompt += "\nNever reply using only emojis or symbols with no words."
 
@@ -553,9 +554,13 @@ class EvaSession:
 
             leftover = b""
             try:
+                # NOTE: the streaming endpoint's language param is named
+                # "language_code" (NOT "target_language_code" - that name is
+                # only valid on the non-streaming .convert() call). Passing
+                # the wrong name throws a TypeError and produces zero audio.
                 for chunk in self.sarvam.text_to_speech.convert_stream(
                     text=sentence,
-                    target_language_code=target_language_code,
+                    language_code=target_language_code,
                     speaker=self.speaker,
                     model=SARVAM_TTS_MODEL,
                     output_audio_codec=tts_codec,
@@ -884,7 +889,7 @@ def twilio_outbound_ws(ws, call_id):
             PENDING_CALLS.pop(call_id, None)
         log("MAIN", f"Outbound call {call_id} disconnected.")
 
-#somemodification
+
 if __name__ == "__main__":
     missing = [n for n, v in [
         ("DEEPGRAM_API_KEY", DEEPGRAM_API_KEY),
