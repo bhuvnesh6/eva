@@ -85,9 +85,9 @@ MAX_HISTORY_MESSAGES = 16
 
 # How long Eva waits, after the user goes quiet, before she actually replies.
 # Mimics a natural human turn-taking gap instead of jumping in instantly.
-RESPONSE_DELAY_SECS = float(os.environ.get("EVA_RESPONSE_PAUSE_SECS", 3.5))
+RESPONSE_DELAY_SECS = float(os.environ.get("EVA_RESPONSE_PAUSE_SECS", 1.0))
 
-BARGE_IN_GRACE_SECS = float(os.environ.get("EVA_BARGE_IN_GRACE_SECS", 2.0))
+BARGE_IN_GRACE_SECS = float(os.environ.get("EVA_BARGE_IN_GRACE_SECS", 1.0))
 
 DEEPGRAM_API_KEY = os.environ.get("DEEPGRAM_API_KEY")
 MISTRAL_API_KEY = os.environ.get("MISTRAL_API_KEY")
