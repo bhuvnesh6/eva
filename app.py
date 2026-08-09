@@ -106,6 +106,9 @@ PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL", "").rstrip("/")
 # (POST /api/calls) and requests Eva sends back TO PravaahAI's callback_url.
 EVA_API_SECRET = os.environ.get("EVA_API_SECRET", "")
 
+PRAVAAH_API_BASE_URL = os.environ.get("PRAVAAH_API_BASE_URL", "").rstrip("/")
+
+
 
 def _e164(num: str) -> str:
     """Best-effort normalize to E.164 (assumes country code is already included)."""
@@ -619,6 +622,62 @@ class EvaSession:
                 self._send_json({"type": "status", "state": "listening"})
 
 
+
+# ---------------- Web widget <-> PravaahAI bridge ----------------
+
+def fetch_widget_config(public_id: str):
+    """Asks PravaahAI which agent this public widget id belongs to, and
+    whether the owner still has Eva minutes."""
+    if not PRAVAAH_API_BASE_URL or not EVA_API_SECRET:
+        return None, "Eva is not configured to talk to PravaahAI (PRAVAAH_API_BASE_URL/EVA_API_SECRET missing)"
+    try:
+        resp = requests.get(
+            f"{PRAVAAH_API_BASE_URL}/api/public/widget-config/{public_id}",
+            headers={"X-Eva-Secret": EVA_API_SECRET}, timeout=10,
+        )
+        data = resp.json()
+        if resp.status_code >= 400:
+            return None, data.get("error", "Widget not found")
+        return data, None
+    except Exception as e:
+        return None, str(e)
+
+
+def report_widget_lead(owner_id, widget_id, name, phone, email):
+    """Fired the moment a visitor submits the lead form, so the lead exists
+    in PravaahAI even if the call drops immediately after."""
+    if not PRAVAAH_API_BASE_URL or not EVA_API_SECRET:
+        return None
+    try:
+        resp = requests.post(
+            f"{PRAVAAH_API_BASE_URL}/api/eva-webhook/widget-lead",
+            headers={"X-Eva-Secret": EVA_API_SECRET, "Content-Type": "application/json"},
+            json={"owner_id": owner_id, "widget_id": widget_id, "name": name, "phone": phone, "email": email},
+            timeout=10,
+        )
+        return resp.json().get("lead_id")
+    except Exception as e:
+        log("WIDGET", f"lead report failed: {e}")
+        return None
+
+
+def report_widget_session_end(owner_id, widget_id, lead_id, duration_secs, transcript):
+    """Fired when the widget WS closes — this is what deducts Eva minutes."""
+    if not PRAVAAH_API_BASE_URL or not EVA_API_SECRET:
+        return
+    try:
+        requests.post(
+            f"{PRAVAAH_API_BASE_URL}/api/eva-webhook/widget-session-result",
+            headers={"X-Eva-Secret": EVA_API_SECRET, "Content-Type": "application/json"},
+            json={
+                "owner_id": owner_id, "widget_id": widget_id, "lead_id": lead_id or "",
+                "duration_secs": duration_secs, "transcript": transcript,
+            },
+            timeout=15,
+        )
+    except Exception as e:
+        log("WIDGET", f"session-result report failed: {e}")
+
 # ============================================================
 # Routes
 # ============================================================
@@ -631,6 +690,233 @@ def landing():
 def widget_js():
     return send_from_directory("static", "widget.js", mimetype="application/javascript")
 
+
+@app.route("/embed/widget.js")
+def embed_widget_js():
+    """Self-contained embed script. Users paste ONE tag on their site:
+      <script src="{EVA_PUBLIC_BASE_URL}/embed/widget.js"
+              data-public-id="wgt_xxx" data-color="#2454E8" async></script>
+    Renders a floating mic bubble bottom-right on desktop, and a full-width
+    centered bottom bubble on mobile (see @media block in the CSS below)."""
+    js = r"""
+(function(){
+  var cur = document.currentScript;
+  var publicId = cur.getAttribute('data-public-id');
+  var color = cur.getAttribute('data-color') || '#2454E8';
+  if(!publicId){ console.error('[EvaWidget] missing data-public-id'); return; }
+  var evaOrigin = cur.src.split('/embed/widget.js')[0];
+  var wsUrl = evaOrigin.replace(/^http/, 'ws') + '/ws/widget/' + publicId;
+
+  var css = document.createElement('style');
+  css.textContent = `
+    #eva-w-bubble{position:fixed;bottom:22px;right:22px;width:62px;height:62px;border-radius:50%;
+      background:${color};box-shadow:0 6px 20px rgba(0,0,0,.25);display:flex;align-items:center;
+      justify-content:center;cursor:pointer;z-index:999999;transition:transform .2s;}
+    #eva-w-bubble:hover{transform:scale(1.06);}
+    #eva-w-bubble svg{width:26px;height:26px;fill:#fff;}
+    #eva-w-bubble.eva-live{animation:eva-pulse 1.4s infinite;}
+    @keyframes eva-pulse{0%{box-shadow:0 0 0 0 ${color}66;}70%{box-shadow:0 0 0 16px ${color}00;}100%{box-shadow:0 0 0 0 ${color}00;}}
+    #eva-w-panel{position:fixed;bottom:96px;right:22px;width:340px;max-width:92vw;height:480px;max-height:76vh;
+      background:#fff;border-radius:16px;box-shadow:0 12px 40px rgba(0,0,0,.22);display:none;flex-direction:column;
+      overflow:hidden;z-index:999999;font-family:-apple-system,Segoe UI,Roboto,sans-serif;}
+    #eva-w-panel.open{display:flex;}
+    #eva-w-head{background:${color};color:#fff;padding:14px 16px;font-size:14px;font-weight:600;}
+    #eva-w-body{flex:1;padding:16px;overflow:auto;font-size:13px;color:#222;}
+    #eva-w-form input{width:100%;box-sizing:border-box;margin-bottom:8px;padding:10px 12px;border:1px solid #ddd;
+      border-radius:8px;font-size:13px;}
+    #eva-w-form button{width:100%;padding:10px;border:none;border-radius:8px;background:${color};color:#fff;
+      font-weight:600;cursor:pointer;}
+    #eva-w-status{text-align:center;color:#888;font-size:12px;margin-top:10px;}
+    #eva-w-mic{width:74px;height:74px;border-radius:50%;background:${color};margin:20px auto;display:flex;
+      align-items:center;justify-content:center;cursor:pointer;animation:eva-mic-pulse 1.8s infinite;}
+    @keyframes eva-mic-pulse{0%{box-shadow:0 0 0 0 ${color}55;}70%{box-shadow:0 0 0 14px ${color}00;}100%{box-shadow:0 0 0 0 ${color}00;}}
+    #eva-w-mic svg{width:30px;height:30px;fill:#fff;}
+    #eva-w-transcript{font-size:12.5px;line-height:1.6;}
+    #eva-w-transcript .u{color:#111;font-weight:600;}
+    #eva-w-transcript .a{color:${color};font-weight:600;}
+    @media(max-width:520px){
+      #eva-w-bubble{left:50%;right:auto;bottom:18px;transform:translateX(-50%);}
+      #eva-w-bubble:hover{transform:translateX(-50%) scale(1.06);}
+      #eva-w-panel{left:0;right:0;bottom:0;transform:none;width:100%;height:100%;
+        max-height:100%;border-radius:0;max-width:100%;}
+    }
+  `;
+  document.head.appendChild(css);
+
+  var bubble = document.createElement('div'); bubble.id = 'eva-w-bubble';
+  bubble.innerHTML = '<svg viewBox="0 0 24 24"><path d="M12 14a3 3 0 0 0 3-3V6a3 3 0 0 0-6 0v5a3 3 0 0 0 3 3zm5-3a5 5 0 0 1-10 0H5a7 7 0 0 0 6 6.92V21h2v-3.08A7 7 0 0 0 19 11h-2z"/></svg>';
+  var panel = document.createElement('div'); panel.id = 'eva-w-panel';
+  panel.innerHTML = `
+    <div id="eva-w-head">Talk to us</div>
+    <div id="eva-w-body">
+      <div id="eva-w-form">
+        <input id="eva-w-name" placeholder="Your name">
+        <input id="eva-w-phone" placeholder="Phone number">
+        <input id="eva-w-email" placeholder="Email (optional)">
+        <button id="eva-w-start">Start</button>
+      </div>
+      <div id="eva-w-call" style="display:none;text-align:center;">
+        <div id="eva-w-mic"><svg viewBox="0 0 24 24"><path d="M12 14a3 3 0 0 0 3-3V6a3 3 0 0 0-6 0v5a3 3 0 0 0 3 3zm5-3a5 5 0 0 1-10 0H5a7 7 0 0 0 6 6.92V21h2v-3.08A7 7 0 0 0 19 11h-2z"/></svg></div>
+        <div id="eva-w-status">Connecting…</div>
+        <div id="eva-w-transcript"></div>
+      </div>
+    </div>`;
+  document.body.appendChild(bubble); document.body.appendChild(panel);
+
+  var ws, audioCtx, mic, processor, playHead = 0;
+  bubble.onclick = function(){ panel.classList.toggle('open'); };
+
+  document.getElementById('eva-w-start').onclick = function(){
+    var name = document.getElementById('eva-w-name').value.trim();
+    var phone = document.getElementById('eva-w-phone').value.trim();
+    var email = document.getElementById('eva-w-email').value.trim();
+    if(!name || !phone){ alert('Please share your name and phone number'); return; }
+    document.getElementById('eva-w-form').style.display = 'none';
+    document.getElementById('eva-w-call').style.display = 'block';
+    startSession(name, phone, email);
+  };
+
+  function startSession(name, phone, email){
+    ws = new WebSocket(wsUrl);
+    ws.binaryType = 'arraybuffer';
+    ws.onopen = function(){
+      ws.send(JSON.stringify({type:'lead_info', name:name, phone:phone, email:email}));
+      startMic();
+      bubble.classList.add('eva-live');
+    };
+    ws.onmessage = function(ev){
+      if(typeof ev.data === 'string'){
+        var msg = JSON.parse(ev.data);
+        if(msg.type === 'status'){ document.getElementById('eva-w-status').textContent =
+          msg.state === 'speaking' ? 'Eva is speaking…' : (msg.state === 'thinking' ? 'Thinking…' : 'Listening…'); }
+        if(msg.type === 'assistant_delta'){ appendTranscript('a', msg.text, true); }
+        if(msg.type === 'assistant_done'){ appendTranscript('a', '', false); }
+        if(msg.type === 'user_transcript' && msg.final){ appendTranscript('u', msg.text, false); }
+        if(msg.type === 'error'){ document.getElementById('eva-w-status').textContent = msg.message; }
+      } else {
+        playAudio(ev.data);
+      }
+    };
+    ws.onclose = function(){ bubble.classList.remove('eva-live'); document.getElementById('eva-w-status').textContent = 'Call ended'; stopMic(); };
+  }
+
+  var lastRole = null, lastLine = null;
+  function appendTranscript(role, text, streaming){
+    var box = document.getElementById('eva-w-transcript');
+    if(streaming && lastRole === role && lastLine){ lastLine.lastChild.textContent += text; }
+    else{
+      lastLine = document.createElement('div');
+      lastLine.innerHTML = '<span class="'+role+'">'+(role==='u'?'You: ':'Eva: ')+'</span>';
+      lastLine.appendChild(document.createTextNode(text));
+      box.appendChild(lastLine); lastRole = role;
+    }
+    box.scrollTop = box.scrollHeight;
+  }
+
+  function startMic(){
+    navigator.mediaDevices.getUserMedia({audio:{channelCount:1,sampleRate:16000}}).then(function(stream){
+      audioCtx = new (window.AudioContext||window.webkitAudioContext)({sampleRate:16000});
+      mic = audioCtx.createMediaStreamSource(stream);
+      processor = audioCtx.createScriptProcessor(4096,1,1);
+      mic.connect(processor); processor.connect(audioCtx.destination);
+      processor.onaudioprocess = function(e){
+        if(!ws || ws.readyState !== 1) return;
+        var input = e.inputBuffer.getChannelData(0);
+        var pcm = new Int16Array(input.length);
+        for(var i=0;i<input.length;i++){ var s = Math.max(-1,Math.min(1,input[i])); pcm[i] = s<0?s*0x8000:s*0x7FFF; }
+        ws.send(pcm.buffer);
+      };
+    }).catch(function(){ document.getElementById('eva-w-status').textContent = 'Microphone access denied'; });
+  }
+  function stopMic(){
+    if(processor){ processor.disconnect(); }
+    if(mic){ mic.disconnect(); }
+    if(audioCtx){ audioCtx.close(); }
+  }
+
+  function playAudio(buf){
+    if(!audioCtx) return;
+    var pcm = new Int16Array(buf);
+    var float32 = new Float32Array(pcm.length);
+    for(var i=0;i<pcm.length;i++) float32[i] = pcm[i]/0x8000;
+    var abuf = audioCtx.createBuffer(1, float32.length, 22050);
+    abuf.copyToChannel(float32, 0);
+    var src = audioCtx.createBufferSource();
+    src.buffer = abuf; src.connect(audioCtx.destination);
+    var startAt = Math.max(audioCtx.currentTime, playHead);
+    src.start(startAt); playHead = startAt + abuf.duration;
+  }
+})();
+"""
+    return js, 200, {"Content-Type": "application/javascript"}
+
+
+@sock.route("/ws/widget/<public_id>")
+def widget_ws(ws, public_id):
+    """A visitor on some customer's website connects here. We look up which
+    agent + owner this public_id belongs to, run the normal Eva voice
+    pipeline, capture the lead, and bill Eva minutes on close."""
+    config, err = fetch_widget_config(public_id)
+    if err or not config:
+        try:
+            ws.send(json.dumps({"type": "error", "message": err or "Widget unavailable"}))
+        except Exception:
+            pass
+        return
+
+    owner_id = config["owner_id"]
+    widget_id = config["widget_id"]
+    agent = config.get("agent", {})
+    require_lead_first = config.get("require_lead_before_chat", True)
+
+    session = EvaSession(ws, mode="browser", agent=agent, lead={})
+    session.call_started_at = time.time()  # reused purely for widget duration billing
+    if not session.start():
+        return
+
+    if require_lead_first:
+        session._send_json({"type": "status", "state": "awaiting_lead_info"})
+    else:
+        session._send_json({"type": "ready"})
+        session.speak(agent.get("opening_line") or "Hi! How can I help you today?", "en")
+
+    lead_id_holder = {"lead_id": None}
+    log("MAIN", f"Widget visitor connected: {public_id}")
+
+    try:
+        while True:
+            msg = ws.receive()
+            if msg is None:
+                break
+            if isinstance(msg, (bytes, bytearray)):
+                session.feed_audio(bytes(msg))
+                continue
+            try:
+                payload = json.loads(msg)
+            except Exception:
+                continue
+
+            mtype = payload.get("type")
+            if mtype == "lead_info":
+                name = (payload.get("name") or "").strip()
+                phone = (payload.get("phone") or "").strip()
+                email = (payload.get("email") or "").strip()
+                session.lead = {"name": name, "phone": phone, "email": email}
+                lead_id_holder["lead_id"] = report_widget_lead(owner_id, widget_id, name, phone, email)
+                session._send_json({"type": "ready"})
+                opening = render_call_vars(agent.get("opening_line") or "Hi {{name}}, how can I help you today?", session.lead)
+                session.speak(opening, "en")
+            elif mtype == "text":
+                session.feed_text(payload.get("text", ""))
+            elif mtype == "ping":
+                session._send_json({"type": "pong"})
+    except Exception as e:
+        log("MAIN", f"widget ws loop error: {e}")
+    finally:
+        session.close()
+        duration_secs = round(time.time() - session.call_started_at, 1)
+        report_widget_session_end(owner_id, widget_id, lead_id_holder["lead_id"], duration_secs, session.transcript)
+        log("MAIN", f"Widget visitor disconnected: {public_id} ({duration_secs}s)")
 
 @app.route("/health")
 def health():
