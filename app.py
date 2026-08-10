@@ -1239,7 +1239,7 @@ def twilio_outbound_ws(ws, call_id):
     if missing:
         log("MAIN", f"Outbound call rejected, missing keys: {missing}")
         return
-
+#
     session = EvaSession(
         ws, mode="phone", call_id=call_id,
         agent=cfg["agent"], lead=cfg["lead"], callback_url=cfg["callback_url"],
