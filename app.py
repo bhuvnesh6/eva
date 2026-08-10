@@ -82,6 +82,10 @@ BOOK_MEETING_RE = re.compile(r"BOOK_MEETING:\s*(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{
 MISTRAL_MODEL = "mistral-small-latest"
 SARVAM_TTS_MODEL = "bulbul:v3"
 DEFAULT_SPEAKER = os.environ.get("EVA_SPEAKER", "priya")
+# Speech playback speed. bulbul:v3 accepts 0.5 (slower) to 2.0 (faster);
+# 1.0 is normal pace. A touch above 1.0 reads as natural-but-brisk instead
+# of sluggish, without tipping into sounding rushed.
+TTS_PACE = float(os.environ.get("EVA_TTS_PACE", 1.12))
 
 MAX_HISTORY_MESSAGES = 16
 
@@ -209,6 +213,12 @@ class EvaSession:
         self.barge_in_candidate_lock = threading.Lock()
         self.barge_in_candidate_timer = None
 
+        # True while Eva is in the middle of a single response turn
+        # (from the first sentence she starts speaking until she's fully
+        # done and gone quiet). Used so the barge-in grace window only
+        # fires once per turn instead of re-arming on every sentence.
+        self.turn_active = False
+
         # --- campaign-call metadata (all None/empty for plain browser/dev calls) ---
         self.call_id = call_id
         self.agent = agent
@@ -335,6 +345,11 @@ class EvaSession:
             if self.barge_in_candidate_timer:
                 self.barge_in_candidate_timer.cancel()
                 self.barge_in_candidate_timer = None
+
+        # The turn Eva was mid-way through is over now - the next thing
+        # she says (the new answer) is a fresh turn and earns its own
+        # grace window (see _enqueue_sentence).
+        self.turn_active = False
 
         if self.mode == "phone":
             if self.stream_sid:
@@ -502,12 +517,17 @@ class EvaSession:
         self.user_text_q.put(text)
 
     def _enqueue_sentence(self, text: str, lang: str):
-        """Puts a line on the TTS queue. If the queue was empty, this is the
-        start of a new thing Eva is about to say, so open a short barge-in
-        grace window - protects against a false VAD trigger cutting her off
-        before she's made a sound (see BARGE_IN_GRACE_SECS)."""
-        if self.sentence_q.empty():
+        """Puts a line on the TTS queue. Only the FIRST sentence of a brand
+        new turn (Eva was fully idle beforehand) opens the barge-in grace
+        window. This used to re-open on every single sentence whenever the
+        queue happened to be momentarily empty between sentences of the
+        SAME reply - which is most of the time during a multi-sentence
+        answer - so Eva was almost continuously "protected" and a real
+        interruption could never land. Now it fires once, right as she
+        starts talking, and stays off for the rest of that turn."""
+        if self.sentence_q.empty() and not self.turn_active:
             self.barge_in_grace_until = time.time() + BARGE_IN_GRACE_SECS
+        self.turn_active = True
         self.sentence_q.put((text, lang))
 
     def speak(self, text: str, lang: str = "en"):
@@ -621,9 +641,22 @@ class EvaSession:
                 self.interrupt_flag.clear()
 
                 user_lang = self.forced_language or detect_lang(user_text)
+                # Must match the script rule already set in the system
+                # prompt (Hinglish = Hindi words in Latin/English script,
+                # NOT Devanagari). The old text here said "Hindi
+                # (Devanagari)", which directly contradicted that - the
+                # model would inconsistently follow one instruction or the
+                # other, so replies sometimes came back in Devanagari
+                # instead of Hinglish.
                 lang_note = {
                     "role": "system",
-                    "content": f"(Reply in {'Hindi (Devanagari)' if user_lang == 'hi' else 'English'} only.)"
+                    "content": (
+                        "(Reply in Hinglish - Hindi words written in "
+                        "English/Latin script, mixed lightly with English - "
+                        "only.)"
+                        if user_lang == "hi"
+                        else "(Reply in English only.)"
+                    )
                 }
                 self.history.append({"role": "user", "content": user_text})
                 self._send_json({"type": "status", "state": "thinking"})
@@ -709,6 +742,7 @@ class EvaSession:
                 # "language_code" (NOT "target_language_code" - that name is
                 # only valid on the non-streaming .convert() call). Passing
                 # the wrong name throws a TypeError and produces zero audio.
+                # `pace` is bulbul:v3's speed knob (0.5-2.0, 1.0 = normal).
                 for chunk in self.sarvam.text_to_speech.convert_stream(
                     text=sentence,
                     language_code=target_language_code,
@@ -716,6 +750,7 @@ class EvaSession:
                     model=SARVAM_TTS_MODEL,
                     output_audio_codec=tts_codec,
                     speech_sample_rate=tts_rate,
+                    pace=TTS_PACE,
                 ):
                     if self.interrupt_flag.is_set():
                         # user started talking mid-sentence - stop right here
@@ -743,6 +778,10 @@ class EvaSession:
             # Let the client know this sentence's audio has fully been sent.
             if self.sentence_q.empty() and not self.interrupt_flag.is_set():
                 self._send_json({"type": "status", "state": "listening"})
+                # Eva has genuinely gone quiet with nothing queued - the
+                # turn is over. Next time she speaks it's a fresh turn and
+                # gets a fresh grace window (see _enqueue_sentence).
+                self.turn_active = False
 
 
 
