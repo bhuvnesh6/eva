@@ -44,6 +44,7 @@ import json
 import time
 import base64
 import queue
+import random
 import threading
 import uuid
 from datetime import datetime
@@ -86,9 +87,23 @@ MAX_HISTORY_MESSAGES = 16
 
 # How long Eva waits, after the user goes quiet, before she actually replies.
 # Mimics a natural human turn-taking gap instead of jumping in instantly.
-RESPONSE_DELAY_SECS = float(os.environ.get("EVA_RESPONSE_PAUSE_SECS", 1.0))
+RESPONSE_DELAY_SECS = float(os.environ.get("EVA_RESPONSE_PAUSE_SECS", 0.7))
+# Small random jitter added on top of the base pause so Eva doesn't reply
+# on the exact same beat every time - a perfectly fixed delay is what
+# makes a voice bot feel mechanical.
+RESPONSE_DELAY_JITTER_SECS = float(os.environ.get("EVA_RESPONSE_PAUSE_JITTER", 0.25))
+# Short acknowledgements ("yes", "okay", "no thanks") get a shorter pause -
+# humans reply to quick confirmations faster than to longer statements.
+SHORT_UTTERANCE_MAX_WORDS = int(os.environ.get("EVA_SHORT_UTTERANCE_MAX_WORDS", 3))
+SHORT_UTTERANCE_DELAY_SECS = float(os.environ.get("EVA_SHORT_UTTERANCE_PAUSE_SECS", 0.35))
 
 BARGE_IN_GRACE_SECS = float(os.environ.get("EVA_BARGE_IN_GRACE_SECS", 1.0))
+# VAD (SpeechStarted) fires on ANY audio energy spike - coughs, breathing,
+# mic bumps - not just real speech. We no longer interrupt Eva on VAD
+# alone; we wait to see if Deepgram actually transcribes real words within
+# this window before treating it as a genuine barge-in.
+BARGE_IN_CONFIRM_MIN_CHARS = int(os.environ.get("EVA_BARGE_IN_MIN_CHARS", 2))
+BARGE_IN_CONFIRM_TIMEOUT_SECS = float(os.environ.get("EVA_BARGE_IN_CONFIRM_TIMEOUT", 0.6))
 
 DEEPGRAM_API_KEY = os.environ.get("DEEPGRAM_API_KEY")
 MISTRAL_API_KEY = os.environ.get("MISTRAL_API_KEY")
@@ -185,6 +200,14 @@ class EvaSession:
         self.pending_transcript = ""             # accumulates final STT chunks pre-response
         self.pending_timer = None                # fires RESPONSE_DELAY_SECS after last speech
         self.barge_in_grace_until = 0.0          # epoch time; ignore VAD barge-in until this passes
+
+        # VAD fires a "candidate" barge-in; it only becomes a real
+        # interrupt once actual transcribed speech confirms it (see
+        # _dg_speech_started / _dg_transcript). Fixes Eva stopping on
+        # every small mic noise.
+        self.barge_in_candidate = threading.Event()
+        self.barge_in_candidate_lock = threading.Lock()
+        self.barge_in_candidate_timer = None
 
         # --- campaign-call metadata (all None/empty for plain browser/dev calls) ---
         self.call_id = call_id
@@ -299,13 +322,19 @@ class EvaSession:
 
     # ---------- barge-in ----------
     def _interrupt_playback(self):
-        """Called the instant the user starts talking. Stops Eva immediately:
-        drops anything queued to be spoken, breaks the in-flight TTS stream,
-        and tells the client/Twilio to flush any audio already sent but not
-        yet played."""
+        """Called once a barge-in is CONFIRMED (real transcribed speech, not
+        just VAD noise). Stops Eva immediately: drops anything queued to be
+        spoken, breaks the in-flight TTS stream, and tells the client/Twilio
+        to flush any audio already sent but not yet played."""
         self.interrupt_flag.set()
         with self.sentence_q.mutex:
             self.sentence_q.queue.clear()
+
+        with self.barge_in_candidate_lock:
+            self.barge_in_candidate.clear()
+            if self.barge_in_candidate_timer:
+                self.barge_in_candidate_timer.cancel()
+                self.barge_in_candidate_timer = None
 
         if self.mode == "phone":
             if self.stream_sid:
@@ -328,22 +357,33 @@ class EvaSession:
         if time.time() < self.barge_in_grace_until:
             return
 
-        # Only treat this as a real barge-in - and only cancel the pending
-        # response timer - if Eva is actually speaking or has something
-        # queued to say. Otherwise this is just VAD firing on a mid-thought
-        # pause/breath while the user is still talking. Cancelling the
-        # pending timer in that case is the bug: if the user then falls
-        # silent (turn over, waiting for a reply) with no further final
-        # transcript to restart it, the timer never fires again and Eva
-        # goes silent for the rest of the call/session.
-        if self.eva_speaking.is_set() or not self.sentence_q.empty():
-            with self.pending_lock:
-                if self.pending_timer:
-                    self.pending_timer.cancel()
-                    self.pending_timer = None
-            log("MAIN", f"[{self.call_id or 'browser'}] Barge-in - interrupting Eva.")
-            self._interrupt_playback()
+        if not (self.eva_speaking.is_set() or not self.sentence_q.empty()):
+            return
 
+        # IMPORTANT: VAD alone does NOT interrupt Eva anymore. Deepgram's
+        # SpeechStarted fires on any energy spike (coughs, breathing, mic
+        # bumps), which used to cut Eva off on the tiniest noise. Instead we
+        # mark this as a *candidate* barge-in and wait up to
+        # BARGE_IN_CONFIRM_TIMEOUT_SECS for _dg_transcript to actually see
+        # real transcribed words - only then do we treat it as a genuine
+        # barge-in and stop her. If nothing gets transcribed in time, this
+        # candidate silently expires (was just noise).
+        with self.barge_in_candidate_lock:
+            self.barge_in_candidate.set()
+            if self.barge_in_candidate_timer:
+                self.barge_in_candidate_timer.cancel()
+            self.barge_in_candidate_timer = threading.Timer(
+                BARGE_IN_CONFIRM_TIMEOUT_SECS, self._clear_barge_in_candidate
+            )
+            self.barge_in_candidate_timer.daemon = True
+            self.barge_in_candidate_timer.start()
+
+    def _clear_barge_in_candidate(self):
+        """Candidate barge-in expired unconfirmed - it was noise, not speech."""
+        with self.barge_in_candidate_lock:
+            self.barge_in_candidate.clear()
+            self.barge_in_candidate_timer = None
+    
 
     def _dg_transcript(self, *_a, result=None, **_k):
         if result is None:
@@ -351,6 +391,24 @@ class EvaSession:
         transcript = result.channel.alternatives[0].transcript
         if not transcript:
             return
+
+        # A candidate barge-in (raised by VAD in _dg_speech_started) is only
+        # confirmed once we see real transcribed words - this is what
+        # filters out noise/breath triggers vs an actual interruption.
+        if self.barge_in_candidate.is_set() and len(transcript.strip()) >= BARGE_IN_CONFIRM_MIN_CHARS:
+            with self.barge_in_candidate_lock:
+                self.barge_in_candidate.clear()
+                if self.barge_in_candidate_timer:
+                    self.barge_in_candidate_timer.cancel()
+                    self.barge_in_candidate_timer = None
+            if self.eva_speaking.is_set() or not self.sentence_q.empty():
+                with self.pending_lock:
+                    if self.pending_timer:
+                        self.pending_timer.cancel()
+                        self.pending_timer = None
+                log("MAIN", f"[{self.call_id or 'browser'}] Barge-in confirmed - interrupting Eva.")
+                self._interrupt_playback()
+
         if result.is_final:
             log("STT", f"Final transcript: {transcript}")
             self._send_json({"type": "user_transcript", "text": transcript, "final": True})
@@ -368,13 +426,29 @@ class EvaSession:
     # ---------- natural turn-taking pause ----------
     def _queue_with_pause(self, transcript: str):
         """Buffer finalized speech and only hand it to the LLM once the user
-        has been quiet for RESPONSE_DELAY_SECS. Each new final transcript
-        resets the timer, so short mid-thought pauses don't get cut off."""
+        has been quiet for a short pause. Each new final transcript resets
+        the timer, so short mid-thought pauses don't get cut off.
+
+        The pause length now varies instead of being a single fixed number:
+        - short replies ("yes", "sounds good") get a quicker turnaround,
+          since that's how people actually respond to quick confirmations
+        - a small random jitter is added on top either way, so Eva never
+          replies on the exact same beat twice - that uniformity is what
+          made her feel robotic."""
         with self.pending_lock:
             self.pending_transcript = (self.pending_transcript + " " + transcript).strip()
             if self.pending_timer:
                 self.pending_timer.cancel()
-            self.pending_timer = threading.Timer(RESPONSE_DELAY_SECS, self._flush_pending_transcript)
+
+            word_count = len(self.pending_transcript.split())
+            base_delay = (
+                SHORT_UTTERANCE_DELAY_SECS
+                if word_count <= SHORT_UTTERANCE_MAX_WORDS
+                else RESPONSE_DELAY_SECS
+            )
+            delay = base_delay + random.uniform(0, RESPONSE_DELAY_JITTER_SECS)
+
+            self.pending_timer = threading.Timer(delay, self._flush_pending_transcript)
             self.pending_timer.daemon = True
             self.pending_timer.start()
 
@@ -463,6 +537,11 @@ class EvaSession:
             if self.pending_timer:
                 self.pending_timer.cancel()
                 self.pending_timer = None
+        with self.barge_in_candidate_lock:
+            if self.barge_in_candidate_timer:
+                self.barge_in_candidate_timer.cancel()
+                self.barge_in_candidate_timer = None
+            self.barge_in_candidate.clear()
         try:
             self.dg_connection.finish()
         except Exception:
