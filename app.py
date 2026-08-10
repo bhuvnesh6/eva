@@ -76,6 +76,7 @@ TTS_SAMPLE_RATE = 22050        # PCM16 we send back to the browser
 SENTENCE_END_RE = re.compile(r"([.!?।\n])")
 SPEAKABLE_RE = re.compile(r"[A-Za-z0-9\u0900-\u097F]")
 DEVANAGARI_RE = re.compile(r"[\u0900-\u097F]")
+BOOK_MEETING_RE = re.compile(r"BOOK_MEETING:\s*(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2})")
 
 MISTRAL_MODEL = "mistral-small-latest"
 SARVAM_TTS_MODEL = "bulbul:v3"
@@ -165,9 +166,10 @@ sock = Sock(app)
 class EvaSession:
     def __init__(self, ws, speaker: str = DEFAULT_SPEAKER, mode: str = "browser",
                  call_id: str = None, agent: dict = None, lead: dict = None,
-                 callback_url: str = None):
+                 callback_url: str = None, meeting: dict = None):
         agent = agent or {}
         lead = lead or {}
+        self.meeting = meeting or {}
 
         self.ws = ws
         self.speaker = (agent.get("speaker") or speaker or DEFAULT_SPEAKER)
@@ -217,7 +219,7 @@ class EvaSession:
                 f"{lead.get('business_name', 'their business')}. Use their name naturally, don't overuse it."
             )
         if self.forced_language == "hi":
-            base_prompt += "\nAlways reply in Hinglish written in English script, mixed lightly with English words."
+            base_prompt += "\nAlways reply in English or hindi as per user speaking written in English script, mixed lightly with English words."
         elif self.forced_language == "en":
             base_prompt += "\nAlways reply in English only."
         else:
@@ -229,6 +231,21 @@ class EvaSession:
                 "Never default to Hindi on your own."
             )
         base_prompt += "\nNever reply using only emojis or symbols with no words."
+
+        if self.meeting:
+            base_prompt += (
+                "\n\nYou can book a meeting for this lead. Meetings are "
+                f"{self.meeting.get('duration_minutes', 30)} minutes long. "
+                f"Available windows: {self.meeting.get('availability_text', '')}. "
+                "The lead's name and phone number are already known to you — never ask for "
+                "them again, only ask for their preferred meeting date and time. "
+                "Once they confirm one specific date and time, output EXACTLY one line in "
+                "this format and nothing else on that line: "
+                "BOOK_MEETING: YYYY-MM-DD HH:MM (24-hour clock, UTC). "
+                "Do not say this line out loud or explain it to the lead — it is processed "
+                "automatically and you will be told right after whether it was confirmed, "
+                "so you can relay that to them."
+            )
 
         self.system_prompt = {"role": "system", "content": base_prompt}
 
@@ -423,6 +440,23 @@ class EvaSession:
         """Queue a line straight to TTS, bypassing the LLM (e.g. an opening greeting)."""
         self._enqueue_sentence(text, lang)
 
+    def _trigger_meeting_booking(self, date_str: str, time_str: str):
+        """Called from the LLM loop the instant a BOOK_MEETING tag is seen.
+        Blocking — runs synchronously inside the LLM thread, which briefly
+        pauses further token consumption from Mistral for that turn. Fine
+        for a single short HTTP call; worth revisiting if this ever needs
+        to be non-blocking."""
+        if not self.meeting:
+            return
+        requested_iso = f"{date_str}T{time_str}:00"
+        confirmed, message = book_meeting_via_pravaah(self.meeting, self.lead, self.call_id, requested_iso)
+        log("MEETING", f"[{self.call_id or 'test'}] requested={requested_iso} confirmed={confirmed}")
+        self.history.append({
+            "role": "system",
+            "content": f"[Booking result: {'confirmed' if confirmed else 'not available'}] {message}",
+        })
+        self._enqueue_sentence(message, detect_lang(message))
+
     def close(self):
         self.stop_event.set()
         with self.pending_lock:
@@ -535,8 +569,13 @@ class EvaSession:
                         remainder = parts[i] if i < len(parts) else ""
 
                         sentence = complete.strip()
-                        if sentence and is_speakable(sentence):
-                            self._enqueue_sentence(sentence, user_lang)
+                        if sentence:
+                            bm = BOOK_MEETING_RE.search(sentence)
+                            if bm:
+                                self._trigger_meeting_booking(bm.group(1), bm.group(2))
+                                sentence = BOOK_MEETING_RE.sub("", sentence).strip()
+                            if sentence and is_speakable(sentence):
+                                self._enqueue_sentence(sentence, user_lang)
                         buffer = remainder
                 except Exception as e:
                     log("LLM", f"ERROR: {e}")
@@ -545,8 +584,13 @@ class EvaSession:
 
                 if not self.interrupt_flag.is_set():
                     tail = buffer.strip()
-                    if tail and is_speakable(tail):
-                        self._enqueue_sentence(tail, user_lang)
+                    if tail:
+                        bm = BOOK_MEETING_RE.search(tail)
+                        if bm:
+                            self._trigger_meeting_booking(bm.group(1), bm.group(2))
+                            tail = BOOK_MEETING_RE.sub("", tail).strip()
+                        if tail and is_speakable(tail):
+                            self._enqueue_sentence(tail, user_lang)
 
                 if full_reply.strip():
                     self.transcript.append({"role": "agent", "text": full_reply.strip(), "ts": time.time()})
@@ -677,6 +721,47 @@ def report_widget_session_end(owner_id, widget_id, lead_id, duration_secs, trans
         )
     except Exception as e:
         log("WIDGET", f"session-result report failed: {e}")
+
+
+def book_meeting_via_pravaah(meeting_ctx: dict, lead: dict, call_id: str, requested_iso: str):
+    """Calls PravaahAI's booking webhook when Eva emits a BOOK_MEETING tag
+    mid-call. Returns (confirmed: bool, message_to_speak: str) — the message
+    is spoken verbatim, so it's kept short and deterministic rather than
+    trusting the LLM to phrase an API result correctly under time pressure."""
+    if not meeting_ctx or not EVA_API_SECRET:
+        return False, "Sorry, I'm not able to book meetings right now."
+    url = meeting_ctx.get("booking_webhook_url") or (
+        f"{PRAVAAH_API_BASE_URL}/api/eva-webhook/book-meeting" if PRAVAAH_API_BASE_URL else None
+    )
+    if not url:
+        return False, "Sorry, I'm not able to book meetings right now."
+    try:
+        resp = requests.post(
+            url,
+            headers={"X-Eva-Secret": EVA_API_SECRET, "Content-Type": "application/json"},
+            json={
+                "owner_id": meeting_ctx.get("owner_id", ""),
+                "lead_id": meeting_ctx.get("lead_id", ""),
+                "lead_name": lead.get("name", ""),
+                "lead_phone": lead.get("phone", ""),
+                "call_id": call_id or "",
+                "agent_id": meeting_ctx.get("agent_id", ""),
+                "requested_datetime": requested_iso,
+            },
+            timeout=15,
+        )
+        data = resp.json()
+        if resp.status_code == 201 and data.get("meeting"):
+            when = data["meeting"].get("scheduled_at", requested_iso)
+            return True, f"You're all set — your meeting is booked for {when} UTC. I've sent the details over WhatsApp."
+        alts = data.get("alternatives") or []
+        if alts:
+            alt_text = " or ".join(alts[:2])
+            return False, f"That time isn't available. Would {alt_text} (UTC) work instead?"
+        return False, data.get("error") or "That time isn't available — could you share another date and time?"
+    except Exception as e:
+        log("MEETING", f"booking webhook failed: {e}")
+        return False, "Sorry, I had trouble booking that — could we try again?"
 
 # ============================================================
 # Routes
@@ -1088,6 +1173,7 @@ def api_place_call():
     twilio_creds = data.get("twilio", {}) or {}
     agent = data.get("agent", {}) or {}
     lead = data.get("lead", {}) or {}
+    meeting = data.get("meeting") or {}
     callback_url = data.get("callback_url")
 
     if not (call_id and to_number and callback_url):
@@ -1102,6 +1188,7 @@ def api_place_call():
     with _pending_calls_lock:
         PENDING_CALLS[call_id] = {
             "agent": agent, "lead": lead, "callback_url": callback_url, "created_at": time.time(),
+            "meeting": meeting,
         }
 
     try:
@@ -1156,6 +1243,7 @@ def twilio_outbound_ws(ws, call_id):
     session = EvaSession(
         ws, mode="phone", call_id=call_id,
         agent=cfg["agent"], lead=cfg["lead"], callback_url=cfg["callback_url"],
+        meeting=cfg.get("meeting"),
     )
     if not session.start():
         session._finish_and_callback(hangup_reason="failed_to_start")
