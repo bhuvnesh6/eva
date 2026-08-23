@@ -65,6 +65,7 @@ from sarvamai import SarvamAI
 from twilio.rest import Client as TwilioClient
 from twilio.twiml.voice_response import VoiceResponse, Connect
 
+import websocket as vanisetu_ws_lib   # pip install websocket-client
 
 load_dotenv()
 
@@ -128,6 +129,11 @@ EVA_API_SECRET = os.environ.get("EVA_API_SECRET", "")
 
 PRAVAAH_API_BASE_URL = os.environ.get("PRAVAAH_API_BASE_URL", "").rstrip("/")
 
+# ---------------- VaniSetu (number provider) config ----------------
+VANISETU_WS_URL = os.environ.get("VANISETU_WS_URL", "wss://voice.varnet.in/v1/ai/connect")
+VANISETU_TCODE = os.environ.get("VANISETU_TCODE", "")
+VANISETU_TOKEN = os.environ.get("VANISETU_TOKEN", "")   # full "Bearer xxxx" string
+VANISETU_RATE = 8000   # G.711 mu-law over telephony — same rate as Twilio's PHONE_RATE
 
 
 def _e164(num: str) -> str:
@@ -185,7 +191,8 @@ sock = Sock(app)
 class EvaSession:
     def __init__(self, ws, speaker: str = DEFAULT_SPEAKER, mode: str = "browser",
                  call_id: str = None, agent: dict = None, lead: dict = None,
-                 callback_url: str = None, meeting: dict = None):
+                 callback_url: str = None, meeting: dict = None,
+                 transport: str = "twilio", vanisetu_session_id: int = None):
         agent = agent or {}
         lead = lead or {}
         self.meeting = meeting or {}
@@ -193,7 +200,9 @@ class EvaSession:
         self.ws = ws
         self.speaker = (agent.get("speaker") or speaker or DEFAULT_SPEAKER)
         self.mode = mode                # "browser" or "phone"
-        self.stream_sid = None          # set once Twilio's "start" event arrives (phone mode only)
+        self.transport = transport      # "twilio" | "vanisetu" — only meaningful when mode == "phone"
+        self.vanisetu_session_id = vanisetu_session_id  # numeric id VaniSetu assigned this call
+        self.stream_sid = None          # set once Twilio's "start" event arrives (phone + twilio only)
         self.ws_lock = threading.Lock()
         self.stop_event = threading.Event()
 
@@ -315,6 +324,14 @@ class EvaSession:
                 pass
 
     def _send_audio(self, audio_bytes: bytes):
+        if self.mode == "phone" and self.transport == "vanisetu":
+            # VaniSetu's socket is shared/multiplexed across every call on the
+            # account, so audio doesn't go through self.ws at all here — it
+            # goes out through the single VaniSetuClient connection, framed
+            # with this session's 4-byte session ID.
+            if self.vanisetu_session_id is not None:
+                vanisetu_client.send_audio(self.vanisetu_session_id, audio_bytes)
+            return
         with self.ws_lock:
             try:
                 if self.mode == "phone":
@@ -352,7 +369,10 @@ class EvaSession:
         self.turn_active = False
 
         if self.mode == "phone":
-            if self.stream_sid:
+            if self.transport == "vanisetu":
+                if self.vanisetu_session_id is not None:
+                    vanisetu_client.send_command(self.vanisetu_session_id, {"command": "FLUSH_MEDIA"})
+            elif self.stream_sid:
                 self._send_raw({"event": "clear", "streamSid": self.stream_sid})
         else:
             self._send_json({"type": "interrupt"})
@@ -562,6 +582,9 @@ class EvaSession:
                 self.barge_in_candidate_timer.cancel()
                 self.barge_in_candidate_timer = None
             self.barge_in_candidate.clear()
+        if self.mode == "phone" and self.transport == "vanisetu" and self.vanisetu_session_id is not None:
+            vanisetu_client.send_command(self.vanisetu_session_id, {"command": "HANGUP"})
+            vanisetu_client.unregister_session(self.vanisetu_session_id)
         try:
             self.dg_connection.finish()
         except Exception:
@@ -731,8 +754,11 @@ class EvaSession:
             self._send_json({"type": "status", "state": "speaking"})
             self.eva_speaking.set()
 
+            if self.mode == "phone" and self.transport == "vanisetu" and self.vanisetu_session_id is not None:
+                vanisetu_client.send_command(self.vanisetu_session_id, {"command": "START_MEDIA_BUFFERING"})
+
             if self.mode == "phone":
-                tts_codec, tts_rate = "mulaw", PHONE_RATE
+                tts_codec, tts_rate = "mulaw", (VANISETU_RATE if self.transport == "vanisetu" else PHONE_RATE)
             else:
                 tts_codec, tts_rate = "linear16", TTS_SAMPLE_RATE
 
@@ -880,6 +906,249 @@ def book_meeting_via_pravaah(meeting_ctx: dict, lead: dict, call_id: str, reques
     except Exception as e:
         log("MEETING", f"booking webhook failed: {e}")
         return False, "Sorry, I had trouble booking that — could we try again?"
+
+
+
+def fetch_caller_id_config(number: str):
+    """Asks PravaahAI which owner+agent a VaniSetu number belongs to, for
+    incoming calls. Mirrors fetch_widget_config()."""
+    if not PRAVAAH_API_BASE_URL or not EVA_API_SECRET:
+        return None, "Eva is not configured to talk to PravaahAI"
+    try:
+        resp = requests.get(
+            f"{PRAVAAH_API_BASE_URL}/api/public/caller-id-config/{number}",
+            headers={"X-Eva-Secret": EVA_API_SECRET}, timeout=10,
+        )
+        data = resp.json()
+        if resp.status_code >= 400:
+            return None, data.get("error", "Caller ID not found")
+        return data, None
+    except Exception as e:
+        return None, str(e)
+
+
+# ============================================================
+# VaniSetu — single multiplexed WS connection to the number provider
+# ============================================================
+class VaniSetuClient:
+    """One persistent WebSocket to VaniSetu carries every call on this
+    account, multiplexed by a numeric session_id VaniSetu assigns per call.
+    Owns that connection, authenticates, and routes audio/events to/from
+    the right EvaSession."""
+
+    def __init__(self):
+        self._wsapp = None
+        self._send_lock = threading.Lock()
+        self._ready = threading.Event()
+        self._stop = False
+
+        self.sessions = {}                    # vanisetu session_id (int) -> EvaSession
+        self._pending_incoming_call_ids = []   # FIFO of call_ids from INCOMING_CALL, not yet bound
+        self._pending_incoming_lock = threading.Lock()
+        self._pending_outbound = {}            # request_id -> {"to_number", "caller_id"}
+        self._pending_outbound_lock = threading.Lock()
+
+    # ---------- lifecycle ----------
+    def start(self):
+        if not (VANISETU_TCODE and VANISETU_TOKEN):
+            log("VANISETU", "VANISETU_TCODE/VANISETU_TOKEN not set — VaniSetu disabled.")
+            return
+        threading.Thread(target=self._run_forever, daemon=True, name="VaniSetuClient").start()
+
+    def _run_forever(self):
+        while not self._stop:
+            try:
+                self._ready.clear()
+                self._connect_once()
+            except Exception as e:
+                log("VANISETU", f"connection error: {e}")
+            self._ready.clear()
+            time.sleep(3)   # reconnect backoff
+
+    def _connect_once(self):
+        def on_open(wsapp):
+            log("VANISETU", "socket open, sending auth...")
+            wsapp.send(json.dumps({"type": "auth", "tcode": VANISETU_TCODE, "token": VANISETU_TOKEN}))
+
+        def on_message(wsapp, message):
+            try:
+                self._handle_message(message)
+            except Exception as e:
+                log("VANISETU", f"message handling error: {e}")
+
+        def on_error(wsapp, error):
+            log("VANISETU", f"socket error: {error}")
+
+        def on_close(wsapp, code, msg):
+            log("VANISETU", f"socket closed: {code} {msg}")
+            self._ready.clear()
+
+        self._wsapp = vanisetu_ws_lib.WebSocketApp(
+            VANISETU_WS_URL, on_open=on_open, on_message=on_message,
+            on_error=on_error, on_close=on_close,
+        )
+        self._wsapp.run_forever(ping_interval=25, ping_timeout=10)
+
+    # ---------- wire out ----------
+    def _send_text(self, obj):
+        if not self._wsapp:
+            return False
+        with self._send_lock:
+            try:
+                self._wsapp.send(json.dumps(obj))
+                return True
+            except Exception as e:
+                log("VANISETU", f"send error: {e}")
+                return False
+
+    def send_command(self, session_id: int, payload: dict):
+        return self._send_text({"session_id": session_id, "payload": payload})
+
+    def send_audio(self, session_id: int, audio_bytes: bytes):
+        if not self._wsapp:
+            return False
+        frame = session_id.to_bytes(4, "big") + audio_bytes
+        with self._send_lock:
+            try:
+                self._wsapp.send(frame, opcode=vanisetu_ws_lib.ABNF.OPCODE_BINARY)
+                return True
+            except Exception as e:
+                log("VANISETU", f"audio send error: {e}")
+                return False
+
+    def place_outbound_call(self, request_id: str, endpoint: str, caller_id: str):
+        with self._pending_outbound_lock:
+            self._pending_outbound[request_id] = {"to_number": endpoint, "caller_id": caller_id}
+        return self._send_text({"payload": {
+            "command": "OUTBOUND_CALL", "endpoint": endpoint,
+            "caller_id": caller_id, "request_id": request_id,
+        }})
+
+    def unregister_session(self, session_id: int):
+        self.sessions.pop(session_id, None)
+
+    # ---------- wire in ----------
+    def _handle_message(self, message):
+        if isinstance(message, (bytes, bytearray)):
+            self._handle_binary(message)
+            return
+
+        obj = json.loads(message)
+
+        if obj.get("event") == "INCOMING_CALL":
+            self._on_incoming_call(obj)
+            return
+        if obj.get("type") in ("auth_ok", "auth_success") or obj.get("status") == "ok":
+            log("VANISETU", "authenticated")
+            self._ready.set()
+            return
+        if obj.get("type") == "error":
+            log("VANISETU", f"error from VaniSetu: {obj}")
+            return
+
+        if "session_id" in obj:
+            session_id = obj["session_id"]
+            payload = obj.get("payload", {}) or {}
+            if payload.get("event") == "MEDIA_START":
+                self._on_media_start(session_id, payload)
+            else:
+                log("VANISETU", f"session {session_id}: unhandled payload {payload}")
+
+    def _handle_binary(self, data: bytes):
+        if len(data) < 4:
+            return
+        session_id = int.from_bytes(data[:4], "big")
+        session = self.sessions.get(session_id)
+        if session:
+            session.feed_audio(data[4:])
+
+    def _on_incoming_call(self, obj):
+        call_id = obj.get("call_id")
+        log("VANISETU", f"INCOMING_CALL call_id={call_id}")
+        with self._pending_incoming_lock:
+            self._pending_incoming_call_ids.append(call_id)
+
+    def _on_media_start(self, session_id, payload):
+        # Check whether this session is one of our own outbound requests.
+        # VaniSetu's doc doesn't show the exact field name request_id comes
+        # back under on the connect event, so we check a couple of likely
+        # names defensively — confirm with Varnet and tighten this if needed.
+        request_id = payload.get("request_id") or payload.get("requestId")
+        outbound_cfg = None
+        if request_id:
+            with self._pending_outbound_lock:
+                outbound_cfg = self._pending_outbound.pop(request_id, None)
+        if outbound_cfg:
+            self._bind_outbound_session(session_id, request_id)
+            return
+
+        # Otherwise treat it as an inbound call, matched FIFO to the oldest
+        # still-unbound INCOMING_CALL (sessions come up in call order).
+        with self._pending_incoming_lock:
+            call_id = self._pending_incoming_call_ids.pop(0) if self._pending_incoming_call_ids else None
+        self._bind_incoming_session(session_id, call_id)
+
+    # ---------- binding sessions ----------
+    def _bind_outbound_session(self, session_id, request_id):
+        call_id = request_id  # we use call_id as request_id when placing the call
+        with _pending_calls_lock:
+            cfg = PENDING_CALLS.get(call_id)
+        if not cfg:
+            log("VANISETU", f"no PENDING_CALLS entry for outbound call_id={call_id}, hanging up")
+            self.send_command(session_id, {"command": "HANGUP"})
+            return
+
+        session = EvaSession(
+            ws=None, mode="phone", transport="vanisetu", vanisetu_session_id=session_id,
+            call_id=call_id, agent=cfg["agent"], lead=cfg["lead"],
+            callback_url=cfg["callback_url"], meeting=cfg.get("meeting"),
+        )
+        self.sessions[session_id] = session
+        if not session.start():
+            self.send_command(session_id, {"command": "HANGUP"})
+            with _pending_calls_lock:
+                PENDING_CALLS.pop(call_id, None)
+            return
+
+        session.call_started_at = time.time()
+        self.send_command(session_id, {"command": "ANSWER"})
+        opening = render_call_vars(
+            cfg["agent"].get("opening_line") or "Hi, do you have a quick minute?", cfg["lead"],
+        )
+        opening_lang = "hi" if cfg["agent"].get("language") == "hi" else "en"
+        session.speak(opening, opening_lang)
+        log("VANISETU", f"Outbound call {call_id} connected as session {session_id}")
+
+    def _bind_incoming_session(self, session_id, call_id):
+        # TODO: VaniSetu doesn't document a "dialed number"/DID field on
+        # INCOMING_CALL or MEDIA_START — that's what we need to look up the
+        # right owner+agent. Confirm the real field with Varnet and set
+        # `number` from it. Until then, incoming VaniSetu calls are rejected.
+        number = None
+        config, err = (fetch_caller_id_config(number) if number else (None, "No DID field available from VaniSetu yet"))
+        if not config:
+            log("VANISETU", f"incoming call {call_id} (session {session_id}) rejected: {err}")
+            self.send_command(session_id, {"command": "HANGUP"})
+            return
+
+        agent = config.get("agent", {})
+        session = EvaSession(
+            ws=None, mode="phone", transport="vanisetu", vanisetu_session_id=session_id,
+            agent=agent, lead={},
+        )
+        self.sessions[session_id] = session
+        if not session.start():
+            self.send_command(session_id, {"command": "HANGUP"})
+            return
+        session.call_started_at = time.time()
+        self.send_command(session_id, {"command": "ANSWER"})
+        session.speak(agent.get("opening_line") or "Hi, how can I help you today?", "en")
+        log("VANISETU", f"Incoming call {call_id} connected as session {session_id}")
+
+
+vanisetu_client = VaniSetuClient()
+vanisetu_client.start()
+
 
 # ============================================================
 # Routes
@@ -1406,6 +1675,51 @@ def twilio_outbound_ws(ws, call_id):
             PENDING_CALLS.pop(call_id, None)
         log("MAIN", f"Outbound call {call_id} disconnected.")
 
+
+@app.route("/api/calls/vanisetu", methods=["POST"])
+def api_place_call_vanisetu():
+    """PravaahAI calls this to have Eva place an outbound call over VaniSetu
+    instead of Twilio. Body: {call_id, to_number, caller_id, agent, lead,
+    callback_url}. Auth: header X-Eva-Secret must match EVA_API_SECRET."""
+    if not EVA_API_SECRET or request.headers.get("X-Eva-Secret") != EVA_API_SECRET:
+        return jsonify({"ok": False, "error": "Invalid or missing X-Eva-Secret"}), 401
+    if not (VANISETU_TCODE and VANISETU_TOKEN):
+        return jsonify({"ok": False, "error": "Eva has no VANISETU_TCODE/VANISETU_TOKEN configured"}), 400
+
+    missing = [n for n, v in [
+        ("DEEPGRAM_API_KEY", DEEPGRAM_API_KEY),
+        ("MISTRAL_API_KEY", MISTRAL_API_KEY),
+        ("SARVAM_API_KEY", SARVAM_API_KEY),
+    ] if not v]
+    if missing:
+        return jsonify({"ok": False, "error": f"Eva missing env keys: {', '.join(missing)}"}), 500
+
+    data = request.get_json(silent=True) or {}
+    call_id = data.get("call_id")
+    to_number = data.get("to_number")
+    caller_id = data.get("caller_id")
+    agent = data.get("agent", {}) or {}
+    lead = data.get("lead", {}) or {}
+    meeting = data.get("meeting") or {}
+    callback_url = data.get("callback_url")
+
+    if not (call_id and to_number and caller_id and callback_url):
+        return jsonify({"ok": False, "error": "call_id, to_number, caller_id and callback_url are required"}), 400
+
+    with _pending_calls_lock:
+        PENDING_CALLS[call_id] = {
+            "agent": agent, "lead": lead, "callback_url": callback_url,
+            "created_at": time.time(), "meeting": meeting,
+        }
+
+    ok = vanisetu_client.place_outbound_call(request_id=call_id, endpoint=to_number, caller_id=caller_id)
+    if not ok:
+        with _pending_calls_lock:
+            PENDING_CALLS.pop(call_id, None)
+        return jsonify({"ok": False, "error": "VaniSetu connection not ready"}), 503
+
+    log("MAIN", f"Outbound VaniSetu call requested: call_id={call_id} -> {to_number} (caller_id={caller_id})")
+    return jsonify({"ok": True, "call_sid": call_id})
 
 if __name__ == "__main__":
     missing = [n for n, v in [

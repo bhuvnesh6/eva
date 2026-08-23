@@ -9,3 +9,4 @@ sounddevice==0.4.7
 deepgram-sdk>=3.7,<4
 sarvamai>=0.1.9
 twilio==9.10.9
+websocket-client
