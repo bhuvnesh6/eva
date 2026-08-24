@@ -83,6 +83,7 @@ DEVANAGARI_RE = re.compile(r"[\u0900-\u097F]")
 BOOK_MEETING_RE = re.compile(r"BOOK_MEETING:\s*(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2})")
 
 MISTRAL_MODEL = "mistral-medium-3.5"
+MISTRAL_REASONING_EFFORT="none"
 SARVAM_TTS_MODEL = "bulbul:v3"
 DEFAULT_SPEAKER = os.environ.get("EVA_SPEAKER", "priya")
 # Speech playback speed. bulbul:v3 accepts 0.5 (slower) to 2.0 (faster);
