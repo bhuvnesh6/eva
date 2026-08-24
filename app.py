@@ -1049,8 +1049,20 @@ class VaniSetuClient:
         if "session_id" in obj:
             session_id = obj["session_id"]
             payload = obj.get("payload", {}) or {}
-            if payload.get("event") == "MEDIA_START":
+            event = payload.get("event")
+            if event == "MEDIA_START":
                 self._on_media_start(session_id, payload)
+            elif event == "INCOMING_CALL":
+                # Genuine inbound calls arrive UNWRAPPED (no session_id) per
+                # VaniSetu's doc - see _on_incoming_call below. If we see
+                # INCOMING_CALL wrapped with a session_id already attached,
+                # it's actually VaniSetu telling us one of OUR OUTBOUND_CALL
+                # requests just got answered, not a new inbound call. This
+                # was previously falling through to "unhandled payload" and
+                # getting silently dropped - the follow-up MEDIA_START then
+                # had nothing to match against and got hung up as a bogus
+                # inbound call. See _on_outbound_connected.
+                self._on_outbound_connected(session_id, payload)
             else:
                 log("VANISETU", f"session {session_id}: unhandled payload {payload}")
 
@@ -1068,7 +1080,18 @@ class VaniSetuClient:
         with self._pending_incoming_lock:
             self._pending_incoming_call_ids.append(call_id)
 
+
     def _on_media_start(self, session_id, payload):
+        # If this session is already bound (e.g. it was just connected via
+        # the wrapped INCOMING_CALL "call answered" event in
+        # _on_outbound_connected), this MEDIA_START is just confirming the
+        # media path is up - NOT a new call. Re-running the binding logic
+        # here would wrongly treat it as inbound and hang up a live,
+        # already-answered outbound call.
+        if session_id in self.sessions:
+            log("VANISETU", f"session {session_id}: MEDIA_START on already-bound session, ignoring")
+            return
+
         # Check whether this session is one of our own outbound requests.
         # VaniSetu's doc doesn't show the exact field name request_id comes
         # back under on the connect event, so we check a couple of likely
@@ -1087,6 +1110,30 @@ class VaniSetuClient:
         with self._pending_incoming_lock:
             call_id = self._pending_incoming_call_ids.pop(0) if self._pending_incoming_call_ids else None
         self._bind_incoming_session(session_id, call_id)
+
+
+    def _on_outbound_connected(self, session_id, payload):
+        """Binds a wrapped INCOMING_CALL event to the oldest still-unbound
+        outbound request (FIFO). VaniSetu doesn't echo our request_id back
+        on this event, so exact matching isn't possible - FIFO is correct
+        as long as answers come back in roughly the order calls were
+        placed. Worth confirming with Varnet if you ever run many
+        concurrent outbound calls and see mis-binding."""
+        request_id = None
+        with self._pending_outbound_lock:
+            request_id = next(iter(self._pending_outbound), None)
+            if request_id:
+                self._pending_outbound.pop(request_id, None)
+
+        if request_id:
+            log("VANISETU", f"session {session_id}: outbound call answered, binding to request_id={request_id}")
+            self._bind_outbound_session(session_id, request_id)
+        else:
+            # No outbound call was waiting - treat as a genuine inbound call.
+            log("VANISETU", f"session {session_id}: wrapped INCOMING_CALL with no pending outbound request, treating as real inbound")
+            with self._pending_incoming_lock:
+                call_id = self._pending_incoming_call_ids.pop(0) if self._pending_incoming_call_ids else None
+            self._bind_incoming_session(session_id, call_id)
 
     # ---------- binding sessions ----------
     def _bind_outbound_session(self, session_id, request_id):
