@@ -42,6 +42,8 @@ import re
 import sys
 import json
 import time
+import math
+import array
 import base64
 import queue
 import random
@@ -80,7 +82,7 @@ SPEAKABLE_RE = re.compile(r"[A-Za-z0-9\u0900-\u097F]")
 DEVANAGARI_RE = re.compile(r"[\u0900-\u097F]")
 BOOK_MEETING_RE = re.compile(r"BOOK_MEETING:\s*(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2})")
 
-MISTRAL_MODEL = "mistral-small-latest"
+MISTRAL_MODEL = "mistral-medium-3.5"
 SARVAM_TTS_MODEL = "bulbul:v3"
 DEFAULT_SPEAKER = os.environ.get("EVA_SPEAKER", "priya")
 # Speech playback speed. bulbul:v3 accepts 0.5 (slower) to 2.0 (faster);
@@ -109,6 +111,22 @@ BARGE_IN_GRACE_SECS = float(os.environ.get("EVA_BARGE_IN_GRACE_SECS", 1.0))
 # this window before treating it as a genuine barge-in.
 BARGE_IN_CONFIRM_MIN_CHARS = int(os.environ.get("EVA_BARGE_IN_MIN_CHARS", 2))
 BARGE_IN_CONFIRM_TIMEOUT_SECS = float(os.environ.get("EVA_BARGE_IN_CONFIRM_TIMEOUT", 0.6))
+
+# Amplitude-based barge-in trigger, independent of (and faster than)
+# Deepgram's VAD. We look at the raw volume of what's actually coming in on
+# the mic/line while Eva is talking. This is the line between "the user is
+# talking" and "there's noise in the background": ambient sound (traffic,
+# a fan, other people across the room) is quieter than the user's own voice
+# because it isn't right on the mic/handset, so it normally stays under
+# these numbers. Crossing the threshold only ARMS a candidate barge-in,
+# same as VAD - it still needs a real transcribed word from Deepgram to
+# actually interrupt Eva (see _arm_barge_in_candidate), so one loud
+# one-off noise (a horn, a door) that isn't speech won't cut her off alone.
+# Linear16 samples (browser mic) range roughly -32768..32767.
+BARGE_IN_MIN_VOLUME_LINEAR16 = int(os.environ.get("EVA_BARGE_IN_MIN_VOLUME_LINEAR16", 600))
+# mu-law (phone calls) decodes to a smaller effective range (~-8031..8031),
+# so this threshold is scaled down to match.
+BARGE_IN_MIN_VOLUME_MULAW = int(os.environ.get("EVA_BARGE_IN_MIN_VOLUME_MULAW", 350))
 
 DEEPGRAM_API_KEY = os.environ.get("DEEPGRAM_API_KEY")
 MISTRAL_API_KEY = os.environ.get("MISTRAL_API_KEY")
@@ -171,6 +189,46 @@ def is_speakable(text: str) -> bool:
 
 def detect_lang(text: str) -> str:
     return "hi" if DEVANAGARI_RE.search(text) else "en"
+
+
+def _build_ulaw_decode_table():
+    """Standard ITU-T G.711 mu-law -> linear16 expansion, precomputed once
+    so per-chunk volume checks on phone audio don't redo the math per byte."""
+    table = []
+    for i in range(256):
+        u_val = ~i & 0xFF
+        t = ((u_val & 0x0F) << 3) + 0x84
+        t <<= (u_val & 0x70) >> 4
+        val = (t - 0x84) if (u_val & 0x80) else (0x84 - t)
+        table.append(val)
+    return table
+
+
+_ULAW_TO_LINEAR16 = _build_ulaw_decode_table()
+
+
+def _rms_pcm16(data: bytes) -> float:
+    """RMS volume of raw linear16 (browser mic) audio."""
+    usable_len = len(data) - (len(data) % 2)
+    if usable_len < 2:
+        return 0.0
+    samples = array.array('h')
+    samples.frombytes(data[:usable_len])
+    if not samples:
+        return 0.0
+    total = sum(s * s for s in samples)
+    return math.sqrt(total / len(samples))
+
+
+def _rms_mulaw(data: bytes) -> float:
+    """RMS volume of raw mu-law (phone) audio, decoded to linear first."""
+    if not data:
+        return 0.0
+    total = 0
+    for b in data:
+        v = _ULAW_TO_LINEAR16[b]
+        total += v * v
+    return math.sqrt(total / len(data))
 
 
 def render_call_vars(text: str, lead: dict) -> str:
@@ -273,6 +331,20 @@ class EvaSession:
                 "Never default to Hindi on your own."
             )
         base_prompt += "\nNever reply using only emojis or symbols with no words."
+        # Applies unconditionally - even on top of an owner's own custom
+        # system_prompt above - since this is a live voice call, not a chat
+        # window: a long reply just sits there as dead air while Eva is
+        # still talking, and invites the lead to talk over her.
+        base_prompt += (
+            "\n\nSPEAKING LENGTH RULE (always follow, no exceptions): this "
+            "is a live phone/voice conversation. Normally answer in ONE "
+            "short sentence. At most 2-3 short sentences for a normal "
+            "question. Only go longer than that if the lead explicitly asks "
+            "for a real explanation, a walkthrough, or a list of things - "
+            "and even then stay as brief as possible while still being "
+            "correct. Never pad with extra detail, filler, or repeating "
+            "back what they said."
+        )
 
         if self.meeting:
             base_prompt += (
@@ -403,7 +475,41 @@ class EvaSession:
         # real transcribed words - only then do we treat it as a genuine
         # barge-in and stop her. If nothing gets transcribed in time, this
         # candidate silently expires (was just noise).
+        self._arm_barge_in_candidate(source="vad")
+
+    def _check_volume_barge_in(self, raw_audio: bytes):
+        """Second, independent barge-in trigger based on raw mic/line
+        volume, running alongside Deepgram's VAD (_dg_speech_started). Real
+        background noise - traffic, a fan, other people across the room -
+        is quieter than the user's own voice on their own mic/handset, so
+        it normally never crosses the threshold. Like VAD, this only arms a
+        candidate; _dg_transcript still has to see actual transcribed words
+        before Eva is interrupted, so a loud one-off noise that isn't
+        speech won't trigger anything on its own."""
+        if time.time() < self.barge_in_grace_until:
+            return
+        if not (self.eva_speaking.is_set() or not self.sentence_q.empty()):
+            return
+        if self.barge_in_candidate.is_set():
+            return  # already armed - no need to recompute volume
+
+        if self.mode == "phone":
+            rms = _rms_mulaw(raw_audio)
+            threshold = BARGE_IN_MIN_VOLUME_MULAW
+        else:
+            rms = _rms_pcm16(raw_audio)
+            threshold = BARGE_IN_MIN_VOLUME_LINEAR16
+
+        if rms >= threshold:
+            self._arm_barge_in_candidate(source=f"volume({rms:.0f}>={threshold})")
+
+    def _arm_barge_in_candidate(self, source: str):
+        """Shared by both barge-in triggers (VAD and volume). Arms a
+        candidate interruption that _dg_transcript will confirm - or let
+        silently expire - once it sees (or doesn't see) real transcribed
+        words within BARGE_IN_CONFIRM_TIMEOUT_SECS."""
         with self.barge_in_candidate_lock:
+            already_armed = self.barge_in_candidate.is_set()
             self.barge_in_candidate.set()
             if self.barge_in_candidate_timer:
                 self.barge_in_candidate_timer.cancel()
@@ -412,6 +518,8 @@ class EvaSession:
             )
             self.barge_in_candidate_timer.daemon = True
             self.barge_in_candidate_timer.start()
+        if not already_armed:
+            log("BARGE-IN", f"[{self.call_id or 'browser'}] candidate armed via {source}")
 
     def _clear_barge_in_candidate(self):
         """Candidate barge-in expired unconfirmed - it was noise, not speech."""
@@ -526,6 +634,10 @@ class EvaSession:
 
     def feed_audio(self, data: bytes):
         try:
+            self._check_volume_barge_in(data)
+        except Exception as e:
+            log("BARGE-IN", f"volume check error: {e}")
+        try:
             self.dg_connection.send(data)
         except Exception as e:
             log("STT", f"send error: {e}")
@@ -633,6 +745,13 @@ class EvaSession:
 
     def _stream_chat(self, client: httpx.Client, messages):
         payload = {"model": MISTRAL_MODEL, "messages": messages, "stream": True}
+        # mistral-medium-3.5 accepts reasoning_effort "none" or "high" -
+        # kept at "none" by default so it doesn't add a thinking pass (and
+        # the latency that comes with it) before Eva starts speaking on a
+        # live call. Harmless to send even if a non-reasoning model is
+        # configured, since Mistral just ignores it in that case.
+        if MISTRAL_REASONING_EFFORT:
+            payload["reasoning_effort"] = MISTRAL_REASONING_EFFORT
         headers = {"Authorization": f"Bearer {MISTRAL_API_KEY}", "Content-Type": "application/json"}
         with client.stream("POST", "https://api.mistral.ai/v1/chat/completions",
                             json=payload, headers=headers, timeout=30) as resp:
