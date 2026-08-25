@@ -82,7 +82,7 @@ SPEAKABLE_RE = re.compile(r"[A-Za-z0-9\u0900-\u097F]")
 DEVANAGARI_RE = re.compile(r"[\u0900-\u097F]")
 BOOK_MEETING_RE = re.compile(r"BOOK_MEETING:\s*(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2})")
 
-MISTRAL_MODEL = "mistral-medium-3.5"
+MISTRAL_MODEL = "mistral-small-latest"
 MISTRAL_REASONING_EFFORT="none"
 SARVAM_TTS_MODEL = "bulbul:v3"
 DEFAULT_SPEAKER = os.environ.get("EVA_SPEAKER", "priya")
@@ -1047,6 +1047,22 @@ def fetch_caller_id_config(number: str):
         return None, str(e)
 
 
+# VaniSetu's doc (v1.2, 22 Aug 2026) only documents INCOMING_CALL and
+# MEDIA_START as events sent to us - it does NOT document what event
+# fires when a call ends (caller hangs up, etc). Without handling that,
+# a VaniSetu EvaSession never gets close()'d or POSTed back to Pravaah's
+# callback_url, so the call sits stuck as "queued" on Pravaah's side even
+# though the call itself ended fine on VaniSetu's end.
+# These are best-guess event names based on common telephony-provider
+# conventions. CONFIRM THE REAL NAME WITH VARNET (or check the
+# "unhandled payload" log line after one real test hangup) and tighten
+# this set once confirmed.
+VANISETU_CALL_END_EVENTS = {
+    "HANGUP", "CALL_ENDED", "CALL_END", "CALL_COMPLETED",
+    "CHANNEL_HANGUP", "MEDIA_STOP", "DISCONNECTED", "CALL_DISCONNECTED",
+}
+
+
 # ============================================================
 # VaniSetu — single multiplexed WS connection to the number provider
 # ============================================================
@@ -1183,7 +1199,13 @@ class VaniSetuClient:
                 # had nothing to match against and got hung up as a bogus
                 # inbound call. See _on_outbound_connected.
                 self._on_outbound_connected(session_id, payload)
+            elif event in VANISETU_CALL_END_EVENTS or (event and event.upper() in VANISETU_CALL_END_EVENTS):
+                self._on_call_ended(session_id, payload)
             else:
+                # If you just hung up a test call and landed here, THIS is
+                # the real event name/shape VaniSetu uses for call-end -
+                # copy the exact "event" value from the log line below into
+                # VANISETU_CALL_END_EVENTS and it'll route correctly next time.
                 log("VANISETU", f"session {session_id}: unhandled payload {payload}")
 
     def _handle_binary(self, data: bytes):
@@ -1231,6 +1253,23 @@ class VaniSetuClient:
             call_id = self._pending_incoming_call_ids.pop(0) if self._pending_incoming_call_ids else None
         self._bind_incoming_session(session_id, call_id)
 
+
+    def _on_call_ended(self, session_id, payload):
+        """Fires when VaniSetu tells us a call is over (see
+        VANISETU_CALL_END_EVENTS above - exact event name unconfirmed with
+        Varnet, verify against real traffic). Without this, VaniSetu
+        sessions never got close()'d or reported back to Pravaah, which is
+        why completed calls were stuck showing "queued" on Pravaah's side -
+        the transcript-completion POST never fired."""
+        session = self.sessions.get(session_id)
+        if not session:
+            log("VANISETU", f"session {session_id}: call-ended event with no matching session (already closed?)")
+            return
+        log("VANISETU", f"session {session_id}: call ended ({payload.get('event')}), closing + reporting to Pravaah")
+        session.hangup_reason = "completed"
+        session.close()
+        session._finish_and_callback(hangup_reason="completed")
+        self.unregister_session(session_id)
 
     def _on_outbound_connected(self, session_id, payload):
         """Binds a wrapped INCOMING_CALL event to the oldest still-unbound
