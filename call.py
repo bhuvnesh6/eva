@@ -14,7 +14,7 @@ How this endpoint behaves:
 import requests
 
 # ---- Fill these in ----
-API_KEY = "c46296c5-9ed7-4bb9-84f7-f4201d11c1ba"   # never hardcode/commit real keys
+API_KEY = "[api key]a"   # never hardcode/commit real keys
 TARGET_NUMBER = "918920419130"             # number to be called (customer_number)
 DID_NUMBER = "918065251635"                # your DID, used as caller_id
 
