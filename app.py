@@ -130,7 +130,8 @@ BARGE_IN_MIN_VOLUME_LINEAR16 = int(os.environ.get("EVA_BARGE_IN_MIN_VOLUME_LINEA
 BARGE_IN_MIN_VOLUME_MULAW = int(os.environ.get("EVA_BARGE_IN_MIN_VOLUME_MULAW", 350))
 
 DEEPGRAM_API_KEY = os.environ.get("DEEPGRAM_API_KEY")
-MISTRAL_API_KEY = os.environ.get("MISTRAL_API_KEY")
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
+GROQ_MODEL = "llama-3.3-70b-versatile"
 SARVAM_API_KEY = os.environ.get("SARVAM_API_KEY")
 
 # ---------------- Twilio (phone call) config ----------------
@@ -745,16 +746,9 @@ class EvaSession:
             self.history = self.history[-MAX_HISTORY_MESSAGES:]
 
     def _stream_chat(self, client: httpx.Client, messages):
-        payload = {"model": MISTRAL_MODEL, "messages": messages, "stream": True}
-        # mistral-medium-3.5 accepts reasoning_effort "none" or "high" -
-        # kept at "none" by default so it doesn't add a thinking pass (and
-        # the latency that comes with it) before Eva starts speaking on a
-        # live call. Harmless to send even if a non-reasoning model is
-        # configured, since Mistral just ignores it in that case.
-        if MISTRAL_REASONING_EFFORT:
-            payload["reasoning_effort"] = MISTRAL_REASONING_EFFORT
-        headers = {"Authorization": f"Bearer {MISTRAL_API_KEY}", "Content-Type": "application/json"}
-        with client.stream("POST", "https://api.mistral.ai/v1/chat/completions",
+        payload = {"model": GROQ_MODEL, "messages": messages, "stream": True}
+        headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
+        with client.stream("POST", "https://api.groq.com/openai/v1/chat/completions",
                             json=payload, headers=headers, timeout=30) as resp:
             resp.raise_for_status()
             for line in resp.iter_lines():
@@ -1600,7 +1594,7 @@ def widget_ws(ws, public_id):
 def health():
     missing = [n for n, v in [
         ("DEEPGRAM_API_KEY", DEEPGRAM_API_KEY),
-        ("MISTRAL_API_KEY", MISTRAL_API_KEY),
+        ("GROQ_API_KEY", GROQ_API_KEY),
         ("SARVAM_API_KEY", SARVAM_API_KEY),
     ] if not v]
     return jsonify({"status": "ok" if not missing else "missing_keys", "missing": missing})
@@ -1610,7 +1604,7 @@ def health():
 def eva_ws(ws):
     missing = [n for n, v in [
         ("DEEPGRAM_API_KEY", DEEPGRAM_API_KEY),
-        ("MISTRAL_API_KEY", MISTRAL_API_KEY),
+        ("GROQ_API_KEY", GROQ_API_KEY),
         ("SARVAM_API_KEY", SARVAM_API_KEY),
     ] if not v]
     if missing:
@@ -1697,7 +1691,7 @@ def twiml():
 def twilio_ws(ws):
     missing = [n for n, v in [
         ("DEEPGRAM_API_KEY", DEEPGRAM_API_KEY),
-        ("MISTRAL_API_KEY", MISTRAL_API_KEY),
+        ("GROQ_API_KEY", GROQ_API_KEY),
         ("SARVAM_API_KEY", SARVAM_API_KEY),
     ] if not v]
     if missing:
@@ -1754,7 +1748,7 @@ def api_place_call():
 
     missing = [n for n, v in [
         ("DEEPGRAM_API_KEY", DEEPGRAM_API_KEY),
-        ("MISTRAL_API_KEY", MISTRAL_API_KEY),
+        ("GROQ_API_KEY", GROQ_API_KEY),
         ("SARVAM_API_KEY", SARVAM_API_KEY),
     ] if not v]
     if missing:
@@ -1826,7 +1820,7 @@ def twilio_outbound_ws(ws, call_id):
 
     missing = [n for n, v in [
         ("DEEPGRAM_API_KEY", DEEPGRAM_API_KEY),
-        ("MISTRAL_API_KEY", MISTRAL_API_KEY),
+        ("GROQ_API_KEY", GROQ_API_KEY),
         ("SARVAM_API_KEY", SARVAM_API_KEY),
     ] if not v]
     if missing:
@@ -1894,7 +1888,7 @@ def api_place_call_vanisetu():
 
     missing = [n for n, v in [
         ("DEEPGRAM_API_KEY", DEEPGRAM_API_KEY),
-        ("MISTRAL_API_KEY", MISTRAL_API_KEY),
+        ("GROQ_API_KEY", GROQ_API_KEY),
         ("SARVAM_API_KEY", SARVAM_API_KEY),
     ] if not v]
     if missing:
@@ -1930,7 +1924,7 @@ def api_place_call_vanisetu():
 if __name__ == "__main__":
     missing = [n for n, v in [
         ("DEEPGRAM_API_KEY", DEEPGRAM_API_KEY),
-        ("MISTRAL_API_KEY", MISTRAL_API_KEY),
+        ("GROQ_API_KEY", GROQ_API_KEY),
         ("SARVAM_API_KEY", SARVAM_API_KEY),
     ] if not v]
     if missing:
