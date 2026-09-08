@@ -131,7 +131,7 @@ BARGE_IN_MIN_VOLUME_MULAW = int(os.environ.get("EVA_BARGE_IN_MIN_VOLUME_MULAW", 
 
 DEEPGRAM_API_KEY = os.environ.get("DEEPGRAM_API_KEY")
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
-GROQ_MODEL = "llama-3.3-70b-versatile"
+GROQ_MODEL = "openai/gpt-oss-120b"
 SARVAM_API_KEY = os.environ.get("SARVAM_API_KEY")
 
 # ---------------- Twilio (phone call) config ----------------
