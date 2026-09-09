@@ -1362,6 +1362,31 @@ def landing():
 def widget_js():
     return send_from_directory("static", "widget.js", mimetype="application/javascript")
 
+@app.route("/api/widget-meta/<public_id>")
+def widget_meta(public_id):
+    """Public, browser-callable (no X-Eva-Secret) — returns only the safe
+    subset of a widget's config so the embed script can schedule the
+    auto-greet timer *before* opening a voice session. Never exposes
+    owner_id or the agent's system_prompt."""
+    config, err = fetch_widget_config(public_id)
+    if err or not config:
+        resp = jsonify({"error": err or "Widget unavailable"})
+        resp.headers["Access-Control-Allow-Origin"] = "*"
+        return resp, 404
+
+    agent = config.get("agent", {}) or {}
+    auto_greet = config.get("auto_greet") or {}
+    resp = jsonify({
+        "greeting": agent.get("opening_line") or "Hi! How can I help you today?",
+        "require_lead_before_chat": config.get("require_lead_before_chat", True),
+        "auto_greet": {
+            "enabled": bool(auto_greet.get("enabled", False)),
+            "message": auto_greet.get("message", ""),
+            "delay_secs": int(auto_greet.get("delay_secs", 5) or 5),
+        },
+    })
+    resp.headers["Access-Control-Allow-Origin"] = "*"
+    return resp
 
 @app.route("/embed/widget.js")
 def embed_widget_js():
@@ -1378,6 +1403,7 @@ def embed_widget_js():
   if(!publicId){ console.error('[EvaWidget] missing data-public-id'); return; }
   var evaOrigin = cur.src.split('/embed/widget.js')[0];
   var wsUrl = evaOrigin.replace(/^http/, 'ws') + '/ws/widget/' + publicId;
+  var metaUrl = evaOrigin + '/api/widget-meta/' + publicId;
 
   var css = document.createElement('style');
   css.textContent = `
@@ -1436,26 +1462,34 @@ def embed_widget_js():
   document.body.appendChild(bubble); document.body.appendChild(panel);
 
   var ws, audioCtx, mic, processor, playHead = 0;
-  bubble.onclick = function(){ panel.classList.toggle('open'); };
+  var autoGreetTimer = null, sessionStarted = false;
+
+  bubble.onclick = function(){
+    panel.classList.toggle('open');
+    cancelAutoGreet(); // visitor engaged manually — no need to also auto-greet them
+  };
+
+  function cancelAutoGreet(){
+    if(autoGreetTimer){ clearTimeout(autoGreetTimer); autoGreetTimer = null; }
+  }
 
   document.getElementById('eva-w-start').onclick = function(){
     var name = document.getElementById('eva-w-name').value.trim();
     var phone = document.getElementById('eva-w-phone').value.trim();
     var email = document.getElementById('eva-w-email').value.trim();
     if(!name || !phone){ alert('Please share your name and phone number'); return; }
+    cancelAutoGreet();
     document.getElementById('eva-w-form').style.display = 'none';
     document.getElementById('eva-w-call').style.display = 'block';
-    startSession(name, phone, email);
+    if(ws && ws.readyState === WebSocket.OPEN){
+      // an auto-greet session is already live — just attach the lead info to it
+      ws.send(JSON.stringify({type:'lead_info', name:name, phone:phone, email:email}));
+    } else {
+      startSession(name, phone, email);
+    }
   };
 
-  function startSession(name, phone, email){
-    ws = new WebSocket(wsUrl);
-    ws.binaryType = 'arraybuffer';
-    ws.onopen = function(){
-      ws.send(JSON.stringify({type:'lead_info', name:name, phone:phone, email:email}));
-      startMic();
-      bubble.classList.add('eva-live');
-    };
+  function wireSocketEvents(){
     ws.onmessage = function(ev){
       if(typeof ev.data === 'string'){
         var msg = JSON.parse(ev.data);
@@ -1469,7 +1503,38 @@ def embed_widget_js():
         playAudio(ev.data);
       }
     };
-    ws.onclose = function(){ bubble.classList.remove('eva-live'); document.getElementById('eva-w-status').textContent = 'Call ended'; stopMic(); };
+    ws.onclose = function(){ bubble.classList.remove('eva-live'); document.getElementById('eva-w-status').textContent = 'Call ended'; sessionStarted = false; stopMic(); };
+  }
+
+  function startSession(name, phone, email){
+    if(sessionStarted) return;
+    sessionStarted = true;
+    ws = new WebSocket(wsUrl);
+    ws.binaryType = 'arraybuffer';
+    ws.onopen = function(){
+      ws.send(JSON.stringify({type:'lead_info', name:name, phone:phone, email:email}));
+      startMic();
+      bubble.classList.add('eva-live');
+    };
+    wireSocketEvents();
+  }
+
+  // Proactive auto-greet: opens the panel and starts talking on its own
+  // after the delay the owner configured — no click needed from the visitor.
+  // The lead form stays visible so they can fill it in while Eva talks.
+  function startAutoGreetSession(){
+    if(sessionStarted) return;
+    sessionStarted = true;
+    document.getElementById('eva-w-call').style.display = 'block';
+    document.getElementById('eva-w-status').textContent = 'Connecting…';
+    panel.classList.add('open');
+    ws = new WebSocket(wsUrl + '?auto_greet=1');
+    ws.binaryType = 'arraybuffer';
+    ws.onopen = function(){
+      startMic();
+      bubble.classList.add('eva-live');
+    };
+    wireSocketEvents();
   }
 
   var lastRole = null, lastLine = null;
@@ -1518,6 +1583,19 @@ def embed_widget_js():
     var startAt = Math.max(audioCtx.currentTime, playHead);
     src.start(startAt); playHead = startAt + abuf.duration;
   }
+
+  // Fetch this widget's public config (auto-greet timing) and — if the
+  // owner turned it on — schedule Eva to speak first after the configured
+  // delay, unless the visitor has already engaged manually by then.
+  fetch(metaUrl).then(function(r){ return r.json(); }).then(function(meta){
+    if(meta && meta.auto_greet && meta.auto_greet.enabled && meta.auto_greet.message){
+      var delayMs = Math.max(1, meta.auto_greet.delay_secs || 5) * 1000;
+      autoGreetTimer = setTimeout(function(){
+        autoGreetTimer = null;
+        if(!sessionStarted) startAutoGreetSession();
+      }, delayMs);
+    }
+  }).catch(function(){ /* auto-greet is best-effort — silently skip if unreachable */ });
 })();
 """
     return js, 200, {"Content-Type": "application/javascript"}
@@ -1527,7 +1605,12 @@ def embed_widget_js():
 def widget_ws(ws, public_id):
     """A visitor on some customer's website connects here. We look up which
     agent + owner this public_id belongs to, run the normal Eva voice
-    pipeline, capture the lead, and bill Eva minutes on close."""
+    pipeline, capture the lead, and bill Eva minutes on close.
+
+    If ?auto_greet=1 is on the URL, this is a PROACTIVE session the embed
+    script opened on its own (after the delay the owner configured), not a
+    visitor who clicked "Start" - so we skip the "fill the form first"
+    gate entirely and have Eva speak the owner's auto-greet line right away."""
     config, err = fetch_widget_config(public_id)
     if err or not config:
         try:
@@ -1540,20 +1623,26 @@ def widget_ws(ws, public_id):
     widget_id = config["widget_id"]
     agent = config.get("agent", {})
     require_lead_first = config.get("require_lead_before_chat", True)
+    auto_greet_cfg = config.get("auto_greet") or {}
+    is_auto_greet = request.args.get("auto_greet") == "1" and auto_greet_cfg.get("enabled")
 
     session = EvaSession(ws, mode="browser", agent=agent, lead={})
     session.call_started_at = time.time()  # reused purely for widget duration billing
     if not session.start():
         return
 
-    if require_lead_first:
+    if is_auto_greet:
+        session._send_json({"type": "ready"})
+        greet_text = auto_greet_cfg.get("message") or agent.get("opening_line") or "Hi! How can I help you today?"
+        session.speak(greet_text, detect_lang(greet_text))
+    elif require_lead_first:
         session._send_json({"type": "status", "state": "awaiting_lead_info"})
     else:
         session._send_json({"type": "ready"})
         session.speak(agent.get("opening_line") or "Hi! How can I help you today?", "en")
 
     lead_id_holder = {"lead_id": None}
-    log("MAIN", f"Widget visitor connected: {public_id}")
+    log("MAIN", f"Widget visitor connected: {public_id}" + (" (auto-greet)" if is_auto_greet else ""))
 
     try:
         while True:
@@ -1576,8 +1665,12 @@ def widget_ws(ws, public_id):
                 session.lead = {"name": name, "phone": phone, "email": email}
                 lead_id_holder["lead_id"] = report_widget_lead(owner_id, widget_id, name, phone, email)
                 session._send_json({"type": "ready"})
-                opening = render_call_vars(agent.get("opening_line") or "Hi {{name}}, how can I help you today?", session.lead)
-                session.speak(opening, "en")
+                # In an auto-greet session Eva already spoke first - don't
+                # speak the opening line again once the lead form comes in,
+                # that would talk over/duplicate what she just said.
+                if not is_auto_greet:
+                    opening = render_call_vars(agent.get("opening_line") or "Hi {{name}}, how can I help you today?", session.lead)
+                    session.speak(opening, "en")
             elif mtype == "text":
                 session.feed_text(payload.get("text", ""))
             elif mtype == "ping":
