@@ -155,6 +155,16 @@ VANISETU_TCODE = os.environ.get("VANISETU_TCODE", "")
 VANISETU_TOKEN = os.environ.get("VANISETU_TOKEN", "")   # full "Bearer xxxx" string
 VANISETU_RATE = 8000   # G.711 mu-law over telephony — same rate as Twilio's PHONE_RATE
 
+# ---------------- VoiceLink (number provider) config ----------------
+# Login credentials come per-call from PravaahAI (each owner has their own
+# VoiceLink account), NOT from env vars — mirrors how Twilio creds arrive
+# per-call rather than being global to this service.
+VOICELINK_BASE_URL = os.environ.get("VOICELINK_BASE_URL", "https://app.voicelink.co.in").rstrip("/")
+# TODO: confirm real codec/sample rate against VoiceLink's "WebSocket
+# Integration" docs — this assumes standard PSTN mu-law@8kHz like VaniSetu/Twilio.
+VOICELINK_CODEC = os.environ.get("VOICELINK_CODEC", "mulaw")
+VOICELINK_RATE = int(os.environ.get("VOICELINK_RATE", 8000))
+
 
 def _e164(num: str) -> str:
     """Best-effort normalize to E.164 (assumes country code is already included)."""
@@ -178,6 +188,12 @@ twilio_client = (
 # Twilio opens the Media Stream socket for that call.
 _pending_calls_lock = threading.Lock()
 PENDING_CALLS = {}
+
+# call_id -> EvaSession, populated once VoiceLink's websocket actually
+# connects. Unlike VaniSetu's shared multiplexed socket, each VoiceLink
+# call gets its own websocket scoped by call_id in the URL, so this is a
+# simple direct lookup rather than a FIFO-matching table.
+VOICELINK_SESSIONS = {}
 
 
 def log(stage: str, msg: str):
@@ -405,6 +421,18 @@ class EvaSession:
             # with this session's 4-byte session ID.
             if self.vanisetu_session_id is not None:
                 vanisetu_client.send_audio(self.vanisetu_session_id, audio_bytes)
+            return
+        if self.mode == "phone" and self.transport == "voicelink":
+            # ASSUMED raw binary audio frames, no JSON/streamSid wrapper —
+            # this socket is scoped to exactly one call via the URL, so
+            # there's no multi-call framing needed like VaniSetu's. See the
+            # TODO in /ws/voicelink/<call_id> if VoiceLink turns out to
+            # wrap audio in JSON events instead.
+            with self.ws_lock:
+                try:
+                    self.ws.send(audio_bytes)
+                except Exception:
+                    pass
             return
         with self.ws_lock:
             try:
@@ -872,7 +900,12 @@ class EvaSession:
                 vanisetu_client.send_command(self.vanisetu_session_id, {"command": "START_MEDIA_BUFFERING"})
 
             if self.mode == "phone":
-                tts_codec, tts_rate = "mulaw", (VANISETU_RATE if self.transport == "vanisetu" else PHONE_RATE)
+                if self.transport == "vanisetu":
+                    tts_codec, tts_rate = "mulaw", VANISETU_RATE
+                elif self.transport == "voicelink":
+                    tts_codec, tts_rate = VOICELINK_CODEC, VOICELINK_RATE
+                else:
+                    tts_codec, tts_rate = "mulaw", PHONE_RATE
             else:
                 tts_codec, tts_rate = "linear16", TTS_SAMPLE_RATE
 
@@ -1036,6 +1069,79 @@ def fetch_caller_id_config(number: str):
         data = resp.json()
         if resp.status_code >= 400:
             return None, data.get("error", "Caller ID not found")
+        return data, None
+    except Exception as e:
+        return None, str(e)
+
+
+# ---------------- VoiceLink auth + call placement ----------------
+
+_voicelink_token_lock = threading.Lock()
+_voicelink_tokens = {}  # login_email -> {"token": "...", "expires_at": epoch}
+
+
+def voicelink_login(login_email: str, login_password: str):
+    """Logs into VoiceLink and returns a bearer token, cached per
+    login_email so we don't re-auth on every single call. TODO: confirm the
+    real token lifetime/field name from VoiceLink's Login response — the
+    50-minute expiry below is a conservative guess, not a confirmed value."""
+    with _voicelink_token_lock:
+        cached = _voicelink_tokens.get(login_email)
+        if cached and cached["expires_at"] > time.time():
+            return cached["token"], None
+    try:
+        resp = requests.post(
+            f"{VOICELINK_BASE_URL}/api/v1/login",
+            json={"email": login_email, "password": login_password},
+            timeout=15,
+        )
+        data = resp.json()
+        if resp.status_code >= 400:
+            return None, data.get("message") or data.get("error") or "VoiceLink login failed"
+        token = data.get("token") or data.get("access_token") or (data.get("data") or {}).get("token")
+        if not token:
+            return None, "VoiceLink login succeeded but no token found in the response"
+        with _voicelink_token_lock:
+            _voicelink_tokens[login_email] = {"token": token, "expires_at": time.time() + 50 * 60}
+        return token, None
+    except Exception as e:
+        return None, str(e)
+
+
+def voicelink_add_lead(login_email, login_password, did_number, customer_number,
+                        websocket_url, webhook_url, custom_parameters=None):
+    """Queues one outbound call via VoiceLink's add_lead API. Retries once
+    on a 401/403 in case the cached token had just expired."""
+    def _do_call(token):
+        return requests.post(
+            f"{VOICELINK_BASE_URL}/api/v1/add_lead",
+            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+            json={
+                "did_number": did_number,
+                "customer_number": customer_number,
+                "websocket_url": websocket_url,
+                "webhook_url": webhook_url,
+                "custom_parameters": json.dumps(custom_parameters or {}),
+            },
+            timeout=15,
+        )
+
+    token, err = voicelink_login(login_email, login_password)
+    if err:
+        return None, err
+    try:
+        resp = _do_call(token)
+        data = resp.json()
+        if resp.status_code in (401, 403):
+            with _voicelink_token_lock:
+                _voicelink_tokens.pop(login_email, None)
+            token2, err2 = voicelink_login(login_email, login_password)
+            if err2:
+                return None, err2
+            resp = _do_call(token2)
+            data = resp.json()
+        if resp.status_code >= 400:
+            return None, data.get("message") or data.get("error") or "VoiceLink add_lead failed"
         return data, None
     except Exception as e:
         return None, str(e)
@@ -2013,6 +2119,171 @@ def api_place_call_vanisetu():
 
     log("MAIN", f"Outbound VaniSetu call requested: call_id={call_id} -> {to_number} (caller_id={caller_id})")
     return jsonify({"ok": True, "call_sid": call_id})
+
+
+@app.route("/api/calls/voicelink", methods=["POST"])
+def api_place_call_voicelink():
+    """PravaahAI calls this to have Eva place an outbound call over
+    VoiceLink instead of Twilio/VaniSetu. Body: {call_id, customer_number,
+    did_number, voicelink_login_email, voicelink_login_password, agent,
+    lead, callback_url}. Auth: header X-Eva-Secret must match EVA_API_SECRET."""
+    if not EVA_API_SECRET or request.headers.get("X-Eva-Secret") != EVA_API_SECRET:
+        return jsonify({"ok": False, "error": "Invalid or missing X-Eva-Secret"}), 401
+    if not PUBLIC_BASE_URL:
+        return jsonify({"ok": False, "error": "PUBLIC_BASE_URL not set in Eva's .env"}), 400
+
+    missing = [n for n, v in [
+        ("DEEPGRAM_API_KEY", DEEPGRAM_API_KEY),
+        ("GROQ_API_KEY", GROQ_API_KEY),
+        ("SARVAM_API_KEY", SARVAM_API_KEY),
+    ] if not v]
+    if missing:
+        return jsonify({"ok": False, "error": f"Eva missing env keys: {', '.join(missing)}"}), 500
+
+    data = request.get_json(silent=True) or {}
+    call_id = data.get("call_id")
+    customer_number = data.get("customer_number")
+    did_number = data.get("did_number")
+    login_email = data.get("voicelink_login_email")
+    login_password = data.get("voicelink_login_password")
+    agent = data.get("agent", {}) or {}
+    lead = data.get("lead", {}) or {}
+    meeting = data.get("meeting") or {}
+    callback_url = data.get("callback_url")
+
+    if not (call_id and customer_number and did_number and callback_url):
+        return jsonify({"ok": False, "error": "call_id, customer_number, did_number and callback_url are required"}), 400
+    if not (login_email and login_password):
+        return jsonify({"ok": False, "error": "voicelink_login_email and voicelink_login_password are required"}), 400
+
+    with _pending_calls_lock:
+        PENDING_CALLS[call_id] = {
+            "agent": agent, "lead": lead, "callback_url": callback_url,
+            "created_at": time.time(), "meeting": meeting,
+        }
+
+    ws_scheme_base = PUBLIC_BASE_URL.replace("https://", "wss://").replace("http://", "ws://")
+    call_websocket_url = f"{ws_scheme_base}/ws/voicelink/{call_id}"
+    call_webhook_url = f"{PUBLIC_BASE_URL}/api/voicelink/webhook/{call_id}"
+
+    result, err = voicelink_add_lead(
+        login_email, login_password, did_number, customer_number,
+        websocket_url=call_websocket_url, webhook_url=call_webhook_url,
+        custom_parameters={"call_id": call_id},
+    )
+    if err:
+        with _pending_calls_lock:
+            PENDING_CALLS.pop(call_id, None)
+        log("MAIN", f"api_place_call_voicelink failed: {err}")
+        return jsonify({"ok": False, "error": err}), 502
+
+    queue_id = result.get("outbound_queue_id") or (result.get("data") or {}).get("outbound_queue_id")
+    log("MAIN", f"Outbound VoiceLink call requested: call_id={call_id} -> {customer_number} (did={did_number})")
+    return jsonify({"ok": True, "call_sid": queue_id or call_id})
+
+
+@app.route("/api/voicelink/webhook/<call_id>", methods=["POST"])
+def voicelink_webhook(call_id):
+    """VoiceLink posts call-status events here — this URL was set as this
+    specific call's webhook_url override in add_lead. TODO: confirm the
+    exact status/event field names against VoiceLink's 'WebSocket
+    Integration -> Webhook' docs page; this is a best-effort guess in the
+    same spirit as VANISETU_CALL_END_EVENTS above."""
+    payload = request.get_json(silent=True) or {}
+    log("VOICELINK", f"webhook call_id={call_id}: {payload}")
+
+    status = (payload.get("status") or payload.get("event") or "").lower()
+    terminal_statuses = {"completed", "failed", "no-answer", "no_answer", "busy", "cancelled", "hangup"}
+    if status in terminal_statuses:
+        session = VOICELINK_SESSIONS.get(call_id)
+        if session:
+            session.hangup_reason = status
+            session.close()
+            session._finish_and_callback(hangup_reason=status)
+            VOICELINK_SESSIONS.pop(call_id, None)
+        else:
+            # The websocket never connected at all (e.g. no-answer) — still
+            # report back to PravaahAI so the call doesn't sit stuck as "queued".
+            with _pending_calls_lock:
+                cfg = PENDING_CALLS.pop(call_id, None)
+            if cfg and cfg.get("callback_url"):
+                try:
+                    requests.post(
+                        cfg["callback_url"],
+                        headers={"X-Eva-Secret": EVA_API_SECRET, "Content-Type": "application/json"},
+                        json={"call_id": call_id, "status": "no_response", "hangup_reason": status,
+                              "duration_secs": 0, "transcript": []},
+                        timeout=15,
+                    )
+                except Exception as e:
+                    log("VOICELINK", f"callback POST failed for {call_id}: {e}")
+    return jsonify({"received": True})
+
+
+@sock.route("/ws/voicelink/<call_id>")
+def voicelink_ws(ws, call_id):
+    """VoiceLink connects here once the customer answers — the URL is
+    already scoped to this exact call_id (we set it per-lead in add_lead),
+    so unlike VaniSetu's shared socket there's no FIFO-matching needed.
+
+    TODO: confirm the real wire protocol against VoiceLink's 'WebSocket
+    Integration -> WebSocket Events' docs page. This assumes raw binary
+    audio frames in both directions (see VOICELINK_CODEC/VOICELINK_RATE) —
+    if VoiceLink instead wraps audio in JSON events, the unexpected-text-
+    frame log below will show you the real shape on the first test call."""
+    with _pending_calls_lock:
+        cfg = PENDING_CALLS.get(call_id)
+    if not cfg:
+        log("VOICELINK", f"No pending config for call_id={call_id}, closing.")
+        return
+
+    missing = [n for n, v in [
+        ("DEEPGRAM_API_KEY", DEEPGRAM_API_KEY),
+        ("GROQ_API_KEY", GROQ_API_KEY),
+        ("SARVAM_API_KEY", SARVAM_API_KEY),
+    ] if not v]
+    if missing:
+        log("VOICELINK", f"Outbound call rejected, missing keys: {missing}")
+        return
+
+    session = EvaSession(
+        ws, mode="phone", transport="voicelink", call_id=call_id,
+        agent=cfg["agent"], lead=cfg["lead"], callback_url=cfg["callback_url"],
+        meeting=cfg.get("meeting"),
+    )
+    if not session.start():
+        session._finish_and_callback(hangup_reason="failed_to_start")
+        with _pending_calls_lock:
+            PENDING_CALLS.pop(call_id, None)
+        return
+
+    VOICELINK_SESSIONS[call_id] = session
+    session.call_started_at = time.time()
+    opening = render_call_vars(cfg["agent"].get("opening_line") or "Hi, do you have a quick minute?", cfg["lead"])
+    opening_lang = "hi" if cfg["agent"].get("language") == "hi" else "en"
+    session.speak(opening, opening_lang)
+    log("VOICELINK", f"Outbound call {call_id} connected.")
+
+    try:
+        while True:
+            msg = ws.receive()
+            if msg is None:
+                break
+            if isinstance(msg, (bytes, bytearray)):
+                session.feed_audio(bytes(msg))
+            else:
+                log("VOICELINK", f"call {call_id}: unexpected text frame (protocol may differ from assumption): {msg[:300]}")
+    except Exception as e:
+        log("VOICELINK", f"ws loop error: {e}")
+        session.hangup_reason = "error"
+    finally:
+        session.close()
+        session._finish_and_callback()
+        VOICELINK_SESSIONS.pop(call_id, None)
+        with _pending_calls_lock:
+            PENDING_CALLS.pop(call_id, None)
+        log("VOICELINK", f"Outbound call {call_id} disconnected.")
+
 
 if __name__ == "__main__":
     missing = [n for n, v in [
