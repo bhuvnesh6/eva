@@ -1114,7 +1114,13 @@ def voicelink_login(login_username: str, login_password: str):
 
     if resp.status_code >= 400:
         return None, data.get("message") or data.get("error") or f"VoiceLink login failed (status {resp.status_code})"
-    token = data.get("token") or data.get("access_token") or (data.get("data") or {}).get("token")
+    inner = data.get("data") or {}
+    token = (
+        data.get("token")
+        or data.get("access_token")
+        or inner.get("token")
+        or inner.get("access_token")
+    )
     if not token:
         return None, f"VoiceLink login succeeded but no token found in the response: {data}"
     with _voicelink_token_lock:
