@@ -1095,17 +1095,31 @@ def voicelink_login(login_email: str, login_password: str):
             json={"email": login_email, "password": login_password},
             timeout=15,
         )
-        data = resp.json()
-        if resp.status_code >= 400:
-            return None, data.get("message") or data.get("error") or "VoiceLink login failed"
-        token = data.get("token") or data.get("access_token") or (data.get("data") or {}).get("token")
-        if not token:
-            return None, "VoiceLink login succeeded but no token found in the response"
-        with _voicelink_token_lock:
-            _voicelink_tokens[login_email] = {"token": token, "expires_at": time.time() + 50 * 60}
-        return token, None
     except Exception as e:
-        return None, str(e)
+        log("VOICELINK-AUTH", f"login request failed to send: {e}")
+        return None, f"Could not reach VoiceLink: {e}"
+
+    # Log the raw response BEFORE trying to parse it as JSON, so a bad
+    # endpoint path / auth shape shows up clearly in the logs instead of
+    # surfacing only as a cryptic "Expecting value" JSON decode error.
+    log("VOICELINK-AUTH", f"login response: status={resp.status_code} body={resp.text[:500]!r}")
+
+    try:
+        data = resp.json()
+    except ValueError:
+        return None, (
+            f"VoiceLink login did not return JSON (status {resp.status_code}). "
+            f"Check the login endpoint path/payload — got: {resp.text[:200]!r}"
+        )
+
+    if resp.status_code >= 400:
+        return None, data.get("message") or data.get("error") or f"VoiceLink login failed (status {resp.status_code})"
+    token = data.get("token") or data.get("access_token") or (data.get("data") or {}).get("token")
+    if not token:
+        return None, f"VoiceLink login succeeded but no token found in the response: {data}"
+    with _voicelink_token_lock:
+        _voicelink_tokens[login_email] = {"token": token, "expires_at": time.time() + 50 * 60}
+    return token, None
 
 
 def voicelink_add_lead(login_email, login_password, did_number, customer_number,
@@ -1129,9 +1143,16 @@ def voicelink_add_lead(login_email, login_password, did_number, customer_number,
     token, err = voicelink_login(login_email, login_password)
     if err:
         return None, err
+
+    def _parse(resp):
+        log("VOICELINK-AUTH", f"add_lead response: status={resp.status_code} body={resp.text[:500]!r}")
+        try:
+            return resp.json(), None
+        except ValueError:
+            return None, f"VoiceLink add_lead did not return JSON (status {resp.status_code}): {resp.text[:200]!r}"
+
     try:
         resp = _do_call(token)
-        data = resp.json()
         if resp.status_code in (401, 403):
             with _voicelink_token_lock:
                 _voicelink_tokens.pop(login_email, None)
@@ -1139,9 +1160,12 @@ def voicelink_add_lead(login_email, login_password, did_number, customer_number,
             if err2:
                 return None, err2
             resp = _do_call(token2)
-            data = resp.json()
+
+        data, parse_err = _parse(resp)
+        if parse_err:
+            return None, parse_err
         if resp.status_code >= 400:
-            return None, data.get("message") or data.get("error") or "VoiceLink add_lead failed"
+            return None, data.get("message") or data.get("error") or f"VoiceLink add_lead failed (status {resp.status_code})"
         return data, None
     except Exception as e:
         return None, str(e)
