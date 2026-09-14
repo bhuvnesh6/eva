@@ -1080,19 +1080,19 @@ _voicelink_token_lock = threading.Lock()
 _voicelink_tokens = {}  # login_email -> {"token": "...", "expires_at": epoch}
 
 
-def voicelink_login(login_email: str, login_password: str):
+def voicelink_login(login_username: str, login_password: str):
     """Logs into VoiceLink and returns a bearer token, cached per
-    login_email so we don't re-auth on every single call. TODO: confirm the
+    login_username so we don't re-auth on every single call. TODO: confirm the
     real token lifetime/field name from VoiceLink's Login response — the
     50-minute expiry below is a conservative guess, not a confirmed value."""
     with _voicelink_token_lock:
-        cached = _voicelink_tokens.get(login_email)
+        cached = _voicelink_tokens.get(login_username)
         if cached and cached["expires_at"] > time.time():
             return cached["token"], None
     try:
         resp = requests.post(
-            f"{VOICELINK_BASE_URL}/api/v1/login",
-            json={"email": login_email, "password": login_password},
+            f"{VOICELINK_BASE_URL}/api/v1/auth/login",
+            json={"username": login_username, "password": login_password},
             timeout=15,
         )
     except Exception as e:
@@ -1118,11 +1118,11 @@ def voicelink_login(login_email: str, login_password: str):
     if not token:
         return None, f"VoiceLink login succeeded but no token found in the response: {data}"
     with _voicelink_token_lock:
-        _voicelink_tokens[login_email] = {"token": token, "expires_at": time.time() + 50 * 60}
+        _voicelink_tokens[login_username] = {"token": token, "expires_at": time.time() + 50 * 60}
     return token, None
 
 
-def voicelink_add_lead(login_email, login_password, did_number, customer_number,
+def voicelink_add_lead(login_username, login_password, did_number, customer_number,
                         websocket_url, webhook_url, custom_parameters=None):
     """Queues one outbound call via VoiceLink's add_lead API. Retries once
     on a 401/403 in case the cached token had just expired."""
@@ -1140,7 +1140,7 @@ def voicelink_add_lead(login_email, login_password, did_number, customer_number,
             timeout=15,
         )
 
-    token, err = voicelink_login(login_email, login_password)
+    token, err = voicelink_login(login_username, login_password)
     if err:
         return None, err
 
@@ -1155,8 +1155,8 @@ def voicelink_add_lead(login_email, login_password, did_number, customer_number,
         resp = _do_call(token)
         if resp.status_code in (401, 403):
             with _voicelink_token_lock:
-                _voicelink_tokens.pop(login_email, None)
-            token2, err2 = voicelink_login(login_email, login_password)
+                _voicelink_tokens.pop(login_username, None)
+            token2, err2 = voicelink_login(login_username, login_password)
             if err2:
                 return None, err2
             resp = _do_call(token2)
@@ -2168,7 +2168,7 @@ def api_place_call_voicelink():
     call_id = data.get("call_id")
     customer_number = data.get("customer_number")
     did_number = data.get("did_number")
-    login_email = data.get("voicelink_login_email")
+    login_username = data.get("voicelink_login_username")
     login_password = data.get("voicelink_login_password")
     agent = data.get("agent", {}) or {}
     lead = data.get("lead", {}) or {}
@@ -2177,8 +2177,8 @@ def api_place_call_voicelink():
 
     if not (call_id and customer_number and did_number and callback_url):
         return jsonify({"ok": False, "error": "call_id, customer_number, did_number and callback_url are required"}), 400
-    if not (login_email and login_password):
-        return jsonify({"ok": False, "error": "voicelink_login_email and voicelink_login_password are required"}), 400
+    if not (login_username and login_password):
+        return jsonify({"ok": False, "error": "voicelink_login_username and voicelink_login_password are required"}), 400
 
     with _pending_calls_lock:
         PENDING_CALLS[call_id] = {
@@ -2191,7 +2191,7 @@ def api_place_call_voicelink():
     call_webhook_url = f"{PUBLIC_BASE_URL}/api/voicelink/webhook/{call_id}"
 
     result, err = voicelink_add_lead(
-        login_email, login_password, did_number, customer_number,
+        login_username, login_password, did_number, customer_number,
         websocket_url=call_websocket_url, webhook_url=call_webhook_url,
         custom_parameters={"call_id": call_id},
     )
