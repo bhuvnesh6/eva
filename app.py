@@ -128,7 +128,10 @@ BARGE_IN_MIN_VOLUME_LINEAR16 = int(os.environ.get("EVA_BARGE_IN_MIN_VOLUME_LINEA
 # mu-law (phone calls) decodes to a smaller effective range (~-8031..8031),
 # so this threshold is scaled down to match.
 BARGE_IN_MIN_VOLUME_MULAW = int(os.environ.get("EVA_BARGE_IN_MIN_VOLUME_MULAW", 350))
-
+# A-law (VoiceLink calls) has a similar effective dynamic range to mu-law,
+# so the same default is a reasonable starting point — tune independently
+# via EVA_BARGE_IN_MIN_VOLUME_ALAW if VoiceLink calls prove more/less sensitive.
+BARGE_IN_MIN_VOLUME_ALAW = int(os.environ.get("EVA_BARGE_IN_MIN_VOLUME_ALAW", 350))
 DEEPGRAM_API_KEY = os.environ.get("DEEPGRAM_API_KEY")
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 GROQ_MODEL = "openai/gpt-oss-120b"
@@ -160,9 +163,9 @@ VANISETU_RATE = 8000   # G.711 mu-law over telephony — same rate as Twilio's P
 # VoiceLink account), NOT from env vars — mirrors how Twilio creds arrive
 # per-call rather than being global to this service.
 VOICELINK_BASE_URL = os.environ.get("VOICELINK_BASE_URL", "https://app.voicelink.co.in").rstrip("/")
-# TODO: confirm real codec/sample rate against VoiceLink's "WebSocket
-# Integration" docs — this assumes standard PSTN mu-law@8kHz like VaniSetu/Twilio.
-VOICELINK_CODEC = os.environ.get("VOICELINK_CODEC", "mulaw")
+# Confirmed via VoiceLink's WebSocket Events docs: media_format.encoding is
+# "audio/alaw" at 8kHz — this is A-law, NOT mu-law like VaniSetu/Twilio.
+VOICELINK_CODEC = os.environ.get("VOICELINK_CODEC", "alaw")
 VOICELINK_RATE = int(os.environ.get("VOICELINK_RATE", 8000))
 
 
@@ -245,6 +248,41 @@ def _rms_mulaw(data: bytes) -> float:
     total = 0
     for b in data:
         v = _ULAW_TO_LINEAR16[b]
+        total += v * v
+    return math.sqrt(total / len(data))
+
+
+def _build_alaw_decode_table():
+    """Standard ITU-T G.711 A-law -> linear16 expansion, precomputed once.
+    VoiceLink's WebSocket audio is A-law, NOT mu-law — see WebSocket Events
+    docs (media_format.encoding = 'audio/alaw')."""
+    table = []
+    for i in range(256):
+        a_val = i ^ 0x55
+        t = (a_val & 0x0F) << 4
+        seg = (a_val & 0x70) >> 4
+        if seg == 0:
+            t += 8
+        elif seg == 1:
+            t += 0x108
+        else:
+            t += 0x108
+            t <<= (seg - 1)
+        val = t if (a_val & 0x80) else -t
+        table.append(val)
+    return table
+
+
+_ALAW_TO_LINEAR16 = _build_alaw_decode_table()
+
+
+def _rms_alaw(data: bytes) -> float:
+    """RMS volume of raw A-law (VoiceLink) audio, decoded to linear first."""
+    if not data:
+        return 0.0
+    total = 0
+    for b in data:
+        v = _ALAW_TO_LINEAR16[b]
         total += v * v
     return math.sqrt(total / len(data))
 
@@ -423,14 +461,19 @@ class EvaSession:
                 vanisetu_client.send_audio(self.vanisetu_session_id, audio_bytes)
             return
         if self.mode == "phone" and self.transport == "voicelink":
-            # ASSUMED raw binary audio frames, no JSON/streamSid wrapper —
-            # this socket is scoped to exactly one call via the URL, so
-            # there's no multi-call framing needed like VaniSetu's. See the
-            # TODO in /ws/voicelink/<call_id> if VoiceLink turns out to
-            # wrap audio in JSON events instead.
+            # Confirmed via WebSocket Events docs: outbound audio is a JSON
+            # event with a base64 payload, e.g. {"event":"media","media":
+            # {"payload":"<base64>"}} — NOT raw binary. Only send once
+            # "start" has actually arrived (stream_sid set), mirroring the
+            # Twilio outbound path.
+            if not self.stream_sid:
+                return
             with self.ws_lock:
                 try:
-                    self.ws.send(audio_bytes)
+                    self.ws.send(json.dumps({
+                        "event": "media",
+                        "media": {"payload": base64.b64encode(audio_bytes).decode("ascii")},
+                    }))
                 except Exception:
                     pass
             return
@@ -474,6 +517,9 @@ class EvaSession:
             if self.transport == "vanisetu":
                 if self.vanisetu_session_id is not None:
                     vanisetu_client.send_command(self.vanisetu_session_id, {"command": "FLUSH_MEDIA"})
+            elif self.transport == "voicelink":
+                if self.stream_sid:
+                    self._send_raw({"event": "clear", "stream_sid": self.stream_sid})
             elif self.stream_sid:
                 self._send_raw({"event": "clear", "streamSid": self.stream_sid})
         else:
@@ -524,8 +570,12 @@ class EvaSession:
             return  # already armed - no need to recompute volume
 
         if self.mode == "phone":
-            rms = _rms_mulaw(raw_audio)
-            threshold = BARGE_IN_MIN_VOLUME_MULAW
+            if self.transport == "voicelink":
+                rms = _rms_alaw(raw_audio)
+                threshold = BARGE_IN_MIN_VOLUME_ALAW
+            else:
+                rms = _rms_mulaw(raw_audio)
+                threshold = BARGE_IN_MIN_VOLUME_MULAW
         else:
             rms = _rms_pcm16(raw_audio)
             threshold = BARGE_IN_MIN_VOLUME_LINEAR16
@@ -636,7 +686,12 @@ class EvaSession:
     # ---------- lifecycle ----------
     def start(self):
         if self.mode == "phone":
-            encoding, sample_rate = "mulaw", PHONE_RATE
+            if self.transport == "voicelink":
+                encoding, sample_rate = VOICELINK_CODEC, VOICELINK_RATE
+            elif self.transport == "vanisetu":
+                encoding, sample_rate = "mulaw", VANISETU_RATE
+            else:
+                encoding, sample_rate = "mulaw", PHONE_RATE
         else:
             encoding, sample_rate = "linear16", MIC_RATE
 
@@ -2214,26 +2269,26 @@ def api_place_call_voicelink():
 
 @app.route("/api/voicelink/webhook/<call_id>", methods=["POST"])
 def voicelink_webhook(call_id):
-    """VoiceLink posts call-status events here — this URL was set as this
-    specific call's webhook_url override in add_lead. TODO: confirm the
-    exact status/event field names against VoiceLink's 'WebSocket
-    Integration -> Webhook' docs page; this is a best-effort guess in the
-    same spirit as VANISETU_CALL_END_EVENTS above."""
+    """VoiceLink posts call-status events here — confirmed shape per docs:
+    {"event": "call.initiated|call.answered|call.ended|call.completed",
+     "callId": ..., "callStatus": ..., "duration": ..., "customParameters": {...}}"""
     payload = request.get_json(silent=True) or {}
-    log("VOICELINK", f"webhook call_id={call_id}: {payload}")
+    event = (payload.get("event") or "").lower()
+    log("VOICELINK", f"webhook call_id={call_id} event={event}")
 
-    status = (payload.get("status") or payload.get("event") or "").lower()
-    terminal_statuses = {"completed", "failed", "no-answer", "no_answer", "busy", "cancelled", "hangup"}
-    if status in terminal_statuses:
+    if event in ("call.ended", "call.completed"):
         session = VOICELINK_SESSIONS.get(call_id)
         if session:
-            session.hangup_reason = status
+            session.hangup_reason = payload.get("callStatus", "completed")
             session.close()
-            session._finish_and_callback(hangup_reason=status)
+            session._finish_and_callback(hangup_reason=session.hangup_reason)
             VOICELINK_SESSIONS.pop(call_id, None)
         else:
             # The websocket never connected at all (e.g. no-answer) — still
             # report back to PravaahAI so the call doesn't sit stuck as "queued".
+            # _finish_and_callback() on the session path already dedupes
+            # against a real websocket-driven callback firing later, since
+            # both paths pop the same PENDING_CALLS entry.
             with _pending_calls_lock:
                 cfg = PENDING_CALLS.pop(call_id, None)
             if cfg and cfg.get("callback_url"):
@@ -2241,8 +2296,11 @@ def voicelink_webhook(call_id):
                     requests.post(
                         cfg["callback_url"],
                         headers={"X-Eva-Secret": EVA_API_SECRET, "Content-Type": "application/json"},
-                        json={"call_id": call_id, "status": "no_response", "hangup_reason": status,
-                              "duration_secs": 0, "transcript": []},
+                        json={
+                            "call_id": call_id, "status": "no_response",
+                            "hangup_reason": payload.get("callStatus", event),
+                            "duration_secs": payload.get("duration", 0), "transcript": [],
+                        },
                         timeout=15,
                     )
                 except Exception as e:
@@ -2253,14 +2311,10 @@ def voicelink_webhook(call_id):
 @sock.route("/ws/voicelink/<call_id>")
 def voicelink_ws(ws, call_id):
     """VoiceLink connects here once the customer answers — the URL is
-    already scoped to this exact call_id (we set it per-lead in add_lead),
-    so unlike VaniSetu's shared socket there's no FIFO-matching needed.
-
-    TODO: confirm the real wire protocol against VoiceLink's 'WebSocket
-    Integration -> WebSocket Events' docs page. This assumes raw binary
-    audio frames in both directions (see VOICELINK_CODEC/VOICELINK_RATE) —
-    if VoiceLink instead wraps audio in JSON events, the unexpected-text-
-    frame log below will show you the real shape on the first test call."""
+    scoped to this exact call_id (we set it per-lead in add_lead). Confirmed
+    protocol per VoiceLink's WebSocket Events docs: JSON events with
+    base64-encoded A-law audio (connected -> start -> media* -> stop),
+    same event-driven shape as Twilio Media Streams, not raw binary."""
     with _pending_calls_lock:
         cfg = PENDING_CALLS.get(call_id)
     if not cfg:
@@ -2288,11 +2342,7 @@ def voicelink_ws(ws, call_id):
         return
 
     VOICELINK_SESSIONS[call_id] = session
-    session.call_started_at = time.time()
-    opening = render_call_vars(cfg["agent"].get("opening_line") or "Hi, do you have a quick minute?", cfg["lead"])
-    opening_lang = "hi" if cfg["agent"].get("language") == "hi" else "en"
-    session.speak(opening, opening_lang)
-    log("VOICELINK", f"Outbound call {call_id} connected.")
+    log("VOICELINK", f"Outbound call {call_id}: websocket connected, awaiting start event.")
 
     try:
         while True:
@@ -2300,9 +2350,44 @@ def voicelink_ws(ws, call_id):
             if msg is None:
                 break
             if isinstance(msg, (bytes, bytearray)):
-                session.feed_audio(bytes(msg))
+                log("VOICELINK", f"call {call_id}: unexpected binary frame, ignoring (protocol is JSON-only)")
+                continue
+            try:
+                data = json.loads(msg)
+            except Exception:
+                continue
+
+            event = data.get("event")
+            if event == "connected":
+                log("VOICELINK", f"call {call_id}: connected")
+            elif event == "start":
+                start_info = data.get("start", {}) or {}
+                session.stream_sid = start_info.get("stream_sid") or data.get("stream_sid")
+                session.call_started_at = time.time()
+                log("VOICELINK", f"call {call_id}: start event, stream_sid={session.stream_sid}")
+                opening = render_call_vars(
+                    cfg["agent"].get("opening_line") or "Hi, do you have a quick minute?", cfg["lead"],
+                )
+                opening_lang = "hi" if cfg["agent"].get("language") == "hi" else "en"
+                session.speak(opening, opening_lang)
+            elif event == "media":
+                media = data.get("media", {}) or {}
+                if media.get("track", "inbound") != "inbound":
+                    continue  # ignore any echo of our own outbound audio
+                payload_b64 = media.get("payload")
+                if payload_b64:
+                    try:
+                        audio = base64.b64decode(payload_b64)
+                    except Exception:
+                        continue
+                    session.feed_audio(audio)
+            elif event == "mark":
+                pass  # turn-taking sync checkpoint — not used yet
+            elif event == "stop":
+                log("VOICELINK", f"call {call_id}: stop event")
+                break
             else:
-                log("VOICELINK", f"call {call_id}: unexpected text frame (protocol may differ from assumption): {msg[:300]}")
+                log("VOICELINK", f"call {call_id}: unhandled event {event!r}")
     except Exception as e:
         log("VOICELINK", f"ws loop error: {e}")
         session.hangup_reason = "error"
