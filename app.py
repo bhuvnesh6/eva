@@ -1587,14 +1587,14 @@ def embed_widget_js():
     Renders a floating mic bubble bottom-right on desktop, and a full-width
     centered bottom bubble on mobile (see @media block in the CSS below)."""
     js = r"""
-(function(){
-  var cur = document.currentScript;
-  var publicId = cur.getAttribute('data-public-id');
-  var color = cur.getAttribute('data-color') || '#2454E8';
-  if(!publicId){ console.error('[EvaWidget] missing data-public-id'); return; }
-  var evaOrigin = cur.src.split('/embed/widget.js')[0];
-  var wsUrl = evaOrigin.replace(/^http/, 'ws') + '/ws/widget/' + publicId;
-  var metaUrl = evaOrigin + '/api/widget-meta/' + publicId;
+ (function(){
+   var cur = document.currentScript;
+   var publicId = cur.getAttribute('data-public-id');
+   var color = cur.getAttribute('data-color') || '#2454E8';
+   if(!publicId){ console.error('[EvaWidget] missing data-public-id'); return; }
+   var evaOrigin = cur.src.split('/embed/widget.js')[0];
+   var wsUrl = evaOrigin.replace(/^http/, 'ws') + '/ws/widget/' + publicId;
+   var metaUrl = evaOrigin + '/api/widget-meta/' + publicId;
 
   var css = document.createElement('style');
   css.textContent = `
@@ -1610,19 +1610,27 @@ def embed_widget_js():
       overflow:hidden;z-index:999999;font-family:-apple-system,Segoe UI,Roboto,sans-serif;}
     #eva-w-panel.open{display:flex;}
     #eva-w-head{background:${color};color:#fff;padding:14px 16px;font-size:14px;font-weight:600;}
-    #eva-w-body{flex:1;padding:16px;overflow:auto;font-size:13px;color:#222;}
+    #eva-w-body{flex:1;padding:16px;overflow:auto;font-size:13px;color:#222;display:flex;flex-direction:column;}
+    #eva-w-greeting{background:#f2f4f8;color:#222;padding:10px 12px;border-radius:12px;margin-bottom:14px;font-size:13px;}
     #eva-w-form input{width:100%;box-sizing:border-box;margin-bottom:8px;padding:10px 12px;border:1px solid #ddd;
       border-radius:8px;font-size:13px;}
     #eva-w-form button{width:100%;padding:10px;border:none;border-radius:8px;background:${color};color:#fff;
       font-weight:600;cursor:pointer;}
+    #eva-w-mode button{width:100%;padding:11px;border:none;border-radius:8px;background:${color};color:#fff;
+      font-weight:600;cursor:pointer;margin-bottom:8px;}
+    #eva-w-mode button.secondary{background:#f2f4f8;color:#222;}
     #eva-w-status{text-align:center;color:#888;font-size:12px;margin-top:10px;}
-    #eva-w-mic{width:74px;height:74px;border-radius:50%;background:${color};margin:20px auto;display:flex;
+    #eva-w-mic{width:74px;height:74px;border-radius:50%;background:${color};margin:16px auto;display:flex;
       align-items:center;justify-content:center;cursor:pointer;animation:eva-mic-pulse 1.8s infinite;}
     @keyframes eva-mic-pulse{0%{box-shadow:0 0 0 0 ${color}55;}70%{box-shadow:0 0 0 14px ${color}00;}100%{box-shadow:0 0 0 0 ${color}00;}}
     #eva-w-mic svg{width:30px;height:30px;fill:#fff;}
-    #eva-w-transcript{font-size:12.5px;line-height:1.6;}
+    #eva-w-transcript{font-size:12.5px;line-height:1.6;flex:1;overflow:auto;margin-top:8px;}
     #eva-w-transcript .u{color:#111;font-weight:600;}
     #eva-w-transcript .a{color:${color};font-weight:600;}
+    #eva-w-chatbar{display:flex;gap:6px;margin-top:10px;}
+    #eva-w-chatbar input{flex:1;padding:9px 11px;border:1px solid #ddd;border-radius:20px;font-size:13px;}
+    #eva-w-chatbar button{padding:9px 14px;border:none;border-radius:20px;background:${color};color:#fff;
+      font-weight:600;cursor:pointer;}
     @media(max-width:520px){
       #eva-w-bubble{left:50%;right:auto;bottom:18px;transform:translateX(-50%);}
       #eva-w-bubble:hover{transform:translateX(-50%) scale(1.06);}
@@ -1638,54 +1646,81 @@ def embed_widget_js():
   panel.innerHTML = `
     <div id="eva-w-head">Talk to us</div>
     <div id="eva-w-body">
-      <div id="eva-w-form">
+      <div id="eva-w-greeting" style="display:none;"></div>
+
+      <div id="eva-w-form" style="display:none;">
         <input id="eva-w-name" placeholder="Your name">
         <input id="eva-w-phone" placeholder="Phone number">
         <input id="eva-w-email" placeholder="Email (optional)">
-        <button id="eva-w-start">Start</button>
+        <button id="eva-w-lead-submit">Continue</button>
       </div>
+
+      <div id="eva-w-mode" style="display:none;">
+        <button id="eva-w-mode-chat">💬 Type a message</button>
+        <button id="eva-w-mode-call" class="secondary">📞 Talk with voice</button>
+      </div>
+
       <div id="eva-w-call" style="display:none;text-align:center;">
         <div id="eva-w-mic"><svg viewBox="0 0 24 24"><path d="M12 14a3 3 0 0 0 3-3V6a3 3 0 0 0-6 0v5a3 3 0 0 0 3 3zm5-3a5 5 0 0 1-10 0H5a7 7 0 0 0 6 6.92V21h2v-3.08A7 7 0 0 0 19 11h-2z"/></svg></div>
         <div id="eva-w-status">Connecting…</div>
-        <div id="eva-w-transcript"></div>
+      </div>
+
+      <div id="eva-w-transcript"></div>
+
+      <div id="eva-w-chatbar" style="display:none;">
+        <input id="eva-w-chat-input" placeholder="Type a message…">
+        <button id="eva-w-chat-send">Send</button>
       </div>
     </div>`;
   document.body.appendChild(bubble); document.body.appendChild(panel);
 
   var ws, audioCtx, mic, processor, playHead = 0;
-  var autoGreetTimer = null, sessionStarted = false;
+  var autoGreetTimer = null, sessionStarted = false, leadCaptured = false, voiceStarted = false;
 
   bubble.onclick = function(){
     panel.classList.toggle('open');
-    cancelAutoGreet(); // visitor engaged manually — no need to also auto-greet them
+    cancelAutoGreet();
+    if(!sessionStarted) connectSession();
   };
 
   function cancelAutoGreet(){
     if(autoGreetTimer){ clearTimeout(autoGreetTimer); autoGreetTimer = null; }
   }
 
-  document.getElementById('eva-w-start').onclick = function(){
-    var name = document.getElementById('eva-w-name').value.trim();
-    var phone = document.getElementById('eva-w-phone').value.trim();
-    var email = document.getElementById('eva-w-email').value.trim();
-    if(!name || !phone){ alert('Please share your name and phone number'); return; }
-    cancelAutoGreet();
-    document.getElementById('eva-w-form').style.display = 'none';
-    document.getElementById('eva-w-call').style.display = 'block';
-    if(ws && ws.readyState === WebSocket.OPEN){
-      // an auto-greet session is already live — just attach the lead info to it
-      ws.send(JSON.stringify({type:'lead_info', name:name, phone:phone, email:email}));
-    } else {
-      startSession(name, phone, email);
-    }
-  };
+  function show(id, disp){ document.getElementById(id).style.display = disp; }
+
+  // ---- 1) connect the socket right away, but this ONLY delivers the text
+  //         greeting + status — Eva never speaks and no mic opens yet.
+  function connectSession(){
+    if(sessionStarted) return;
+    sessionStarted = true;
+    ws = new WebSocket(wsUrl);
+    ws.binaryType = 'arraybuffer';
+    ws.onopen = function(){ document.getElementById('eva-w-status').textContent = 'Connecting…'; };
+    wireSocketEvents();
+  }
 
   function wireSocketEvents(){
     ws.onmessage = function(ev){
       if(typeof ev.data === 'string'){
         var msg = JSON.parse(ev.data);
-        if(msg.type === 'status'){ document.getElementById('eva-w-status').textContent =
-          msg.state === 'speaking' ? 'Eva is speaking…' : (msg.state === 'thinking' ? 'Thinking…' : 'Listening…'); }
+
+        if(msg.type === 'greeting'){
+          var g = document.getElementById('eva-w-greeting');
+          g.textContent = msg.text; g.style.display = 'block';
+        }
+        if(msg.type === 'status' && msg.state === 'awaiting_lead_info'){
+          show('eva-w-form', 'block');
+        }
+        if(msg.type === 'status' && msg.state === 'ready_for_mode_select'){
+          leadCaptured = true;
+          show('eva-w-form', 'none');
+          show('eva-w-mode', 'block');
+        }
+        if(msg.type === 'status' && msg.state){
+          document.getElementById('eva-w-status').textContent =
+            msg.state === 'speaking' ? 'Eva is speaking…' : (msg.state === 'thinking' ? 'Thinking…' : 'Listening…');
+        }
         if(msg.type === 'assistant_delta'){ appendTranscript('a', msg.text, true); }
         if(msg.type === 'assistant_done'){ appendTranscript('a', '', false); }
         if(msg.type === 'user_transcript' && msg.final){ appendTranscript('u', msg.text, false); }
@@ -1694,37 +1729,58 @@ def embed_widget_js():
         playAudio(ev.data);
       }
     };
-    ws.onclose = function(){ bubble.classList.remove('eva-live'); document.getElementById('eva-w-status').textContent = 'Call ended'; sessionStarted = false; stopMic(); };
+    ws.onclose = function(){ bubble.classList.remove('eva-live'); sessionStarted = false; stopMic(); };
   }
 
-  function startSession(name, phone, email){
-    if(sessionStarted) return;
-    sessionStarted = true;
-    ws = new WebSocket(wsUrl);
-    ws.binaryType = 'arraybuffer';
-    ws.onopen = function(){
+  // ---- 2) lead form ----
+  document.getElementById('eva-w-lead-submit').onclick = function(){
+    var name = document.getElementById('eva-w-name').value.trim();
+    var phone = document.getElementById('eva-w-phone').value.trim();
+    var email = document.getElementById('eva-w-email').value.trim();
+    if(!name || !phone){ alert('Please share your name and phone number'); return; }
+    if(ws && ws.readyState === WebSocket.OPEN){
       ws.send(JSON.stringify({type:'lead_info', name:name, phone:phone, email:email}));
-      startMic();
-      bubble.classList.add('eva-live');
-    };
-    wireSocketEvents();
+    }
+  };
+
+  // ---- 3) mode choice: chat (text only) vs call (voice) ----
+  document.getElementById('eva-w-mode-chat').onclick = function(){
+    show('eva-w-mode', 'none');
+    show('eva-w-chatbar', 'flex');
+    if(ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({type:'start_chat'}));
+  };
+  document.getElementById('eva-w-mode-call').onclick = function(){
+    show('eva-w-mode', 'none');
+    show('eva-w-call', 'block');
+    show('eva-w-chatbar', 'flex'); // typing still works during a call
+    voiceStarted = true;
+    if(ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({type:'start_voice'}));
+    startMic();
+    bubble.classList.add('eva-live');
+  };
+
+  document.getElementById('eva-w-chat-send').onclick = sendChatText;
+  document.getElementById('eva-w-chat-input').addEventListener('keydown', function(e){
+    if(e.key === 'Enter') sendChatText();
+  });
+  function sendChatText(){
+    var input = document.getElementById('eva-w-chat-input');
+    var text = input.value.trim();
+    if(!text || !ws || ws.readyState !== WebSocket.OPEN) return;
+    ws.send(JSON.stringify({type:'text', text:text}));
+    input.value = '';
   }
 
-  // Proactive auto-greet: opens the panel and starts talking on its own
-  // after the delay the owner configured — no click needed from the visitor.
-  // The lead form stays visible so they can fill it in while Eva talks.
+  // ---- proactive auto-greet: unchanged, owner opt-in, speaks right away ----
   function startAutoGreetSession(){
     if(sessionStarted) return;
     sessionStarted = true;
-    document.getElementById('eva-w-call').style.display = 'block';
+    show('eva-w-call', 'block');
     document.getElementById('eva-w-status').textContent = 'Connecting…';
     panel.classList.add('open');
     ws = new WebSocket(wsUrl + '?auto_greet=1');
     ws.binaryType = 'arraybuffer';
-    ws.onopen = function(){
-      startMic();
-      bubble.classList.add('eva-live');
-    };
+    ws.onopen = function(){ startMic(); bubble.classList.add('eva-live'); };
     wireSocketEvents();
   }
 
@@ -1775,9 +1831,6 @@ def embed_widget_js():
     src.start(startAt); playHead = startAt + abuf.duration;
   }
 
-  // Fetch this widget's public config (auto-greet timing) and — if the
-  // owner turned it on — schedule Eva to speak first after the configured
-  // delay, unless the visitor has already engaged manually by then.
   fetch(metaUrl).then(function(r){ return r.json(); }).then(function(meta){
     if(meta && meta.auto_greet && meta.auto_greet.enabled && meta.auto_greet.message){
       var delayMs = Math.max(1, meta.auto_greet.delay_secs || 5) * 1000;
@@ -1786,7 +1839,7 @@ def embed_widget_js():
         if(!sessionStarted) startAutoGreetSession();
       }, delayMs);
     }
-  }).catch(function(){ /* auto-greet is best-effort — silently skip if unreachable */ });
+  }).catch(function(){});
 })();
 """
     return js, 200, {"Content-Type": "application/javascript"}
@@ -1798,10 +1851,25 @@ def widget_ws(ws, public_id):
     agent + owner this public_id belongs to, run the normal Eva voice
     pipeline, capture the lead, and bill Eva minutes on close.
 
-    If ?auto_greet=1 is on the URL, this is a PROACTIVE session the embed
-    script opened on its own (after the delay the owner configured), not a
-    visitor who clicked "Start" - so we skip the "fill the form first"
-    gate entirely and have Eva speak the owner's auto-greet line right away."""
+    Fixed flow (previously Eva spoke + the mic effectively started the
+    instant the socket opened, with no text greeting and no lead-gate when
+    require_lead_before_chat was off):
+      1. Server sends a plain TEXT "greeting" message immediately — nothing
+         is spoken, no mic is expected yet.
+      2. If require_lead_before_chat is on, server sends
+         status=awaiting_lead_info and waits for a "lead_info" message.
+         If it's off, server sends status=ready_for_mode_select right away.
+      3. Client then explicitly chooses a mode:
+           - {"type":"start_chat"}  -> pure text, no mic, no auto-speak
+           - {"type":"start_voice"} -> Eva speaks the opening line, client
+             is expected to start streaming mic audio from here
+      4. Meeting/site-visit booking now works from the widget: the full
+         `meeting` context (webhook url, owner_id, agent_id, lead_id) is
+         passed into EvaSession so BOOK_MEETING: triggers actually fire,
+         exactly like a phone call.
+
+    ?auto_greet=1 is unchanged — that's the owner's own opt-in "Eva speaks
+    first after N seconds" feature and intentionally skips all of this."""
     config, err = fetch_widget_config(public_id)
     if err or not config:
         try:
@@ -1816,21 +1884,26 @@ def widget_ws(ws, public_id):
     require_lead_first = config.get("require_lead_before_chat", True)
     auto_greet_cfg = config.get("auto_greet") or {}
     is_auto_greet = request.args.get("auto_greet") == "1" and auto_greet_cfg.get("enabled")
+    meeting_ctx = config.get("meeting")  # None unless agent's book_meeting task is on
 
-    session = EvaSession(ws, mode="browser", agent=agent, lead={})
+    session = EvaSession(ws, mode="browser", agent=agent, lead={}, meeting=meeting_ctx)
     session.call_started_at = time.time()  # reused purely for widget duration billing
     if not session.start():
         return
 
+    greet_text = agent.get("opening_line") or "Hi! How can I help you today?"
+
     if is_auto_greet:
         session._send_json({"type": "ready"})
-        greet_text = auto_greet_cfg.get("message") or agent.get("opening_line") or "Hi! How can I help you today?"
-        session.speak(greet_text, detect_lang(greet_text))
-    elif require_lead_first:
-        session._send_json({"type": "status", "state": "awaiting_lead_info"})
+        auto_text = auto_greet_cfg.get("message") or greet_text
+        session.speak(auto_text, detect_lang(auto_text))
     else:
-        session._send_json({"type": "ready"})
-        session.speak(agent.get("opening_line") or "Hi! How can I help you today?", "en")
+        # Always show a plain text greeting first — never speak on connect.
+        session._send_json({"type": "greeting", "text": greet_text})
+        if require_lead_first:
+            session._send_json({"type": "status", "state": "awaiting_lead_info"})
+        else:
+            session._send_json({"type": "status", "state": "ready_for_mode_select"})
 
     lead_id_holder = {"lead_id": None}
     log("MAIN", f"Widget visitor connected: {public_id}" + (" (auto-greet)" if is_auto_greet else ""))
@@ -1855,13 +1928,26 @@ def widget_ws(ws, public_id):
                 email = (payload.get("email") or "").strip()
                 session.lead = {"name": name, "phone": phone, "email": email}
                 lead_id_holder["lead_id"] = report_widget_lead(owner_id, widget_id, name, phone, email)
-                session._send_json({"type": "ready"})
-                # In an auto-greet session Eva already spoke first - don't
-                # speak the opening line again once the lead form comes in,
-                # that would talk over/duplicate what she just said.
+                if session.meeting and lead_id_holder["lead_id"]:
+                    session.meeting["lead_id"] = lead_id_holder["lead_id"]
                 if not is_auto_greet:
-                    opening = render_call_vars(agent.get("opening_line") or "Hi {{name}}, how can I help you today?", session.lead)
+                    session._send_json({"type": "status", "state": "ready_for_mode_select"})
+
+            elif mtype == "start_chat":
+                # Pure text mode — no mic, no auto-speak. Eva only replies
+                # once the visitor actually types something (mtype=="text").
+                session._send_json({"type": "ready"})
+
+            elif mtype == "start_voice":
+                # Visitor chose to talk — NOW Eva speaks the opening line,
+                # and the client is expected to start streaming mic audio.
+                if not is_auto_greet:
+                    opening = render_call_vars(
+                        agent.get("opening_line") or "Hi {{name}}, how can I help you today?", session.lead,
+                    )
+                    session._send_json({"type": "ready"})
                     session.speak(opening, "en")
+
             elif mtype == "text":
                 session.feed_text(payload.get("text", ""))
             elif mtype == "ping":
