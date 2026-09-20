@@ -1877,7 +1877,7 @@ def widget_ws(ws, public_id):
         except Exception:
             pass
         return
-
+   #new
     owner_id = config["owner_id"]
     widget_id = config["widget_id"]
     agent = config.get("agent", {})
