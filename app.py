@@ -1568,7 +1568,8 @@ def widget_meta(public_id):
     agent = config.get("agent", {}) or {}
     auto_greet = config.get("auto_greet") or {}
     resp = jsonify({
-        "greeting": agent.get("opening_line") or "Hi! How can I help you today?",
+        "greeting": config.get("greeting") or agent.get("opening_line") or "Hi! How can I help you today?",
+        "icon_url": config.get("icon_url", ""),
         "require_lead_before_chat": config.get("require_lead_before_chat", True),
         "auto_greet": {
             "enabled": bool(auto_greet.get("enabled", False)),
@@ -1604,6 +1605,13 @@ def embed_widget_js():
     #eva-w-bubble:hover{transform:scale(1.06);}
     #eva-w-bubble svg{width:26px;height:26px;fill:#fff;}
     #eva-w-bubble.eva-live{animation:eva-pulse 1.4s infinite;}
+    #eva-w-bubble.eva-has-icon{background-size:cover;background-position:center;background-repeat:no-repeat;}
+    #eva-w-bubble.eva-has-icon svg{display:none;}
+    #eva-w-close{cursor:pointer;font-size:20px;line-height:1;padding:2px 8px;border-radius:6px;}
+    #eva-w-close:hover{background:rgba(255,255,255,.18);}
+    #eva-w-open-label{position:fixed;bottom:92px;right:22px;background:#111;color:#fff;padding:7px 14px;
+      border-radius:20px;font-size:12px;font-family:-apple-system,Segoe UI,Roboto,sans-serif;cursor:pointer;
+      box-shadow:0 4px 14px rgba(0,0,0,.25);z-index:999999;display:none;white-space:nowrap;}
     @keyframes eva-pulse{0%{box-shadow:0 0 0 0 ${color}66;}70%{box-shadow:0 0 0 16px ${color}00;}100%{box-shadow:0 0 0 0 ${color}00;}}
     #eva-w-panel{position:fixed;bottom:96px;right:22px;width:340px;max-width:92vw;height:480px;max-height:76vh;
       background:#fff;border-radius:16px;box-shadow:0 12px 40px rgba(0,0,0,.22);display:none;flex-direction:column;
@@ -1636,6 +1644,7 @@ def embed_widget_js():
       #eva-w-bubble:hover{transform:translateX(-50%) scale(1.06);}
       #eva-w-panel{left:0;right:0;bottom:0;transform:none;width:100%;height:100%;
         max-height:100%;border-radius:0;max-width:100%;}
+      #eva-w-open-label{left:50%;right:auto;transform:translateX(-50%);bottom:88px;}
     }
   `;
   document.head.appendChild(css);
@@ -1644,7 +1653,9 @@ def embed_widget_js():
   bubble.innerHTML = '<svg viewBox="0 0 24 24"><path d="M12 14a3 3 0 0 0 3-3V6a3 3 0 0 0-6 0v5a3 3 0 0 0 3 3zm5-3a5 5 0 0 1-10 0H5a7 7 0 0 0 6 6.92V21h2v-3.08A7 7 0 0 0 19 11h-2z"/></svg>';
   var panel = document.createElement('div'); panel.id = 'eva-w-panel';
   panel.innerHTML = `
-    <div id="eva-w-head">Talk to us</div>
+    <div id="eva-w-head" style="display:flex;align-items:center;justify-content:space-between;">
+      <span>Talk to us</span><span id="eva-w-close">&times;</span>
+    </div>
     <div id="eva-w-body">
       <div id="eva-w-greeting" style="display:none;"></div>
 
@@ -1673,6 +1684,11 @@ def embed_widget_js():
       </div>
     </div>`;
   document.body.appendChild(bubble); document.body.appendChild(panel);
+
+  var openLabel = document.createElement('div');
+  openLabel.id = 'eva-w-open-label';
+  openLabel.textContent = 'Click to open';
+  document.body.appendChild(openLabel);
 
   var ws, audioCtx, mic, processor, playHead = 0;
   var autoGreetTimer = null, sessionStarted = false, leadCaptured = false, voiceStarted = false;
@@ -1777,6 +1793,7 @@ def embed_widget_js():
     sessionStarted = true;
     show('eva-w-call', 'block');
     document.getElementById('eva-w-status').textContent = 'Connecting…';
+    openLabel.style.display = 'none';
     panel.classList.add('open');
     ws = new WebSocket(wsUrl + '?auto_greet=1');
     ws.binaryType = 'arraybuffer';
@@ -1832,6 +1849,10 @@ def embed_widget_js():
   }
 
   fetch(metaUrl).then(function(r){ return r.json(); }).then(function(meta){
+    if(meta && meta.icon_url){
+      bubble.style.backgroundImage = 'url(' + meta.icon_url + ')';
+      bubble.classList.add('eva-has-icon');
+    }
     if(meta && meta.auto_greet && meta.auto_greet.enabled && meta.auto_greet.message){
       var delayMs = Math.max(1, meta.auto_greet.delay_secs || 5) * 1000;
       autoGreetTimer = setTimeout(function(){
@@ -1891,7 +1912,7 @@ def widget_ws(ws, public_id):
     if not session.start():
         return
 
-    greet_text = agent.get("opening_line") or "Hi! How can I help you today?"
+    greet_text = config.get("greeting") or agent.get("opening_line") or "Hi! How can I help you today?"
 
     if is_auto_greet:
         session._send_json({"type": "ready"})
