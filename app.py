@@ -1601,44 +1601,43 @@ def embed_widget_js():
   css.textContent = `
     #eva-w-bubble{position:fixed;bottom:22px;right:22px;width:62px;height:62px;border-radius:50%;
       background:${color};box-shadow:0 6px 20px rgba(0,0,0,.25);display:flex;align-items:center;
-      justify-content:center;cursor:pointer;z-index:999999;transition:transform .2s;}
+      justify-content:center;cursor:pointer;z-index:999999;transition:transform .2s;background-size:cover;
+      background-position:center;background-repeat:no-repeat;}
     #eva-w-bubble:hover{transform:scale(1.06);}
     #eva-w-bubble svg{width:26px;height:26px;fill:#fff;}
     #eva-w-bubble.eva-live{animation:eva-pulse 1.4s infinite;}
-    #eva-w-bubble.eva-has-icon{background-size:cover;background-position:center;background-repeat:no-repeat;}
     #eva-w-bubble.eva-has-icon svg{display:none;}
-    #eva-w-close{cursor:pointer;font-size:20px;line-height:1;padding:2px 8px;border-radius:6px;}
-    #eva-w-close:hover{background:rgba(255,255,255,.18);}
-    #eva-w-open-label{position:fixed;bottom:92px;right:22px;background:#111;color:#fff;padding:7px 14px;
-      border-radius:20px;font-size:12px;font-family:-apple-system,Segoe UI,Roboto,sans-serif;cursor:pointer;
-      box-shadow:0 4px 14px rgba(0,0,0,.25);z-index:999999;display:none;white-space:nowrap;}
     @keyframes eva-pulse{0%{box-shadow:0 0 0 0 ${color}66;}70%{box-shadow:0 0 0 16px ${color}00;}100%{box-shadow:0 0 0 0 ${color}00;}}
     #eva-w-panel{position:fixed;bottom:96px;right:22px;width:340px;max-width:92vw;height:480px;max-height:76vh;
       background:#fff;border-radius:16px;box-shadow:0 12px 40px rgba(0,0,0,.22);display:none;flex-direction:column;
       overflow:hidden;z-index:999999;font-family:-apple-system,Segoe UI,Roboto,sans-serif;}
     #eva-w-panel.open{display:flex;}
-    #eva-w-head{background:${color};color:#fff;padding:14px 16px;font-size:14px;font-weight:600;}
+    #eva-w-head{background:${color};color:#fff;padding:12px 14px;font-size:14px;font-weight:600;
+      display:flex;align-items:center;justify-content:space-between;}
+    #eva-w-close{cursor:pointer;font-size:12.5px;font-weight:600;padding:6px 10px;border-radius:16px;
+      background:rgba(255,255,255,.16);display:flex;align-items:center;gap:5px;user-select:none;}
+    #eva-w-close:hover{background:rgba(255,255,255,.28);}
     #eva-w-body{flex:1;padding:16px;overflow:auto;font-size:13px;color:#222;display:flex;flex-direction:column;}
     #eva-w-greeting{background:#f2f4f8;color:#222;padding:10px 12px;border-radius:12px;margin-bottom:14px;font-size:13px;}
     #eva-w-form input{width:100%;box-sizing:border-box;margin-bottom:8px;padding:10px 12px;border:1px solid #ddd;
       border-radius:8px;font-size:13px;}
     #eva-w-form button{width:100%;padding:10px;border:none;border-radius:8px;background:${color};color:#fff;
       font-weight:600;cursor:pointer;}
-    #eva-w-mode button{width:100%;padding:11px;border:none;border-radius:8px;background:${color};color:#fff;
-      font-weight:600;cursor:pointer;margin-bottom:8px;}
-    #eva-w-mode button.secondary{background:#f2f4f8;color:#222;}
     #eva-w-status{text-align:center;color:#888;font-size:12px;margin-top:10px;}
     #eva-w-mic{width:74px;height:74px;border-radius:50%;background:${color};margin:16px auto;display:flex;
-      align-items:center;justify-content:center;cursor:pointer;animation:eva-mic-pulse 1.8s infinite;}
+      align-items:center;justify-content:center;animation:eva-mic-pulse 1.8s infinite;}
     @keyframes eva-mic-pulse{0%{box-shadow:0 0 0 0 ${color}55;}70%{box-shadow:0 0 0 14px ${color}00;}100%{box-shadow:0 0 0 0 ${color}00;}}
     #eva-w-mic svg{width:30px;height:30px;fill:#fff;}
     #eva-w-transcript{font-size:12.5px;line-height:1.6;flex:1;overflow:auto;margin-top:8px;}
     #eva-w-transcript .u{color:#111;font-weight:600;}
     #eva-w-transcript .a{color:${color};font-weight:600;}
-    #eva-w-chatbar{display:flex;gap:6px;margin-top:10px;}
+    #eva-w-chatbar{display:none;gap:6px;margin-top:10px;}
     #eva-w-chatbar input{flex:1;padding:9px 11px;border:1px solid #ddd;border-radius:20px;font-size:13px;}
     #eva-w-chatbar button{padding:9px 14px;border:none;border-radius:20px;background:${color};color:#fff;
       font-weight:600;cursor:pointer;}
+    #eva-w-open-label{position:fixed;bottom:92px;right:22px;background:#111;color:#fff;padding:7px 14px;
+      border-radius:20px;font-size:12px;font-family:-apple-system,Segoe UI,Roboto,sans-serif;cursor:pointer;
+      box-shadow:0 4px 14px rgba(0,0,0,.25);z-index:999999;display:none;white-space:nowrap;}
     @media(max-width:520px){
       #eva-w-bubble{left:50%;right:auto;bottom:18px;transform:translateX(-50%);}
       #eva-w-bubble:hover{transform:translateX(-50%) scale(1.06);}
@@ -1651,39 +1650,33 @@ def embed_widget_js():
 
   var bubble = document.createElement('div'); bubble.id = 'eva-w-bubble';
   bubble.innerHTML = '<svg viewBox="0 0 24 24"><path d="M12 14a3 3 0 0 0 3-3V6a3 3 0 0 0-6 0v5a3 3 0 0 0 3 3zm5-3a5 5 0 0 1-10 0H5a7 7 0 0 0 6 6.92V21h2v-3.08A7 7 0 0 0 19 11h-2z"/></svg>';
+
   var panel = document.createElement('div'); panel.id = 'eva-w-panel';
-  panel.innerHTML = `
-    <div id="eva-w-head" style="display:flex;align-items:center;justify-content:space-between;">
-      <span>Talk to us</span><span id="eva-w-close">&times;</span>
-    </div>
-    <div id="eva-w-body">
-      <div id="eva-w-greeting" style="display:none;"></div>
-
-      <div id="eva-w-form" style="display:none;">
-        <input id="eva-w-name" placeholder="Your name">
-        <input id="eva-w-phone" placeholder="Phone number">
-        <input id="eva-w-email" placeholder="Email (optional)">
-        <button id="eva-w-lead-submit">Continue</button>
-      </div>
-
-      <div id="eva-w-mode" style="display:none;">
-        <button id="eva-w-mode-chat">💬 Type a message</button>
-        <button id="eva-w-mode-call" class="secondary">📞 Talk with voice</button>
-      </div>
-
-      <div id="eva-w-call" style="display:none;text-align:center;">
-        <div id="eva-w-mic"><svg viewBox="0 0 24 24"><path d="M12 14a3 3 0 0 0 3-3V6a3 3 0 0 0-6 0v5a3 3 0 0 0 3 3zm5-3a5 5 0 0 1-10 0H5a7 7 0 0 0 6 6.92V21h2v-3.08A7 7 0 0 0 19 11h-2z"/></svg></div>
-        <div id="eva-w-status">Connecting…</div>
-      </div>
-
-      <div id="eva-w-transcript"></div>
-
-      <div id="eva-w-chatbar" style="display:none;">
-        <input id="eva-w-chat-input" placeholder="Type a message…">
-        <button id="eva-w-chat-send">Send</button>
-      </div>
-    </div>`;
-  document.body.appendChild(bubble); document.body.appendChild(panel);
+  panel.innerHTML =
+    '<div id="eva-w-head">' +
+      '<span>Talk to us</span>' +
+      '<span id="eva-w-close">Close &times;</span>' +
+    '</div>' +
+    '<div id="eva-w-body">' +
+      '<div id="eva-w-greeting" style="display:none;"></div>' +
+      '<div id="eva-w-form" style="display:none;">' +
+        '<input id="eva-w-name" placeholder="Your name">' +
+        '<input id="eva-w-phone" placeholder="Phone number">' +
+        '<input id="eva-w-email" placeholder="Email (optional)">' +
+        '<button id="eva-w-lead-submit">Continue</button>' +
+      '</div>' +
+      '<div id="eva-w-call" style="display:none;text-align:center;">' +
+        '<div id="eva-w-mic"><svg viewBox="0 0 24 24"><path d="M12 14a3 3 0 0 0 3-3V6a3 3 0 0 0-6 0v5a3 3 0 0 0 3 3zm5-3a5 5 0 0 1-10 0H5a7 7 0 0 0 6 6.92V21h2v-3.08A7 7 0 0 0 19 11h-2z"/></svg></div>' +
+        '<div id="eva-w-status">Connecting…</div>' +
+      '</div>' +
+      '<div id="eva-w-transcript"></div>' +
+      '<div id="eva-w-chatbar">' +
+        '<input id="eva-w-chat-input" placeholder="Type a message…">' +
+        '<button id="eva-w-chat-send">Send</button>' +
+      '</div>' +
+    '</div>';
+  document.body.appendChild(bubble);
+  document.body.appendChild(panel);
 
   var openLabel = document.createElement('div');
   openLabel.id = 'eva-w-open-label';
@@ -1691,22 +1684,36 @@ def embed_widget_js():
   document.body.appendChild(openLabel);
 
   var ws, audioCtx, mic, processor, playHead = 0;
-  var autoGreetTimer = null, sessionStarted = false, leadCaptured = false, voiceStarted = false;
+  var autoGreetTimer = null, sessionStarted = false, voiceStarted = false;
 
-  bubble.onclick = function(){
-    panel.classList.toggle('open');
-    cancelAutoGreet();
-    if(!sessionStarted) connectSession();
-  };
+  function show(id, disp){ document.getElementById(id).style.display = disp; }
 
   function cancelAutoGreet(){
     if(autoGreetTimer){ clearTimeout(autoGreetTimer); autoGreetTimer = null; }
   }
 
-  function show(id, disp){ document.getElementById(id).style.display = disp; }
+  function openWidgetPanel(){
+    panel.classList.add('open');
+    openLabel.style.display = 'none';
+    cancelAutoGreet();
+    if(!sessionStarted) connectSession();
+  }
+  function closeWidgetPanel(){
+    panel.classList.remove('open');
+    openLabel.style.display = 'block';
+  }
+  bubble.addEventListener('click', function(){
+    if(panel.classList.contains('open')) closeWidgetPanel();
+    else openWidgetPanel();
+  });
+  openLabel.addEventListener('click', openWidgetPanel);
+  document.getElementById('eva-w-close').addEventListener('click', function(e){
+    e.stopPropagation();
+    closeWidgetPanel();
+  });
 
-  // ---- 1) connect the socket right away, but this ONLY delivers the text
-  //         greeting + status — Eva never speaks and no mic opens yet.
+  // ---- 1) connect the socket right away — this ONLY delivers the text
+  //         greeting + status. Eva never speaks and no mic opens yet.
   function connectSession(){
     if(sessionStarted) return;
     sessionStarted = true;
@@ -1722,16 +1729,16 @@ def embed_widget_js():
         var msg = JSON.parse(ev.data);
 
         if(msg.type === 'greeting'){
+          // TEXT ONLY — this is never spoken/played as audio.
           var g = document.getElementById('eva-w-greeting');
           g.textContent = msg.text; g.style.display = 'block';
         }
         if(msg.type === 'status' && msg.state === 'awaiting_lead_info'){
           show('eva-w-form', 'block');
         }
-        if(msg.type === 'status' && msg.state === 'ready_for_mode_select'){
-          leadCaptured = true;
+        if(msg.type === 'status' && msg.state === 'auto_start_voice'){
           show('eva-w-form', 'none');
-          show('eva-w-mode', 'block');
+          autoStartVoice();
         }
         if(msg.type === 'status' && msg.state){
           document.getElementById('eva-w-status').textContent =
@@ -1749,7 +1756,7 @@ def embed_widget_js():
   }
 
   // ---- 2) lead form ----
-  document.getElementById('eva-w-lead-submit').onclick = function(){
+  document.getElementById('eva-w-lead-submit').addEventListener('click', function(){
     var name = document.getElementById('eva-w-name').value.trim();
     var phone = document.getElementById('eva-w-phone').value.trim();
     var email = document.getElementById('eva-w-email').value.trim();
@@ -1757,25 +1764,21 @@ def embed_widget_js():
     if(ws && ws.readyState === WebSocket.OPEN){
       ws.send(JSON.stringify({type:'lead_info', name:name, phone:phone, email:email}));
     }
-  };
+  });
 
-  // ---- 3) mode choice: chat (text only) vs call (voice) ----
-  document.getElementById('eva-w-mode-chat').onclick = function(){
-    show('eva-w-mode', 'none');
-    show('eva-w-chatbar', 'flex');
-    if(ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({type:'start_chat'}));
-  };
-  document.getElementById('eva-w-mode-call').onclick = function(){
-    show('eva-w-mode', 'none');
-    show('eva-w-call', 'block');
-    show('eva-w-chatbar', 'flex'); // typing still works during a call
+  // ---- 3) automatically starts voice the moment lead info is captured
+  //         (or right after the greeting, if no lead form is required) ----
+  function autoStartVoice(){
+    if(voiceStarted) return;
     voiceStarted = true;
+    show('eva-w-call', 'block');
+    show('eva-w-chatbar', 'flex');
     if(ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({type:'start_voice'}));
     startMic();
     bubble.classList.add('eva-live');
-  };
+  }
 
-  document.getElementById('eva-w-chat-send').onclick = sendChatText;
+  document.getElementById('eva-w-chat-send').addEventListener('click', sendChatText);
   document.getElementById('eva-w-chat-input').addEventListener('keydown', function(e){
     if(e.key === 'Enter') sendChatText();
   });
@@ -1787,11 +1790,13 @@ def embed_widget_js():
     input.value = '';
   }
 
-  // ---- proactive auto-greet: unchanged, owner opt-in, speaks right away ----
+  // ---- proactive auto-greet: owner opt-in, speaks right away on a timer ----
   function startAutoGreetSession(){
     if(sessionStarted) return;
     sessionStarted = true;
+    voiceStarted = true;
     show('eva-w-call', 'block');
+    show('eva-w-chatbar', 'flex');
     document.getElementById('eva-w-status').textContent = 'Connecting…';
     openLabel.style.display = 'none';
     panel.classList.add('open');
@@ -1833,6 +1838,7 @@ def embed_widget_js():
     if(processor){ processor.disconnect(); }
     if(mic){ mic.disconnect(); }
     if(audioCtx){ audioCtx.close(); }
+    voiceStarted = false;
   }
 
   function playAudio(buf){
@@ -1849,18 +1855,24 @@ def embed_widget_js():
   }
 
   fetch(metaUrl).then(function(r){ return r.json(); }).then(function(meta){
-    if(meta && meta.icon_url){
-      bubble.style.backgroundImage = 'url(' + meta.icon_url + ')';
-      bubble.classList.add('eva-has-icon');
+    if(!meta) return;
+    if(meta.icon_url){
+      var iconImg = new Image();
+      iconImg.onload = function(){
+        bubble.style.backgroundImage = 'url("' + meta.icon_url + '")';
+        bubble.classList.add('eva-has-icon');
+      };
+      iconImg.onerror = function(){ console.warn('[EvaWidget] icon failed to load:', meta.icon_url); };
+      iconImg.src = meta.icon_url;
     }
-    if(meta && meta.auto_greet && meta.auto_greet.enabled && meta.auto_greet.message){
+    if(meta.auto_greet && meta.auto_greet.enabled && meta.auto_greet.message){
       var delayMs = Math.max(1, meta.auto_greet.delay_secs || 5) * 1000;
       autoGreetTimer = setTimeout(function(){
         autoGreetTimer = null;
         if(!sessionStarted) startAutoGreetSession();
       }, delayMs);
     }
-  }).catch(function(){});
+  }).catch(function(err){ console.warn('[EvaWidget] widget-meta fetch failed:', err); });
 })();
 """
     return js, 200, {"Content-Type": "application/javascript"}
@@ -1919,12 +1931,13 @@ def widget_ws(ws, public_id):
         auto_text = auto_greet_cfg.get("message") or greet_text
         session.speak(auto_text, detect_lang(auto_text))
     else:
-        # Always show a plain text greeting first — never speak on connect.
+        # Always show a plain text greeting first — this is NEVER spoken/played as audio.
         session._send_json({"type": "greeting", "text": greet_text})
         if require_lead_first:
             session._send_json({"type": "status", "state": "awaiting_lead_info"})
         else:
-            session._send_json({"type": "status", "state": "ready_for_mode_select"})
+            # No lead form required — go straight into a live voice session.
+            session._send_json({"type": "status", "state": "auto_start_voice"})
 
     lead_id_holder = {"lead_id": None}
     log("MAIN", f"Widget visitor connected: {public_id}" + (" (auto-greet)" if is_auto_greet else ""))
@@ -1952,7 +1965,8 @@ def widget_ws(ws, public_id):
                 if session.meeting and lead_id_holder["lead_id"]:
                     session.meeting["lead_id"] = lead_id_holder["lead_id"]
                 if not is_auto_greet:
-                    session._send_json({"type": "status", "state": "ready_for_mode_select"})
+                    # Lead captured — go straight into a live voice session, no extra click needed.
+                    session._send_json({"type": "status", "state": "auto_start_voice"})
 
             elif mtype == "start_chat":
                 # Pure text mode — no mic, no auto-speak. Eva only replies
