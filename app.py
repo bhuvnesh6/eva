@@ -164,9 +164,35 @@ BARGE_IN_MIN_VOLUME_MULAW = int(os.environ.get("EVA_BARGE_IN_MIN_VOLUME_MULAW", 
 # via EVA_BARGE_IN_MIN_VOLUME_ALAW if VoiceLink calls prove more/less sensitive.
 BARGE_IN_MIN_VOLUME_ALAW = int(os.environ.get("EVA_BARGE_IN_MIN_VOLUME_ALAW", 350))
 DEEPGRAM_API_KEY = os.environ.get("DEEPGRAM_API_KEY")
-GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
-GROQ_MODEL = "openai/gpt-oss-120b"
 SARVAM_API_KEY = os.environ.get("SARVAM_API_KEY")
+
+# ---------------- LLM provider switch ----------------
+# Set LLM_PROVIDER=gemini in .env to swap Eva's brain from Groq to Gemini,
+# or LLM_PROVIDER=groq to go back — no code changes needed either way.
+# Both API keys can sit in .env at once; only the selected one is used.
+LLM_PROVIDER = os.environ.get("LLM_PROVIDER", "groq").strip().lower()  # "groq" | "gemini"
+
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
+GROQ_MODEL = os.environ.get("GROQ_MODEL", "openai/gpt-oss-120b")
+
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+# Flash-Lite = Google's cheapest/fastest Gemini tier (lowest token cost +
+# latency) — a good match since Eva's replies are already forced to 1-3
+# short sentences. Bump to GEMINI_MODEL=gemini-3.5-flash in .env if you
+# want smarter replies at higher cost.
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.5-flash-lite")
+
+
+def check_missing_keys():
+    """Which required env vars are missing, given the CURRENT LLM_PROVIDER.
+    Only the active provider's key is required — the other one is ignored
+    even if it's unset."""
+    checks = [("DEEPGRAM_API_KEY", DEEPGRAM_API_KEY), ("SARVAM_API_KEY", SARVAM_API_KEY)]
+    if LLM_PROVIDER == "gemini":
+        checks.append(("GEMINI_API_KEY", GEMINI_API_KEY))
+    else:
+        checks.append(("GROQ_API_KEY", GROQ_API_KEY))
+    return [n for n, v in checks if not v]
 
 # ---------------- Twilio (phone call) config ----------------
 PHONE_RATE = 8000               # Twilio Media Streams is fixed at 8kHz mu-law
@@ -889,6 +915,16 @@ class EvaSession:
             self.history = self.history[-MAX_HISTORY_MESSAGES:]
 
     def _stream_chat(self, client: httpx.Client, messages):
+        """Dispatches to whichever provider LLM_PROVIDER selects. Both
+        generators below yield plain text deltas, so nothing downstream
+        (sentence-splitting, TTS queue, BOOK_MEETING detection) needs to
+        know or care which LLM is actually live."""
+        if LLM_PROVIDER == "gemini":
+            yield from self._stream_chat_gemini(client, messages)
+        else:
+            yield from self._stream_chat_groq(client, messages)
+
+    def _stream_chat_groq(self, client: httpx.Client, messages):
         payload = {"model": GROQ_MODEL, "messages": messages, "stream": True}
         headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
         with client.stream("POST", "https://api.groq.com/openai/v1/chat/completions",
@@ -903,6 +939,52 @@ class EvaSession:
                 try:
                     obj = json.loads(data)
                     delta = obj["choices"][0]["delta"].get("content")
+                    if delta:
+                        yield delta
+                except Exception:
+                    continue
+
+    def _stream_chat_gemini(self, client: httpx.Client, messages):
+        """Gemini has no OpenAI-style flat messages list — "system" role
+        text goes into a separate systemInstruction block, and the turn
+        history uses "user"/"model" roles instead of "user"/"assistant".
+        Streams over SSE (alt=sse), same idea as Groq's chunked streaming."""
+        system_parts, contents = [], []
+        for m in messages:
+            role = m.get("role")
+            text = m.get("content") or ""
+            if not text:
+                continue
+            if role == "system":
+                system_parts.append(text)
+            else:
+                gem_role = "model" if role == "assistant" else "user"
+                # Gemini needs strictly alternating user/model turns - merge
+                # consecutive same-role messages instead of sending them as
+                # separate turns.
+                if contents and contents[-1]["role"] == gem_role:
+                    contents[-1]["parts"][0]["text"] += "\n" + text
+                else:
+                    contents.append({"role": gem_role, "parts": [{"text": text}]})
+
+        payload = {"contents": contents}
+        if system_parts:
+            payload["systemInstruction"] = {"parts": [{"text": "\n\n".join(system_parts)}]}
+
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:streamGenerateContent?alt=sse"
+        headers = {"Content-Type": "application/json", "x-goog-api-key": GEMINI_API_KEY}
+        with client.stream("POST", url, json=payload, headers=headers, timeout=30) as resp:
+            resp.raise_for_status()
+            for line in resp.iter_lines():
+                if not line or not line.startswith("data:"):
+                    continue
+                data = line[len("data:"):].strip()
+                if not data or data == "[DONE]":
+                    continue
+                try:
+                    obj = json.loads(data)
+                    parts = obj["candidates"][0]["content"]["parts"]
+                    delta = "".join(p.get("text", "") for p in parts)
                     if delta:
                         yield delta
                 except Exception:
@@ -2051,21 +2133,13 @@ def widget_ws(ws, public_id):
 
 @app.route("/health")
 def health():
-    missing = [n for n, v in [
-        ("DEEPGRAM_API_KEY", DEEPGRAM_API_KEY),
-        ("GROQ_API_KEY", GROQ_API_KEY),
-        ("SARVAM_API_KEY", SARVAM_API_KEY),
-    ] if not v]
+    missing = check_missing_keys()
     return jsonify({"status": "ok" if not missing else "missing_keys", "missing": missing})
 
 
 @sock.route("/ws/eva")
 def eva_ws(ws):
-    missing = [n for n, v in [
-        ("DEEPGRAM_API_KEY", DEEPGRAM_API_KEY),
-        ("GROQ_API_KEY", GROQ_API_KEY),
-        ("SARVAM_API_KEY", SARVAM_API_KEY),
-    ] if not v]
+    missing = check_missing_keys()
     if missing:
         ws.send(json.dumps({"type": "error", "message": f"Server missing env keys: {', '.join(missing)}"}))
         return
@@ -2148,11 +2222,7 @@ def twiml():
 
 @sock.route("/ws/twilio")
 def twilio_ws(ws):
-    missing = [n for n, v in [
-        ("DEEPGRAM_API_KEY", DEEPGRAM_API_KEY),
-        ("GROQ_API_KEY", GROQ_API_KEY),
-        ("SARVAM_API_KEY", SARVAM_API_KEY),
-    ] if not v]
+    missing = check_missing_keys()
     if missing:
         log("MAIN", f"Twilio call rejected, missing keys: {missing}")
         return
@@ -2205,11 +2275,7 @@ def api_place_call():
     if not PUBLIC_BASE_URL:
         return jsonify({"ok": False, "error": "PUBLIC_BASE_URL not set in Eva's .env"}), 400
 
-    missing = [n for n, v in [
-        ("DEEPGRAM_API_KEY", DEEPGRAM_API_KEY),
-        ("GROQ_API_KEY", GROQ_API_KEY),
-        ("SARVAM_API_KEY", SARVAM_API_KEY),
-    ] if not v]
+    missing = check_missing_keys()
     if missing:
         return jsonify({"ok": False, "error": f"Eva missing env keys: {', '.join(missing)}"}), 500
 
@@ -2277,11 +2343,7 @@ def twilio_outbound_ws(ws, call_id):
         log("MAIN", f"No pending config for call_id={call_id}, closing.")
         return
 
-    missing = [n for n, v in [
-        ("DEEPGRAM_API_KEY", DEEPGRAM_API_KEY),
-        ("GROQ_API_KEY", GROQ_API_KEY),
-        ("SARVAM_API_KEY", SARVAM_API_KEY),
-    ] if not v]
+    missing = check_missing_keys()
     if missing:
         log("MAIN", f"Outbound call rejected, missing keys: {missing}")
         return
@@ -2345,11 +2407,7 @@ def api_place_call_vanisetu():
     if not (VANISETU_TCODE and VANISETU_TOKEN):
         return jsonify({"ok": False, "error": "Eva has no VANISETU_TCODE/VANISETU_TOKEN configured"}), 400
 
-    missing = [n for n, v in [
-        ("DEEPGRAM_API_KEY", DEEPGRAM_API_KEY),
-        ("GROQ_API_KEY", GROQ_API_KEY),
-        ("SARVAM_API_KEY", SARVAM_API_KEY),
-    ] if not v]
+    missing = check_missing_keys()
     if missing:
         return jsonify({"ok": False, "error": f"Eva missing env keys: {', '.join(missing)}"}), 500
 
@@ -2392,11 +2450,7 @@ def api_place_call_voicelink():
     if not PUBLIC_BASE_URL:
         return jsonify({"ok": False, "error": "PUBLIC_BASE_URL not set in Eva's .env"}), 400
 
-    missing = [n for n, v in [
-        ("DEEPGRAM_API_KEY", DEEPGRAM_API_KEY),
-        ("GROQ_API_KEY", GROQ_API_KEY),
-        ("SARVAM_API_KEY", SARVAM_API_KEY),
-    ] if not v]
+    missing = check_missing_keys()
     if missing:
         return jsonify({"ok": False, "error": f"Eva missing env keys: {', '.join(missing)}"}), 500
 
@@ -2496,11 +2550,7 @@ def voicelink_ws(ws, call_id):
         log("VOICELINK", f"No pending config for call_id={call_id}, closing.")
         return
 
-    missing = [n for n, v in [
-        ("DEEPGRAM_API_KEY", DEEPGRAM_API_KEY),
-        ("GROQ_API_KEY", GROQ_API_KEY),
-        ("SARVAM_API_KEY", SARVAM_API_KEY),
-    ] if not v]
+    missing = check_missing_keys()
     if missing:
         log("VOICELINK", f"Outbound call rejected, missing keys: {missing}")
         return
@@ -2576,11 +2626,7 @@ def voicelink_ws(ws, call_id):
 
 
 if __name__ == "__main__":
-    missing = [n for n, v in [
-        ("DEEPGRAM_API_KEY", DEEPGRAM_API_KEY),
-        ("GROQ_API_KEY", GROQ_API_KEY),
-        ("SARVAM_API_KEY", SARVAM_API_KEY),
-    ] if not v]
+    missing = check_missing_keys()
     if missing:
         print(f"Missing keys in .env: {', '.join(missing)}")
         sys.exit(1)
