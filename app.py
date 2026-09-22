@@ -78,9 +78,41 @@ MIC_RATE = 16000               # PCM16 the browser sends to us
 TTS_SAMPLE_RATE = 22050        # PCM16 we send back to the browser
 
 SENTENCE_END_RE = re.compile(r"([.!?।\n])")
-SPEAKABLE_RE = re.compile(r"[A-Za-z0-9\u0900-\u097F]")
-DEVANAGARI_RE = re.compile(r"[\u0900-\u097F]")
+# Matches Latin, Devanagari, Bengali, Tamil, Telugu, Kannada, or Malayalam
+# characters — used to decide if a chunk of text has anything speakable.
+SPEAKABLE_RE = re.compile(
+    r"[A-Za-z0-9\u0900-\u097F\u0980-\u09FF\u0B80-\u0BFF\u0C00-\u0C7F\u0C80-\u0CFF\u0D00-\u0D7F]"
+)
+DEVANAGARI_RE = re.compile(r"[\u0900-\u097F]")  # kept for backward compatibility
 BOOK_MEETING_RE = re.compile(r"BOOK_MEETING:\s*(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2})")
+
+# ---------------- Multi-language support ----------------
+LANG_SCRIPT_RE = {
+    "hi": re.compile(r"[\u0900-\u097F]"),   # Hindi — Devanagari
+    "bn": re.compile(r"[\u0980-\u09FF]"),   # Bengali
+    "ta": re.compile(r"[\u0B80-\u0BFF]"),   # Tamil
+    "te": re.compile(r"[\u0C00-\u0C7F]"),   # Telugu
+    "kn": re.compile(r"[\u0C80-\u0CFF]"),   # Kannada
+    "ml": re.compile(r"[\u0D00-\u0D7F]"),   # Malayalam
+}
+SUPPORTED_LANGUAGES = {"en", "hi", "bn", "ta", "te", "kn", "ml"}
+LANG_NAMES = {
+    "en": "English", "hi": "Hindi", "bn": "Bengali",
+    "ta": "Tamil", "te": "Telugu", "kn": "Kannada", "ml": "Malayalam",
+}
+# Sarvam bulbul:v3 language codes — confirm against Sarvam's docs/dashboard.
+SARVAM_LANG_CODE = {
+    "en": "en-IN", "hi": "hi-IN", "bn": "bn-IN",
+    "ta": "ta-IN", "te": "te-IN", "kn": "kn-IN", "ml": "ml-IN",
+}
+# One voice per gender, reused across every language so the SAME voice
+# speaks the whole call. CONFIRM these speaker names exist on your Sarvam
+# account for bulbul:v3 (check their docs/list-speakers) — swap if 400s.
+SPEAKER_MAP = {
+    lang: {"female": os.environ.get("EVA_SPEAKER_FEMALE", "anushka"),
+           "male":   os.environ.get("EVA_SPEAKER_MALE", "abhilash")}
+    for lang in SUPPORTED_LANGUAGES
+}
 
 MISTRAL_MODEL = "mistral-small-latest"
 MISTRAL_REASONING_EFFORT="none"
@@ -95,7 +127,7 @@ MAX_HISTORY_MESSAGES = 16
 
 # How long Eva waits, after the user goes quiet, before she actually replies.
 # Mimics a natural human turn-taking gap instead of jumping in instantly.
-RESPONSE_DELAY_SECS = float(os.environ.get("EVA_RESPONSE_PAUSE_SECS", 0.7))
+RESPONSE_DELAY_SECS = float(os.environ.get("EVA_RESPONSE_PAUSE_SECS", 0.4))
 # Small random jitter added on top of the base pause so Eva doesn't reply
 # on the exact same beat every time - a perfectly fixed delay is what
 # makes a voice bot feel mechanical.
@@ -110,9 +142,8 @@ BARGE_IN_GRACE_SECS = float(os.environ.get("EVA_BARGE_IN_GRACE_SECS", 1.0))
 # mic bumps - not just real speech. We no longer interrupt Eva on VAD
 # alone; we wait to see if Deepgram actually transcribes real words within
 # this window before treating it as a genuine barge-in.
-BARGE_IN_CONFIRM_MIN_CHARS = int(os.environ.get("EVA_BARGE_IN_MIN_CHARS", 2))
-BARGE_IN_CONFIRM_TIMEOUT_SECS = float(os.environ.get("EVA_BARGE_IN_CONFIRM_TIMEOUT", 0.6))
-
+BARGE_IN_CONFIRM_MIN_CHARS = int(os.environ.get("EVA_BARGE_IN_MIN_CHARS", 3))
+BARGE_IN_CONFIRM_TIMEOUT_SECS = float(os.environ.get("EVA_BARGE_IN_CONFIRM_TIMEOUT", 0.8))
 # Amplitude-based barge-in trigger, independent of (and faster than)
 # Deepgram's VAD. We look at the raw volume of what's actually coming in on
 # the mic/line while Eva is talking. This is the line between "the user is
@@ -209,7 +240,14 @@ def is_speakable(text: str) -> bool:
 
 
 def detect_lang(text: str) -> str:
-    return "hi" if DEVANAGARI_RE.search(text) else "en"
+    """Detects which supported language a transcript is in, by script.
+    Non-Latin scripts are unambiguous; Latin-script text (English,
+    Hinglish, romanized regional languages) falls back to English — the
+    LLM prompt handles Hinglish-vs-English judgment on its own."""
+    for lang, pattern in LANG_SCRIPT_RE.items():
+        if pattern.search(text):
+            return lang
+    return "en"
 
 
 def _build_ulaw_decode_table():
@@ -312,8 +350,7 @@ class EvaSession:
         self.meeting = meeting or {}
 
         self.ws = ws
-        self.speaker = (agent.get("speaker") or speaker or DEFAULT_SPEAKER)
-        self.mode = mode                # "browser" or "phone"
+        self.mode = mode                # "browser" or "phone"               # "browser" or "phone"
         self.transport = transport      # "twilio" | "vanisetu" — only meaningful when mode == "phone"
         self.vanisetu_session_id = vanisetu_session_id  # numeric id VaniSetu assigned this call
         self.stream_sid = None          # set once Twilio's "start" event arrives (phone + twilio only)
@@ -354,7 +391,24 @@ class EvaSession:
         self._callback_lock = threading.Lock()
 
         forced_lang = agent.get("language")
-        self.forced_language = forced_lang if forced_lang in ("en", "hi") else None
+        self.forced_language = forced_lang if forced_lang in SUPPORTED_LANGUAGES else None
+
+        # Voice selection: agent.speaker (explicit name) always wins.
+        # Otherwise pick from SPEAKER_MAP by gender — previously agent.gender
+        # was stored but never actually used, so every call silently used
+        # DEFAULT_SPEAKER no matter what gender was picked in the dashboard.
+        # Set ONCE here and never reassigned mid-call, which is what keeps
+        # Eva's voice/tone consistent across a call even as language shifts
+        # sentence-to-sentence.
+        agent_gender = agent.get("gender") if agent.get("gender") in ("male", "female") else "female"
+        voice_lang = self.forced_language or "en"
+        self.gender = agent_gender
+        self.speaker = (
+            agent.get("speaker")
+            or SPEAKER_MAP.get(voice_lang, SPEAKER_MAP["en"]).get(agent_gender)
+            or speaker or DEFAULT_SPEAKER
+        )
+
         self.max_duration_secs = int(agent.get("max_duration_secs") or 0) or None
         self.min_duration_secs = int(agent.get("min_duration_secs") or 0) or None
 
@@ -374,17 +428,22 @@ class EvaSession:
                 f"\n\nYou are speaking with {lead.get('name', 'the lead')} from "
                 f"{lead.get('business_name', 'their business')}. Use their name naturally, don't overuse it."
             )
-        if self.forced_language == "hi":
-            base_prompt += "\nAlways reply in English or hindi as per user speaking written in English script, mixed lightly with English words."
+        if self.forced_language and self.forced_language != "en":
+            lang_label = LANG_NAMES.get(self.forced_language, self.forced_language)
+            base_prompt += (
+                f"\nAlways reply in {lang_label}, written in its own native script "
+                f"(not romanized/Latin script), unless the user explicitly writes in English."
+            )
         elif self.forced_language == "en":
             base_prompt += "\nAlways reply in English only."
         else:
             base_prompt += (
-                "\nLanguage rule: default to English. Only switch to Hinglish "
-                "(Hindi written in English script, mixed lightly with English words) "
-                "if the user is clearly speaking Hindi (Devanagari script). "
-                "If their message is in English, unclear, or mixed, reply in English. "
-                "Never default to Hindi on your own."
+                "\nLanguage rule: default to English. If the user is clearly speaking "
+                "one of these languages, reply in THAT language using its own native "
+                "script (not romanized): Hindi (Devanagari), Bengali (Bangla script), "
+                "Tamil (Tamil script), Telugu (Telugu script), Kannada (Kannada script), "
+                "Malayalam (Malayalam script). If their message is in English, unclear, "
+                "or mixed, reply in English. Never guess a regional language on your own."
             )
         base_prompt += "\nNever reply using only emojis or symbols with no words."
         # Applies unconditionally - even on top of an owner's own custom
@@ -700,6 +759,7 @@ class EvaSession:
             language="multi",
             smart_format=True,
             interim_results=True,
+            endpointing=300,          # ms of silence treated as a likely pause — steadier utterance-end detection
             utterance_end_ms="1000",
             vad_events=True,
             encoding=encoding,
@@ -861,23 +921,17 @@ class EvaSession:
                 self.interrupt_flag.clear()
 
                 user_lang = self.forced_language or detect_lang(user_text)
-                # Must match the script rule already set in the system
-                # prompt (Hinglish = Hindi words in Latin/English script,
-                # NOT Devanagari). The old text here said "Hindi
-                # (Devanagari)", which directly contradicted that - the
-                # model would inconsistently follow one instruction or the
-                # other, so replies sometimes came back in Devanagari
-                # instead of Hinglish.
-                lang_note = {
-                    "role": "system",
-                    "content": (
-                        "(Reply in Hinglish - Hindi words written in "
-                        "English/Latin script, mixed lightly with English - "
-                        "only.)"
-                        if user_lang == "hi"
-                        else "(Reply in English only.)"
-                    )
-                }
+                # Tells the model exactly which script to answer in for THIS
+                # turn, matching what detect_lang() picked up. Native script
+                # (not romanized) so Sarvam's TTS pronounces it correctly.
+                if user_lang == "en":
+                    lang_note = {"role": "system", "content": "(Reply in English only.)"}
+                else:
+                    lang_label = LANG_NAMES.get(user_lang, user_lang)
+                    lang_note = {
+                        "role": "system",
+                        "content": f"(Reply in {lang_label}, written in its own native script, not romanized.)",
+                    }
                 self.history.append({"role": "user", "content": user_text})
                 self._send_json({"type": "status", "state": "thinking"})
 
@@ -947,7 +1001,7 @@ class EvaSession:
             if self.interrupt_flag.is_set():
                 continue
 
-            target_language_code = "hi-IN" if lang == "hi" else "en-IN"
+            target_language_code = SARVAM_LANG_CODE.get(lang, "en-IN")
             self._send_json({"type": "status", "state": "speaking"})
             self.eva_speaking.set()
 
@@ -1504,9 +1558,9 @@ class VaniSetuClient:
         session.call_started_at = time.time()
         self.send_command(session_id, {"command": "ANSWER"})
         opening = render_call_vars(
-            cfg["agent"].get("opening_line") or "Hi, do you have a quick minute?", cfg["lead"],
+            cfg["agent"].get("opening_line") or "Hi {{name}}, do you have a quick minute?", cfg["lead"],
         )
-        opening_lang = "hi" if cfg["agent"].get("language") == "hi" else "en"
+        opening_lang = cfg["agent"].get("language") if cfg["agent"].get("language") in SUPPORTED_LANGUAGES else "en"
         session.speak(opening, opening_lang)
         log("VANISETU", f"Outbound call {call_id} connected as session {session_id}")
 
@@ -2259,10 +2313,10 @@ def twilio_outbound_ws(ws, call_id):
                 session.stream_sid = data["start"]["streamSid"]
                 session.call_started_at = time.time()
                 opening = render_call_vars(
-                    cfg["agent"].get("opening_line") or "Hi, do you have a quick minute?",
+                    cfg["agent"].get("opening_line") or "Hi {{name}}, do you have a quick minute?",
                     cfg["lead"],
                 )
-                opening_lang = "hi" if cfg["agent"].get("language") == "hi" else "en"
+                opening_lang = cfg["agent"].get("language") if cfg["agent"].get("language") in SUPPORTED_LANGUAGES else "en"
                 session.speak(opening, opening_lang)
             elif event == "media":
                 audio = base64.b64decode(data["media"]["payload"])
@@ -2487,9 +2541,9 @@ def voicelink_ws(ws, call_id):
                 session.call_started_at = time.time()
                 log("VOICELINK", f"call {call_id}: start event, stream_sid={session.stream_sid}")
                 opening = render_call_vars(
-                    cfg["agent"].get("opening_line") or "Hi, do you have a quick minute?", cfg["lead"],
+                    cfg["agent"].get("opening_line") or "Hi {{name}}, do you have a quick minute?", cfg["lead"],
                 )
-                opening_lang = "hi" if cfg["agent"].get("language") == "hi" else "en"
+                opening_lang = cfg["agent"].get("language") if cfg["agent"].get("language") in SUPPORTED_LANGUAGES else "en"
                 session.speak(opening, opening_lang)
             elif event == "media":
                 media = data.get("media", {}) or {}
