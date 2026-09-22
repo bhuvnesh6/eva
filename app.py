@@ -108,9 +108,12 @@ SARVAM_LANG_CODE = {
 # One voice per gender, reused across every language so the SAME voice
 # speaks the whole call. CONFIRM these speaker names exist on your Sarvam
 # account for bulbul:v3 (check their docs/list-speakers) — swap if 400s.
+# One voice per gender, reused across every language so the SAME voice
+# speaks the whole call. Confirmed valid for bulbul:v3 from Sarvam's own
+# 400 error body — if you change these, they must be in that list.
 SPEAKER_MAP = {
-    lang: {"female": os.environ.get("EVA_SPEAKER_FEMALE", "anushka"),
-           "male":   os.environ.get("EVA_SPEAKER_MALE", "abhilash")}
+    lang: {"female": os.environ.get("EVA_SPEAKER_FEMALE", "priya"),
+           "male":   os.environ.get("EVA_SPEAKER_MALE", "aditya")}
     for lang in SUPPORTED_LANGUAGES
 }
 
