@@ -55,6 +55,8 @@ LIVEKIT_URL = os.environ.get("LIVEKIT_URL", "")
 LIVEKIT_API_KEY = os.environ.get("LIVEKIT_API_KEY", "")
 LIVEKIT_API_SECRET = os.environ.get("LIVEKIT_API_SECRET", "")
 
+livekit_bridge.init(LIVEKIT_URL, LIVEKIT_API_KEY, LIVEKIT_API_SECRET, os.environ.get("AGENT_NAME", "eva-agent"))
+
 
 
 load_dotenv()
@@ -372,12 +374,6 @@ class _AsyncLoopRunner:
 
 
 _async_loop = _AsyncLoopRunner()
-
-# Reuse this SAME background loop for the VoiceLink LiveKit bridge instead
-# of giving it a second one — see livekit_bridge.init()'s docstring for why.
-livekit_bridge.init(LIVEKIT_URL, LIVEKIT_API_KEY, LIVEKIT_API_SECRET,
-                     os.environ.get("AGENT_NAME", "eva-agent"), _async_loop)
-
 
 def _stream_livekit_tts(tts_client, text, lang):
     """Bridges LiveKit's async TTS generator into a plain sync generator
@@ -2613,7 +2609,8 @@ def voicelink_ws(ws, call_id):
     try:
         bridge.start()
     except Exception as e:
-        log("VOICELINK", f"bridge failed to start for {call_id}: {e}")
+        log("VOICELINK", f"bridge failed to start for {call_id}: {type(e).__name__}: {e!r}")
+        bridge.close()  # best-effort: clean up anything that DID connect
         with _pending_calls_lock:
             PENDING_CALLS.pop(call_id, None)
         return
