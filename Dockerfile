@@ -15,6 +15,8 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
+RUN python -m livekit.agents download-files
+
 COPY . .
 
 COPY supervisord.conf /etc/supervisor/conf.d/eva.conf

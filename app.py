@@ -49,6 +49,12 @@ from livekit.agents.utils import http_context   # replaces sarvamai
 from twilio.rest import Client as TwilioClient
 
 import livekit_bridge
+
+
+LIVEKIT_URL = os.environ.get("LIVEKIT_URL", "")
+LIVEKIT_API_KEY = os.environ.get("LIVEKIT_API_KEY", "")
+LIVEKIT_API_SECRET = os.environ.get("LIVEKIT_API_SECRET", "")
+
 livekit_bridge.init(LIVEKIT_URL, LIVEKIT_API_KEY, LIVEKIT_API_SECRET, os.environ.get("AGENT_NAME", "eva-agent"))
 
 load_dotenv()
