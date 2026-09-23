@@ -813,8 +813,8 @@ class EvaSession:
             language="multi",
             smart_format=True,
             interim_results=True,
-            endpointing=300,          # ms of silence treated as a likely pause — steadier utterance-end detection
-            utterance_end_ms="1000",
+            endpointing=200,          # ms of silence treated as a likely pause — steadier utterance-end detection
+            utterance_end_ms="600",
             vad_events=True,
             encoding=encoding,
             sample_rate=sample_rate,
@@ -1098,11 +1098,17 @@ class EvaSession:
     # ---------- TTS loop ----------
 # --- NEW (full method) ---
     def _tts_loop(self):
+        pending_fetch = None  # (sentence, lang, generator) prefetched while previous sentence plays
         while not self.stop_event.is_set():
-            try:
-                sentence, lang = self.sentence_q.get(timeout=0.5)
-            except queue.Empty:
-                continue
+            if pending_fetch is not None:
+                sentence, lang, gen = pending_fetch
+                pending_fetch = None
+            else:
+                try:
+                    sentence, lang = self.sentence_q.get(timeout=0.5)
+                except queue.Empty:
+                    continue
+                gen = None
             if not is_speakable(sentence):
                 continue
             if self.interrupt_flag.is_set():
@@ -1128,10 +1134,25 @@ class EvaSession:
             else:
                 target_rate, target_codec = TTS_SAMPLE_RATE, "linear16"
 
+            if gen is None:
+                gen = _stream_livekit_tts(self.tts, sentence, lang)
+
             resample_state = None
             leftover = b""
+            prefetch_started = False
             try:
-                for pcm, src_rate in _stream_livekit_tts(self.tts, sentence, lang):
+                 for pcm, src_rate in gen:
+                    # Once we know THIS sentence is actually producing audio,
+                    # start synthesizing the NEXT queued sentence in parallel
+                    # so it's ready the instant this one finishes playing.
+                    if not prefetch_started:
+                        prefetch_started = True
+                        try:
+                            next_sentence, next_lang = self.sentence_q.get_nowait()
+                            pending_fetch = (next_sentence, next_lang,
+                                             _stream_livekit_tts(self.tts, next_sentence, next_lang))
+                        except queue.Empty:
+                            pass
                     if self.interrupt_flag.is_set():
                         break
                     if src_rate != target_rate:
