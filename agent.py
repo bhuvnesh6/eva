@@ -114,17 +114,22 @@ def book_meeting_via_pravaah(meeting_ctx: dict, lead: dict, call_id: str, reques
 
 class EvaAgent(Agent):
     def __init__(self, instructions: str, global_tts: inference.TTS,
-                 meeting: dict, lead: dict, call_id: str):
+                 meeting: dict, lead: dict, call_id: str, opening_line: str = ""):
         super().__init__(instructions=instructions)
         self._global_tts = global_tts
         self._meeting = meeting or {}
         self._lead = lead or {}
         self._call_id = call_id
+        self._opening_line = opening_line
 
     async def on_enter(self) -> None:
-        await self.session.generate_reply(
-            instructions="Greet the caller warmly as Eva and ask how you can help today."
-        )
+        logger.info("on_enter: greeting=%r", self._opening_line)
+        if self._opening_line:
+            await self.session.say(self._opening_line, allow_interruptions=True)
+        else:
+            await self.session.generate_reply(
+                instructions="Greet the caller warmly and ask how you can help today."
+            )
 
     async def tts_node(self, text: AsyncIterable[str], model_settings: ModelSettings):
         buffer = ""
@@ -268,6 +273,10 @@ async def entrypoint(ctx: JobContext) -> None:
         min_interruption_duration=0.5,
     )
 
+    session.on("error", lambda ev: logger.error("SESSION ERROR: %r", getattr(ev, "error", ev)))
+    session.on("agent_state_changed",
+               lambda ev: logger.info("agent state: %s -> %s", ev.old_state, ev.new_state))
+
     transcript = []
 
     def _on_item_added(ev):
@@ -308,8 +317,9 @@ async def entrypoint(ctx: JobContext) -> None:
     ctx.add_shutdown_callback(_finish_and_callback)
 
     instructions = _build_instructions(agent_cfg, lead, meeting)
+    opening_line = render_call_vars(agent_cfg.get("opening_line") or "", lead).strip().strip('"').strip()
     agent = EvaAgent(instructions=instructions, global_tts=global_tts,
-                      meeting=meeting, lead=lead, call_id=call_id)
+                      meeting=meeting, lead=lead, call_id=call_id, opening_line=opening_line)
 
     await session.start(
         agent=agent,

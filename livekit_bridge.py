@@ -14,7 +14,9 @@ import base64
 import json
 import threading
 import uuid
+from collections import deque
 
+import gevent
 from livekit import rtc, api
 
 import gevent.monkey as _gevent_monkey
@@ -100,33 +102,30 @@ class VoiceLinkBridge:
         self.local_track = None
         self._closed = threading.Event()
 
+        # outbound audio (agent -> phone): filled by the LiveKit loop thread,
+        # drained by a gevent greenlet that owns the websocket
+        self._out = deque()
+        self.started = threading.Event()   # set when VoiceLink's "start" event arrives
+        self.stream_sid = None
+        self._sent_frames = 0
+        self._in_frames = 0
+
     # ---------------- lifecycle ----------------
     def start(self):
-        """Creates the room, dispatches Eva into it, connects a trunk
-        participant, and opens an audio source. Blocks until connected.
-        40s timeout - room.connect()'s native FFI handshake has been
-        observed taking noticeably longer than a plain HTTP round trip."""
+        """Creates the room, connects the trunk participant, publishes the
+        audio track, THEN dispatches Eva. Blocks until done."""
         _run(self._async_start(), timeout=40)
+        gevent.spawn(self._sender_loop)        # greenlet in the same thread as the websocket
+        _submit(self._diagnose_dispatch())     # prints job status a few secs later
+
+    def _lk_api(self):
+        return api.LiveKitAPI(LIVEKIT_URL, LIVEKIT_API_KEY, LIVEKIT_API_SECRET)
 
     async def _async_start(self):
-        lkapi = api.LiveKitAPI(LIVEKIT_URL, LIVEKIT_API_KEY, LIVEKIT_API_SECRET)
+        lkapi = self._lk_api()
         try:
             await lkapi.room.create_room(api.CreateRoomRequest(name=self.room_name))
             print(f"[VOICELINK-BRIDGE] room created: {self.room_name}", flush=True)
-
-            metadata = json.dumps({
-                "agent": self.agent_cfg,
-                "lead": self.lead,
-                "meeting": self.meeting,
-                "call_id": self.call_id,
-                "callback_url": self.callback_url,
-            })
-            dispatch_result = await lkapi.agent_dispatch.create_dispatch(
-                api.CreateAgentDispatchRequest(
-                    room=self.room_name, agent_name=AGENT_NAME, metadata=metadata,
-                )
-            )
-            print(f"[VOICELINK-BRIDGE] dispatch created: {dispatch_result!r}", flush=True)
         finally:
             await lkapi.aclose()
 
@@ -140,6 +139,10 @@ class VoiceLinkBridge:
 
         self.room = rtc.Room()
         self.room.on("track_subscribed", self._on_track_subscribed)
+        self.room.on("participant_connected",
+                     lambda p: print(f"[VOICELINK-BRIDGE] participant joined: {p.identity} kind={p.kind}", flush=True))
+        self.room.on("participant_disconnected",
+                     lambda p: print(f"[VOICELINK-BRIDGE] participant left: {p.identity}", flush=True))
 
         print(f"[VOICELINK-BRIDGE] connecting trunk to {self.room_name}...", flush=True)
         await self.room.connect(LIVEKIT_URL, token, options=rtc.RoomOptions(auto_subscribe=True))
@@ -152,6 +155,46 @@ class VoiceLinkBridge:
         )
         print(f"[VOICELINK-BRIDGE] audio track published for {self.room_name}", flush=True)
 
+        # Dispatch Eva only now, so she joins a room that already has the caller's mic.
+        metadata = json.dumps({
+            "agent": self.agent_cfg,
+            "lead": self.lead,
+            "meeting": self.meeting,
+            "call_id": self.call_id,
+            "callback_url": self.callback_url,
+        })
+        lkapi = self._lk_api()
+        try:
+            dispatch_result = await lkapi.agent_dispatch.create_dispatch(
+                api.CreateAgentDispatchRequest(
+                    room=self.room_name, agent_name=AGENT_NAME, metadata=metadata,
+                )
+            )
+            print(f"[VOICELINK-BRIDGE] dispatch created: id={dispatch_result.id} agent={dispatch_result.agent_name}", flush=True)
+        finally:
+            await lkapi.aclose()
+
+    async def _diagnose_dispatch(self):
+        """4s after dispatch, print whether a job was actually created and who is in the room."""
+        try:
+            await asyncio.sleep(4)
+            who = [p.identity for p in self.room.remote_participants.values()] if self.room else []
+            print(f"[VOICELINK-BRIDGE] room participants after 4s: {who}", flush=True)
+            lkapi = self._lk_api()
+            try:
+                dispatches = await lkapi.agent_dispatch.list_dispatch(room_name=self.room_name)
+                for d in dispatches:
+                    print(f"[VOICELINK-BRIDGE] dispatch {d.id} agent={d.agent_name} jobs={len(d.state.jobs)}", flush=True)
+                    for j in d.state.jobs:
+                        print(f"[VOICELINK-BRIDGE]   job {j.id} status={j.state.status} "
+                              f"error={j.state.error!r} participant={j.state.participant_identity!r}", flush=True)
+                    if not d.state.jobs:
+                        print("[VOICELINK-BRIDGE]   NO JOB CREATED -> worker did not pick it up (check agent logs)", flush=True)
+            finally:
+                await lkapi.aclose()
+        except Exception as e:
+            print(f"[VOICELINK-BRIDGE] diagnose failed: {type(e).__name__}: {e!r}", flush=True)
+
     # ---------------- inbound: VoiceLink -> LiveKit room ----------------
     def feed_alaw(self, alaw_bytes: bytes):
         """Call from the VoiceLink websocket thread for every inbound
@@ -159,6 +202,9 @@ class VoiceLinkBridge:
         room. Fire-and-forget so the websocket read loop never blocks."""
         if self._closed.is_set() or self.source is None:
             return
+        self._in_frames += 1
+        if self._in_frames == 1:
+            print(f"[VOICELINK-BRIDGE] first inbound audio frame ({len(alaw_bytes)} bytes)", flush=True)
         pcm16 = audioop.alaw2lin(alaw_bytes, 2)
         frame = rtc.AudioFrame(
             data=pcm16, sample_rate=ROOM_AUDIO_RATE, num_channels=1,
@@ -168,33 +214,57 @@ class VoiceLinkBridge:
 
     # ---------------- outbound: LiveKit room -> VoiceLink ----------------
     def _on_track_subscribed(self, track, publication, participant):
+        print(f"[VOICELINK-BRIDGE] track subscribed: kind={track.kind} from {participant.identity}", flush=True)
         if track.kind != rtc.TrackKind.KIND_AUDIO:
             return
         _submit(self._pump_agent_audio(track))
 
     async def _pump_agent_audio(self, track: rtc.Track):
+        """Runs on the LiveKit loop thread. It must NOT touch the websocket,
+        so it only pushes 20ms A-law chunks (160 bytes) into a deque."""
         stream = rtc.AudioStream(track, sample_rate=ROOM_AUDIO_RATE, num_channels=1)
+        buf = b""
+        first = True
         async for event in stream:
             if self._closed.is_set():
                 break
-            alaw = audioop.lin2alaw(bytes(event.frame.data), 2)
-            self._send_alaw_to_voicelink(alaw)
+            if first:
+                first = False
+                print("[VOICELINK-BRIDGE] first agent audio frame received from LiveKit", flush=True)
+            buf += audioop.lin2alaw(bytes(event.frame.data), 2)
+            while len(buf) >= 160:
+                self._out.append(buf[:160])
+                buf = buf[160:]
 
-    def _send_alaw_to_voicelink(self, alaw_bytes: bytes):
-        with self.ws_lock:
+    def _sender_loop(self):
+        """Greenlet in the gevent thread: the only place that writes to the
+        VoiceLink websocket. Waits for VoiceLink's 'start' event first."""
+        while not self._closed.is_set():
+            if not self.started.is_set() or not self._out:
+                gevent.sleep(0.005)
+                continue
+            try:
+                chunk = self._out.popleft()
+            except IndexError:
+                continue
             try:
                 self.ws.send(json.dumps({
                     "event": "media",
-                    "media": {"payload": base64.b64encode(alaw_bytes).decode("ascii")},
+                    "media": {"payload": base64.b64encode(chunk).decode("ascii")},
                 }))
-            except Exception:
-                pass
+                self._sent_frames += 1
+                if self._sent_frames == 1:
+                    print("[VOICELINK-BRIDGE] first audio frame SENT to VoiceLink", flush=True)
+            except Exception as e:
+                print(f"[VOICELINK-BRIDGE] ws send failed: {type(e).__name__}: {e!r}", flush=True)
+                gevent.sleep(0.05)
 
     def clear_playback(self):
         """Best-effort barge-in flush signal to VoiceLink."""
+        self._out.clear()
         with self.ws_lock:
             try:
-                self.ws.send(json.dumps({"event": "clear"}))
+                self.ws.send(json.dumps({"event": "clear", "stream_sid": self.stream_sid}))
             except Exception:
                 pass
 
