@@ -229,6 +229,7 @@ server.setup_fnc = prewarm
 
 @server.rtc_session(agent_name=AGENT_NAME)
 async def entrypoint(ctx: JobContext) -> None:
+    logger.info(f"=== ENTRYPOINT CALLED for room {ctx.room.name}, job metadata: {ctx.job.metadata!r} ===")
     ctx.log_context_fields = {"room": ctx.room.name}
 
     # --- parse per-call context, if any (set by livekit_bridge.py for

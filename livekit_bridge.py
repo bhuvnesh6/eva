@@ -96,11 +96,12 @@ class VoiceLinkBridge:
                 "call_id": self.call_id,
                 "callback_url": self.callback_url,
             })
-            await lkapi.agent_dispatch.create_dispatch(
+            dispatch_result = await lkapi.agent_dispatch.create_dispatch(
                 api.CreateAgentDispatchRequest(
                     room=self.room_name, agent_name=AGENT_NAME, metadata=metadata,
                 )
             )
+            print(f"[VOICELINK-BRIDGE] dispatch created: {dispatch_result!r}", flush=True)
         finally:
             await lkapi.aclose()
 
