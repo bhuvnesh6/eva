@@ -800,7 +800,14 @@ class EvaSession:
     def start(self):
         if self.mode == "phone":
             if self.transport == "voicelink":
-                encoding, sample_rate = VOICELINK_CODEC, VOICELINK_RATE
+                # Deepgram's LIVE STREAMING endpoint does not accept
+                # encoding=alaw (alaw is documented for pre-recorded/batch
+                # transcription and for Deepgram TTS output only) — sending
+                # it caused Deepgram to reject the websocket handshake with
+                # HTTP 400. We decode VoiceLink's A-law audio to linear16
+                # ourselves in feed_audio() below, so tell Deepgram to
+                # expect linear16 here, not alaw.
+                encoding, sample_rate = "linear16", VOICELINK_RATE
             elif self.transport == "vanisetu":
                 encoding, sample_rate = "mulaw", VANISETU_RATE
             else:
@@ -837,7 +844,15 @@ class EvaSession:
         except Exception as e:
             log("BARGE-IN", f"volume check error: {e}")
         try:
-            self.dg_connection.send(data)
+            # VoiceLink's wire audio is A-law, but Deepgram's live
+            # streaming endpoint rejects encoding=alaw with HTTP 400 (see
+            # start()). Decode to linear16 before forwarding so Deepgram
+            # actually accepts the stream; other transports are untouched.
+            if self.mode == "phone" and self.transport == "voicelink":
+                data_for_dg = audioop.alaw2lin(data, 2)
+            else:
+                data_for_dg = data
+            self.dg_connection.send(data_for_dg)
         except Exception as e:
             log("STT", f"send error: {e}")
 
