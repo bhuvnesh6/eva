@@ -1,42 +1,3 @@
-"""
-Eva - Web backend
-
-Flask app that serves:
-  - "/"            a landing page (templates/landing.html) with Eva's demo widget
-  - "/widget.js"   an embeddable <script> you can paste into ANY html page,
-                    which injects a floating "Talk to Eva" widget bottom-right
-  - "/ws/eva"      a WebSocket endpoint that runs the real voice pipeline:
-                    browser mic (PCM16/16kHz) -> Deepgram STT (streaming)
-                    -> Mistral LLM (streaming) -> Sarvam TTS (streaming)
-                    -> PCM16/22050Hz audio frames sent back to the browser
-  - "/api/calls"   called by PravaahAI to place an outbound campaign call
-                    (Eva calls the lead, runs the same voice pipeline over
-                    Twilio Media Streams, then POSTs the transcript back to
-                    PravaahAI's callback_url when the call ends)
-
-Each WebSocket connection gets its own EvaSession with its own Deepgram
-connection + history, so multiple visitors/calls can run at once.
-
-Setup:
-    pip install -r requirements.txt
-
-    .env:
-        DEEPGRAM_API_KEY=...
-        MISTRAL_API_KEY=...
-        SARVAM_API_KEY=...
-        PORT=8420                    (optional, defaults to 8420)
-        EVA_SPEAKER=priya            (optional)
-        EVA_API_SECRET=...           (shared secret with PravaahAI)
-        PUBLIC_BASE_URL=https://your-eva-tunnel.ngrok-free.app
-        EVA_RESPONSE_PAUSE_SECS=3.5  (optional, natural pause before Eva replies)
-
-Run (dev):
-    python app.py
-
-Run (prod, inside Docker):
-    gunicorn -k gevent -w 1 -b 0.0.0.0:8420 app:app
-"""
-
 import os
 import re
 import sys
@@ -69,6 +30,24 @@ from twilio.twiml.voice_response import VoiceResponse, Connect
 
 import websocket as vanisetu_ws_lib   # pip install websocket-client
 
+
+# --- NEW ---
+import math
+import array
+import audioop          # stdlib on <3.13, audioop-lts backport on 3.13+
+import asyncio
+import base64
+import queue
+...
+from deepgram import (
+    DeepgramClient,
+    DeepgramClientOptions,
+    LiveTranscriptionEvents,
+    LiveOptions,
+)
+from livekit.agents import inference   # replaces sarvamai
+from twilio.rest import Client as TwilioClient
+
 load_dotenv()
 
 # ---------------- Config ----------------
@@ -80,51 +59,27 @@ TTS_SAMPLE_RATE = 22050        # PCM16 we send back to the browser
 SENTENCE_END_RE = re.compile(r"([.!?।\n])")
 # Matches Latin, Devanagari, Bengali, Tamil, Telugu, Kannada, or Malayalam
 # characters — used to decide if a chunk of text has anything speakable.
-SPEAKABLE_RE = re.compile(
-    r"[A-Za-z0-9\u0900-\u097F\u0980-\u09FF\u0B80-\u0BFF\u0C00-\u0C7F\u0C80-\u0CFF\u0D00-\u0D7F]"
-)
-DEVANAGARI_RE = re.compile(r"[\u0900-\u097F]")  # kept for backward compatibility
-BOOK_MEETING_RE = re.compile(r"BOOK_MEETING:\s*(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2})")
+# --- NEW ---
+SPEAKABLE_RE = re.compile(r"[A-Za-z0-9\u0900-\u097F]")   # Latin or Devanagari
+# --- NEW ---
+DEVANAGARI_RE = re.compile(r"[\u0900-\u097F]")
 
-# ---------------- Multi-language support ----------------
-LANG_SCRIPT_RE = {
-    "hi": re.compile(r"[\u0900-\u097F]"),   # Hindi — Devanagari
-    "bn": re.compile(r"[\u0980-\u09FF]"),   # Bengali
-    "ta": re.compile(r"[\u0B80-\u0BFF]"),   # Tamil
-    "te": re.compile(r"[\u0C00-\u0C7F]"),   # Telugu
-    "kn": re.compile(r"[\u0C80-\u0CFF]"),   # Kannada
-    "ml": re.compile(r"[\u0D00-\u0D7F]"),   # Malayalam
-}
-SUPPORTED_LANGUAGES = {"en", "hi", "bn", "ta", "te", "kn", "ml"}
-LANG_NAMES = {
-    "en": "English", "hi": "Hindi", "bn": "Bengali",
-    "ta": "Tamil", "te": "Telugu", "kn": "Kannada", "ml": "Malayalam",
-}
-# Sarvam bulbul:v3 language codes — confirm against Sarvam's docs/dashboard.
-SARVAM_LANG_CODE = {
-    "en": "en-IN", "hi": "hi-IN", "bn": "bn-IN",
-    "ta": "ta-IN", "te": "te-IN", "kn": "kn-IN", "ml": "ml-IN",
-}
-# One voice per gender, reused across every language so the SAME voice
-# speaks the whole call. CONFIRM these speaker names exist on your Sarvam
-# account for bulbul:v3 (check their docs/list-speakers) — swap if 400s.
-# One voice per gender, reused across every language so the SAME voice
-# speaks the whole call. Confirmed valid for bulbul:v3 from Sarvam's own
-# 400 error body — if you change these, they must be in that list.
-SPEAKER_MAP = {
-    lang: {"female": os.environ.get("EVA_SPEAKER_FEMALE", "priya"),
-           "male":   os.environ.get("EVA_SPEAKER_MALE", "aditya")}
-    for lang in SUPPORTED_LANGUAGES
-}
+# ---------------- Language support: English + Hindi only ----------------
+SUPPORTED_LANGUAGES = {"en", "hi"}
+LANG_NAMES = {"en": "English", "hi": "Hindi"}
 
-MISTRAL_MODEL = "mistral-small-latest"
-MISTRAL_REASONING_EFFORT="none"
-SARVAM_TTS_MODEL = "bulbul:v3"
-DEFAULT_SPEAKER = os.environ.get("EVA_SPEAKER", "priya")
-# Speech playback speed. bulbul:v3 accepts 0.5 (slower) to 2.0 (faster);
-# 1.0 is normal pace. A touch above 1.0 reads as natural-but-brisk instead
-# of sluggish, without tipping into sounding rushed.
-TTS_PACE = float(os.environ.get("EVA_TTS_PACE", 1.12))
+# ---------------- LiveKit voice (TTS) ----------------
+# No more Sarvam — TTS now goes through LiveKit's hosted Inference API,
+# authenticated with LIVEKIT_URL/LIVEKIT_API_KEY/LIVEKIT_API_SECRET
+# (same creds Eva V2 already uses for its web widget), not a per-vendor key.
+LIVEKIT_URL = os.environ.get("LIVEKIT_URL", "")
+LIVEKIT_API_KEY = os.environ.get("LIVEKIT_API_KEY", "")
+LIVEKIT_API_SECRET = os.environ.get("LIVEKIT_API_SECRET", "")
+LIVEKIT_TTS_MODEL = os.environ.get("LIVEKIT_TTS_MODEL", "inworld/inworld-tts-2")
+# One voice per gender, reused across the whole call regardless of which
+# of the two supported languages is being spoken.
+VOICE_MALE = os.environ.get("EVA_VOICE_MALE", "Manoj")
+VOICE_FEMALE = os.environ.get("EVA_VOICE_FEMALE", "Riya")
 
 MAX_HISTORY_MESSAGES = 16
 
@@ -187,10 +142,12 @@ GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.5-flash-lite")
 
 
 def check_missing_keys():
-    """Which required env vars are missing, given the CURRENT LLM_PROVIDER.
-    Only the active provider's key is required — the other one is ignored
-    even if it's unset."""
-    checks = [("DEEPGRAM_API_KEY", DEEPGRAM_API_KEY), ("SARVAM_API_KEY", SARVAM_API_KEY)]
+    checks = [
+        ("DEEPGRAM_API_KEY", DEEPGRAM_API_KEY),
+        ("LIVEKIT_URL", LIVEKIT_URL),
+        ("LIVEKIT_API_KEY", LIVEKIT_API_KEY),
+        ("LIVEKIT_API_SECRET", LIVEKIT_API_SECRET),
+    ]
     if LLM_PROVIDER == "gemini":
         checks.append(("GEMINI_API_KEY", GEMINI_API_KEY))
     else:
@@ -268,15 +225,11 @@ def is_speakable(text: str) -> bool:
     return bool(SPEAKABLE_RE.search(text))
 
 
+# --- NEW ---
 def detect_lang(text: str) -> str:
-    """Detects which supported language a transcript is in, by script.
-    Non-Latin scripts are unambiguous; Latin-script text (English,
-    Hinglish, romanized regional languages) falls back to English — the
-    LLM prompt handles Hinglish-vs-English judgment on its own."""
-    for lang, pattern in LANG_SCRIPT_RE.items():
-        if pattern.search(text):
-            return lang
-    return "en"
+    """English/Hindi only: Devanagari means Hindi, anything else (including
+    Hinglish/romanized Hindi) falls back to English."""
+    return "hi" if DEVANAGARI_RE.search(text) else "en"
 
 
 def _build_ulaw_decode_table():
@@ -365,12 +318,64 @@ def render_call_vars(text: str, lead: dict) -> str:
 app = Flask(__name__, template_folder="templates", static_folder="static", static_url_path="/static")
 sock = Sock(app)
 
+# ---------------- LiveKit TTS: sync/async bridge ----------------
+# inference.TTS is async-only; everything else in this file is sync
+# (Flask + flask-sock under gunicorn's gevent worker). One persistent
+# background thread owns a single asyncio loop for the life of the
+# process — every session bridges its TTS calls into it via
+# run_coroutine_threadsafe rather than each spinning up its own loop.
+class _AsyncLoopRunner:
+    def __init__(self):
+        self.loop = asyncio.new_event_loop()
+        threading.Thread(target=self._run, daemon=True, name="LiveKitAsyncLoop").start()
+
+    def _run(self):
+        asyncio.set_event_loop(self.loop)
+        self.loop.run_forever()
+
+
+_async_loop = _AsyncLoopRunner()
+
+
+def _stream_livekit_tts(tts_client, text, lang):
+    """Bridges LiveKit's async TTS generator into a plain sync generator
+    of (pcm16_bytes, sample_rate) tuples — same shape as the old
+    sarvam.text_to_speech.convert_stream(...) call it replaces."""
+    out_q = queue.Queue()
+    SENTINEL = object()
+
+    async def _pump():
+        try:
+            tts_client.update_options(language=lang)
+            async for audio in tts_client.synthesize(text):
+                frame = audio.frame
+                # If your installed livekit-agents version stores frame
+                # samples differently, adjust this line (print
+                # type(frame.data) once while testing).
+                out_q.put((bytes(frame.data), frame.sample_rate))
+        except Exception as e:
+            out_q.put(e)
+        finally:
+            out_q.put(SENTINEL)
+
+    _async_loop.loop.call_soon_threadsafe(
+        lambda: asyncio.ensure_future(_pump(), loop=_async_loop.loop)
+    )
+
+    while True:
+        item = out_q.get()
+        if item is SENTINEL:
+            return
+        if isinstance(item, Exception):
+            raise item
+        yield item
 
 # ============================================================
 # One EvaSession per WebSocket connection
 # ============================================================
 class EvaSession:
-    def __init__(self, ws, speaker: str = DEFAULT_SPEAKER, mode: str = "browser",
+    # --- NEW ---
+    def __init__(self, ws, mode: str = "browser",
                  call_id: str = None, agent: dict = None, lead: dict = None,
                  callback_url: str = None, meeting: dict = None,
                  transport: str = "twilio", vanisetu_session_id: int = None):
@@ -429,14 +434,10 @@ class EvaSession:
         # Set ONCE here and never reassigned mid-call, which is what keeps
         # Eva's voice/tone consistent across a call even as language shifts
         # sentence-to-sentence.
+        # --- NEW ---
         agent_gender = agent.get("gender") if agent.get("gender") in ("male", "female") else "female"
-        voice_lang = self.forced_language or "en"
         self.gender = agent_gender
-        self.speaker = (
-            agent.get("speaker")
-            or SPEAKER_MAP.get(voice_lang, SPEAKER_MAP["en"]).get(agent_gender)
-            or speaker or DEFAULT_SPEAKER
-        )
+        self.voice_name = VOICE_MALE if agent_gender == "male" else VOICE_FEMALE
 
         self.max_duration_secs = int(agent.get("max_duration_secs") or 0) or None
         self.min_duration_secs = int(agent.get("min_duration_secs") or 0) or None
@@ -468,11 +469,8 @@ class EvaSession:
         else:
             base_prompt += (
                 "\nLanguage rule: default to English. If the user is clearly speaking "
-                "one of these languages, reply in THAT language using its own native "
-                "script (not romanized): Hindi (Devanagari), Bengali (Bangla script), "
-                "Tamil (Tamil script), Telugu (Telugu script), Kannada (Kannada script), "
-                "Malayalam (Malayalam script). If their message is in English, unclear, "
-                "or mixed, reply in English. Never guess a regional language on your own."
+                "Hindi, reply in Hindi using Devanagari script (not romanized). "
+                "If their message is in English, unclear, or mixed, reply in English."
             )
         base_prompt += "\nNever reply using only emojis or symbols with no words."
         # Applies unconditionally - even on top of an owner's own custom
@@ -516,7 +514,8 @@ class EvaSession:
         self.dg_connection.on(LiveTranscriptionEvents.Error, self._dg_error)
         self.dg_connection.on(LiveTranscriptionEvents.Close, self._dg_close)
 
-        self.sarvam = SarvamAI(api_subscription_key=SARVAM_API_KEY)
+        # --- NEW ---
+        self.tts = inference.TTS(model=LIVEKIT_TTS_MODEL, voice=self.voice_name, language="en")
 
     # ---------- outbound helpers ----------
     def _send_json(self, obj):
@@ -1071,83 +1070,67 @@ class EvaSession:
                 self._send_json({"type": "assistant_done", "text": full_reply})
 
     # ---------- TTS loop ----------
+# --- NEW (full method) ---
     def _tts_loop(self):
         while not self.stop_event.is_set():
             try:
                 sentence, lang = self.sentence_q.get(timeout=0.5)
             except queue.Empty:
                 continue
-
             if not is_speakable(sentence):
                 continue
-
-            # Dropped mid-flight by a barge-in that happened between this
-            # sentence being queued and us picking it up - skip it.
             if self.interrupt_flag.is_set():
                 continue
 
-            target_language_code = SARVAM_LANG_CODE.get(lang, "en-IN")
             self._send_json({"type": "status", "state": "speaking"})
             self.eva_speaking.set()
 
             if self.mode == "phone" and self.transport == "vanisetu" and self.vanisetu_session_id is not None:
                 vanisetu_client.send_command(self.vanisetu_session_id, {"command": "START_MEDIA_BUFFERING"})
 
+            # LiveKit's TTS always hands back linear16 PCM at its own
+            # native sample rate — we resample + (for phone) mu-law/A-law
+            # encode it ourselves with audioop, replacing what Sarvam used
+            # to do internally via output_audio_codec/speech_sample_rate.
             if self.mode == "phone":
                 if self.transport == "vanisetu":
-                    tts_codec, tts_rate = "mulaw", VANISETU_RATE
+                    target_rate, target_codec = VANISETU_RATE, "mulaw"
                 elif self.transport == "voicelink":
-                    tts_codec, tts_rate = VOICELINK_CODEC, VOICELINK_RATE
+                    target_rate, target_codec = VOICELINK_RATE, VOICELINK_CODEC
                 else:
-                    tts_codec, tts_rate = "mulaw", PHONE_RATE
+                    target_rate, target_codec = PHONE_RATE, "mulaw"
             else:
-                tts_codec, tts_rate = "linear16", TTS_SAMPLE_RATE
+                target_rate, target_codec = TTS_SAMPLE_RATE, "linear16"
 
+            resample_state = None
             leftover = b""
             try:
-                # NOTE: the streaming endpoint's language param is named
-                # "language_code" (NOT "target_language_code" - that name is
-                # only valid on the non-streaming .convert() call). Passing
-                # the wrong name throws a TypeError and produces zero audio.
-                # `pace` is bulbul:v3's speed knob (0.5-2.0, 1.0 = normal).
-                for chunk in self.sarvam.text_to_speech.convert_stream(
-                    text=sentence,
-                    language_code=target_language_code,
-                    speaker=self.speaker,
-                    model=SARVAM_TTS_MODEL,
-                    output_audio_codec=tts_codec,
-                    speech_sample_rate=tts_rate,
-                    pace=TTS_PACE,
-                ):
+                for pcm, src_rate in _stream_livekit_tts(self.tts, sentence, lang):
                     if self.interrupt_flag.is_set():
-                        # user started talking mid-sentence - stop right here
                         break
-                    if not chunk:
-                        continue
-                    if self.mode == "phone":
-                        # mu-law is 1 byte/sample - no alignment needed, send as-is
-                        self._send_audio(chunk)
-                        continue
-                    # linear16 is 2 bytes/sample - keep frames byte-aligned
-                    data = leftover + chunk
-                    if len(data) % 2 != 0:
-                        leftover = data[-1:]
-                        data = data[:-1]
-                    else:
-                        leftover = b""
-                    if data:
-                        self._send_audio(data)
+                    if src_rate != target_rate:
+                        pcm, resample_state = audioop.ratecv(pcm, 2, 1, src_rate, target_rate, resample_state)
+
+                    if target_codec == "mulaw":
+                        self._send_audio(audioop.lin2ulaw(pcm, 2))
+                    elif target_codec == "alaw":
+                        self._send_audio(audioop.lin2alaw(pcm, 2))
+                    else:  # linear16 — browser widget
+                        data = leftover + pcm
+                        if len(data) % 2 != 0:
+                            leftover = data[-1:]
+                            data = data[:-1]
+                        else:
+                            leftover = b""
+                        if data:
+                            self._send_audio(data)
             except Exception as e:
                 log("TTS", f"ERROR: {e}")
 
             self.eva_speaking.clear()
 
-            # Let the client know this sentence's audio has fully been sent.
             if self.sentence_q.empty() and not self.interrupt_flag.is_set():
                 self._send_json({"type": "status", "state": "listening"})
-                # Eva has genuinely gone quiet with nothing queued - the
-                # turn is over. Next time she speaks it's a fresh turn and
-                # gets a fresh grace window (see _enqueue_sentence).
                 self.turn_active = False
 
 
