@@ -5,7 +5,8 @@ gevent==24.2.1
 python-dotenv==1.0.1
 httpx==0.27.2
 numpy==1.26.4
-sounddevice==0.4.7
+# --- NEW ---
+sounddevice>=0.5
 deepgram-sdk>=3.7,<4
 twilio==9.10.9
 websocket-client
