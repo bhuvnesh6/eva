@@ -45,6 +45,7 @@ from deepgram import (
     LiveOptions,
 )
 from livekit.agents import inference   # replaces sarvamai
+from livekit.agents.utils import http_context   # replaces sarvamai
 from twilio.rest import Client as TwilioClient
 
 load_dotenv()
@@ -60,8 +61,9 @@ SENTENCE_END_RE = re.compile(r"([.!?।\n])")
 # characters — used to decide if a chunk of text has anything speakable.
 # --- NEW ---
 SPEAKABLE_RE = re.compile(r"[A-Za-z0-9\u0900-\u097F]")   # Latin or Devanagari
-# --- NEW ---
 DEVANAGARI_RE = re.compile(r"[\u0900-\u097F]")
+BOOK_MEETING_RE = re.compile(r"BOOK_MEETING:\s*(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2})")
+
 
 # ---------------- Language support: English + Hindi only ----------------
 SUPPORTED_LANGUAGES = {"en", "hi"}
@@ -323,14 +325,41 @@ sock = Sock(app)
 # background thread owns a single asyncio loop for the life of the
 # process — every session bridges its TTS calls into it via
 # run_coroutine_threadsafe rather than each spinning up its own loop.
+# --- NEW (full block) ---
 class _AsyncLoopRunner:
+    """One persistent background thread owns a single asyncio loop AND a
+    single long-lived LiveKit "http job context" for the life of the
+    process. inference.TTS requires that context to be open (it's normally
+    opened for you inside AgentSession/JobContext) — outside that, it
+    raises "Attempted to use an http session outside of a job context".
+    We open it ONCE here and every TTS task is created as a CHILD task of
+    that same open context (via the queue below), so each one correctly
+    inherits the session instead of failing."""
     def __init__(self):
         self.loop = asyncio.new_event_loop()
+        self.request_q = None
+        self._ready = threading.Event()
         threading.Thread(target=self._run, daemon=True, name="LiveKitAsyncLoop").start()
+        self._ready.wait()
 
     def _run(self):
         asyncio.set_event_loop(self.loop)
+        self.loop.create_task(self._main())
         self.loop.run_forever()
+
+    async def _main(self):
+        self.request_q = asyncio.Queue()
+        async with http_context.open():
+            self._ready.set()
+            while True:
+                coro_fn = await self.request_q.get()
+                asyncio.create_task(coro_fn())
+
+    def submit(self, coro_fn):
+        """coro_fn: zero-arg callable returning a coroutine. Safe to call
+        from any thread. Runs inside the loop's persistent http job
+        context so LiveKit inference plugins work correctly."""
+        self.loop.call_soon_threadsafe(self.request_q.put_nowait, coro_fn)
 
 
 _async_loop = _AsyncLoopRunner()
@@ -357,9 +386,7 @@ def _stream_livekit_tts(tts_client, text, lang):
         finally:
             out_q.put(SENTINEL)
 
-    _async_loop.loop.call_soon_threadsafe(
-        lambda: asyncio.ensure_future(_pump(), loop=_async_loop.loop)
-    )
+    _async_loop.submit(_pump)
 
     while True:
         item = out_q.get()
@@ -1658,8 +1685,14 @@ class VaniSetuClient:
         log("VANISETU", f"Incoming call {call_id} connected as session {session_id}")
 
 
+# --- NEW ---
+VANISETU_ENABLED = os.environ.get("VANISETU_ENABLED", "false").lower() == "true"
+
 vanisetu_client = VaniSetuClient()
-vanisetu_client.start()
+if VANISETU_ENABLED:
+    vanisetu_client.start()
+else:
+    log("VANISETU", "VANISETU_ENABLED=false — skipping VaniSetu connection.")
 
 
 # ============================================================
