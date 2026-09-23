@@ -17,7 +17,21 @@ import uuid
 
 from livekit import rtc, api
 
-from gevent.threadpool import ThreadPool
+import gevent.monkey as _gevent_monkey
+
+# The ACTUAL, pre-monkeypatch threading.Thread class. gunicorn's gevent
+# worker monkey-patches threading.Thread into a greenlet that multiplexes
+# onto ONE shared real OS thread - using it here caused the earlier
+# "Cannot run the event loop while another loop is running" crash when
+# combined with app.py's existing TTS loop. Switching to
+# gevent.threadpool.ThreadPool got a real OS thread, but ThreadPool's
+# worker hub expects each task to RETURN promptly; asyncio's run_forever()
+# never returns, so the pool's own internal cross-thread signaling had
+# nothing left to wait for and raised "LoopExit: This operation would
+# block forever". get_original() sidesteps both: a genuine, permanently-
+# running OS thread with no gevent thread-pool lifecycle assumptions
+# attached to it.
+_RealThread = _gevent_monkey.get_original("threading", "Thread")
 
 LIVEKIT_URL = None
 LIVEKIT_API_KEY = None
@@ -35,25 +49,14 @@ def init(url, api_key, api_secret, agent_name):
 
 
 class _BridgeLoop:
-    """Runs the bridge's asyncio loop on a dedicated, GENUINE OS thread via
-    gevent.threadpool.ThreadPool - NOT via threading.Thread(), which under
-    gunicorn's gevent worker (monkey-patched) becomes just another greenlet
-    multiplexed onto the SAME single real OS thread as everything else in
-    the process, including app.py's existing TTS _AsyncLoopRunner. Sharing
-    that thread caused two real problems: (1) an asyncio "two loops on one
-    thread" crash when this bridge had its own threading.Thread-based
-    loop, and (2) after merging into the shared loop to fix (1), room
-    connect() - which goes through livekit-rtc's native FFI layer -
-    started timing out because the shared loop was busy with other work
-    and couldn't service the FFI callback promptly ("timed out waiting for
-    ReadyForRoomEventRequest after ConnectCallback").
-    ThreadPool gives us a real, unpatched OS thread: no collision with the
-    existing loop, and no risk of FFI-level blocking stalling the rest of
-    the app's cooperative scheduling."""
+    """Runs the bridge's asyncio loop on a genuine, permanently-running OS
+    thread spawned via the real (pre-monkeypatch) threading.Thread - see
+    _RealThread comment above for why neither a plain threading.Thread nor
+    gevent.threadpool.ThreadPool work for this."""
     def __init__(self):
         self.loop = asyncio.new_event_loop()
-        self._pool = ThreadPool(1)
-        self._pool.spawn(self._run)
+        self._thread = _RealThread(target=self._run, daemon=True, name="LiveKitBridgeLoop")
+        self._thread.start()
 
     def _run(self):
         asyncio.set_event_loop(self.loop)
