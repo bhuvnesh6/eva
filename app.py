@@ -29,6 +29,11 @@ from twilio.twiml.voice_response import VoiceResponse, Connect
 
 import websocket as vanisetu_ws_lib   # pip install websocket-client
 
+import collections
+import gevent.monkey as _gevent_monkey
+# Genuine OS thread class (pre-monkeypatch) - same trick as livekit_bridge.py
+_RealThread = _gevent_monkey.get_original("threading", "Thread")
+
 
 # --- NEW ---
 import math
@@ -339,50 +344,72 @@ sock = Sock(app)
 # background thread owns a single asyncio loop for the life of the
 # process — every session bridges its TTS calls into it via
 # run_coroutine_threadsafe rather than each spinning up its own loop.
-# --- NEW (full block) ---
 class _AsyncLoopRunner:
-    """One persistent background thread owns a single asyncio loop AND a
-    single long-lived LiveKit "http job context" for the life of the
-    process. inference.TTS requires that context to be open (it's normally
-    opened for you inside AgentSession/JobContext) — outside that, it
-    raises "Attempted to use an http session outside of a job context".
-    We open it ONCE here and every TTS task is created as a CHILD task of
-    that same open context (via the queue below), so each one correctly
-    inherits the session instead of failing."""
+    """Runs an asyncio loop on a REAL OS thread (not a gevent greenlet) and
+    keeps one LiveKit http context open for all TTS tasks."""
     def __init__(self):
         self.loop = asyncio.new_event_loop()
         self.request_q = None
-        self._ready = threading.Event()
-        threading.Thread(target=self._run, daemon=True, name="LiveKitAsyncLoop").start()
-        self._ready.wait()
+        self._is_ready = False
+        self._error = None
+        _RealThread(target=self._run, daemon=True, name="LiveKitAsyncLoop").start()
+
+        # Poll with gevent-friendly sleep (no cross-thread Event needed),
+        # and never hang the gunicorn worker forever at import time.
+        deadline = time.time() + 20
+        while not self._is_ready and self._error is None and time.time() < deadline:
+            time.sleep(0.05)
+        if self._error is not None:
+            raise RuntimeError(f"LiveKit TTS loop failed to start: {self._error!r}")
+        if not self._is_ready:
+            raise RuntimeError("LiveKit TTS loop did not start within 20s")
 
     def _run(self):
-        asyncio.set_event_loop(self.loop)
-        self.loop.create_task(self._main())
-        self.loop.run_forever()
+        try:
+            asyncio.set_event_loop(self.loop)
+            self.loop.create_task(self._main())
+            self.loop.run_forever()
+        except BaseException as e:
+            self._error = e
+            raise
 
     async def _main(self):
-        self.request_q = asyncio.Queue()
-        async with http_context.open():
-            self._ready.set()
-            while True:
-                coro_fn = await self.request_q.get()
-                asyncio.create_task(coro_fn())
+        try:
+            self.request_q = asyncio.Queue()
+            if hasattr(http_context, "_new_session_ctx"):
+                # livekit-agents 1.x: sets the http-session ContextVar in THIS
+                # task's context; every child task created below inherits it.
+                http_context._new_session_ctx()
+                self._is_ready = True
+                await self._serve()
+            else:
+                async with http_context.open():
+                    self._is_ready = True
+                    await self._serve()
+        except BaseException as e:
+            self._error = e
+            log("TTS-LOOP", f"fatal: {type(e).__name__}: {e!r}")
+            raise
+
+    async def _serve(self):
+        while True:
+            coro_fn = await self.request_q.get()
+            asyncio.create_task(coro_fn())
 
     def submit(self, coro_fn):
-        """coro_fn: zero-arg callable returning a coroutine. Safe to call
-        from any thread. Runs inside the loop's persistent http job
-        context so LiveKit inference plugins work correctly."""
+        """coro_fn: zero-arg callable returning a coroutine. Safe from any thread."""
         self.loop.call_soon_threadsafe(self.request_q.put_nowait, coro_fn)
 
 
 _async_loop = _AsyncLoopRunner()
 
+
 def _stream_livekit_tts(tts_client, text, lang):
-    """Bridges LiveKit's async TTS generator into a plain sync generator
-    of (pcm16_bytes, sample_rate) tuples — same shape as the old
-    sarvam.text_to_speech.convert_stream(...) call it replaces."""
-    out_q = queue.Queue()
+    """Bridges LiveKit's async TTS generator (real thread) into a sync
+    generator of (pcm16_bytes, sample_rate) for gevent code. Uses a deque +
+    cooperative sleep instead of queue.Queue, so it's safe across the
+    real-thread / gevent boundary."""
+    out = collections.deque()
     SENTINEL = object()
 
     async def _pump():
@@ -390,19 +417,24 @@ def _stream_livekit_tts(tts_client, text, lang):
             tts_client.update_options(language=lang)
             async for audio in tts_client.synthesize(text):
                 frame = audio.frame
-                # If your installed livekit-agents version stores frame
-                # samples differently, adjust this line (print
-                # type(frame.data) once while testing).
-                out_q.put((bytes(frame.data), frame.sample_rate))
+                out.append((bytes(frame.data), frame.sample_rate))
         except Exception as e:
-            out_q.put(e)
+            out.append(e)
         finally:
-            out_q.put(SENTINEL)
+            out.append(SENTINEL)
 
     _async_loop.submit(_pump)
 
+    last_activity = time.time()
     while True:
-        item = out_q.get()
+        try:
+            item = out.popleft()
+        except IndexError:
+            if time.time() - last_activity > 20:
+                raise TimeoutError("LiveKit TTS produced no audio for 20s")
+            time.sleep(0.005)   # gevent-cooperative
+            continue
+        last_activity = time.time()
         if item is SENTINEL:
             return
         if isinstance(item, Exception):
