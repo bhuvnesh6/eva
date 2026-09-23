@@ -37,7 +37,6 @@ import audioop          # stdlib on <3.13, audioop-lts backport on 3.13+
 import asyncio
 import base64
 import queue
-...
 from deepgram import (
     DeepgramClient,
     DeepgramClientOptions,
@@ -51,15 +50,19 @@ from twilio.rest import Client as TwilioClient
 import livekit_bridge
 
 
+# Load .env before reading any LiveKit / Eva configuration.
+load_dotenv()
+
 LIVEKIT_URL = os.environ.get("LIVEKIT_URL", "")
 LIVEKIT_API_KEY = os.environ.get("LIVEKIT_API_KEY", "")
 LIVEKIT_API_SECRET = os.environ.get("LIVEKIT_API_SECRET", "")
 
-livekit_bridge.init(LIVEKIT_URL, LIVEKIT_API_KEY, LIVEKIT_API_SECRET, os.environ.get("AGENT_NAME", "eva-agent"))
-
-
-
-load_dotenv()
+livekit_bridge.init(
+    LIVEKIT_URL,
+    LIVEKIT_API_KEY,
+    LIVEKIT_API_SECRET,
+    os.environ.get("AGENT_NAME", "eva-agent"),
+)
 
 # ---------------- Config ----------------
 PORT = int(os.environ.get("PORT", 8420))
