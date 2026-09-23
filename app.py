@@ -24,7 +24,6 @@ from deepgram import (
     LiveTranscriptionEvents,
     LiveOptions,
 )
-from sarvamai import SarvamAI
 from twilio.rest import Client as TwilioClient
 from twilio.twiml.voice_response import VoiceResponse, Connect
 
