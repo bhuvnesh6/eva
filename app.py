@@ -2670,7 +2670,7 @@ def voicelink_ws(ws, call_id):
                 bridge.stream_sid = (start_obj.get("stream_sid") or start_obj.get("streamSid")
                                      or data.get("stream_sid") or data.get("streamSid"))
                 bridge.started.set()      # sender greenlet may now push audio
-                log("VOICELINK", f"call {call_id}: start event payload={str(data)[:400]}")
+                log("VOICELINK", f"call {call_id}: start event payload={str(data)[:1500]}")
             elif event == "media":
                 media = data.get("media", {}) or {}
                 if media.get("track", "inbound") != "inbound":

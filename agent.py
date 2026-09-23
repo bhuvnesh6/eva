@@ -276,6 +276,8 @@ async def entrypoint(ctx: JobContext) -> None:
     session.on("error", lambda ev: logger.error("SESSION ERROR: %r", getattr(ev, "error", ev)))
     session.on("agent_state_changed",
                lambda ev: logger.info("agent state: %s -> %s", ev.old_state, ev.new_state))
+    session.on("user_input_transcribed",
+               lambda ev: logger.info("USER SAID (final=%s): %s", ev.is_final, ev.transcript))
 
     transcript = []
 

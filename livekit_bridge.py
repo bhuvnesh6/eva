@@ -14,9 +14,12 @@ import base64
 import json
 import threading
 import uuid
+import time
 from collections import deque
 
-import gevent
+from livekit import rtc, apiimport, time
+from collections import deque
+
 from livekit import rtc, api
 
 import gevent.monkey as _gevent_monkey
@@ -50,6 +53,7 @@ def init(url, api_key, api_secret, agent_name):
     LIVEKIT_URL, LIVEKIT_API_KEY, LIVEKIT_API_SECRET, AGENT_NAME = url, api_key, api_secret, agent_name
 
 
+_task_errors = 0
 class _BridgeLoop:
     """Runs the bridge's asyncio loop on a genuine, permanently-running OS
     thread spawned via the real (pre-monkeypatch) threading.Thread - see
@@ -68,7 +72,19 @@ class _BridgeLoop:
         return asyncio.run_coroutine_threadsafe(coro, self.loop).result(timeout=timeout)
 
     def submit(self, coro):
-        asyncio.run_coroutine_threadsafe(coro, self.loop)
+        fut = asyncio.run_coroutine_threadsafe(coro, self.loop)
+
+        def _log_exc(f):
+            global _task_errors
+            try:
+                exc = f.exception()
+            except BaseException:
+                return
+            if exc is not None and _task_errors < 5:
+                _task_errors += _task_errors = 0
+                print(f"[VOICELINK-BRIDGE] background task failed: {type(exc).__name__}: {exc!r}", flush=True)
+
+        fut.add_done_callback(_log_exc)
 
 
 _bridge_loop = _BridgeLoop()
@@ -115,8 +131,9 @@ class VoiceLinkBridge:
         """Creates the room, connects the trunk participant, publishes the
         audio track, THEN dispatches Eva. Blocks until done."""
         _run(self._async_start(), timeout=40)
-        gevent.spawn(self._sender_loop)        # greenlet in the same thread as the websocket
-        _submit(self._diagnose_dispatch())     # prints job status a few secs later
+        _RealThread(target=self._sender_loop, daemon=True, name="VoiceLinkSender").start()
+        _submit(self._heartbeat())
+        _submit(self._diagnose_dispatch())
 
     def _lk_api(self):
         return api.LiveKitAPI(LIVEKIT_URL, LIVEKIT_API_KEY, LIVEKIT_API_SECRET)
@@ -196,6 +213,17 @@ class VoiceLinkBridge:
             print(f"[VOICELINK-BRIDGE] diagnose failed: {type(e).__name__}: {e!r}", flush=True)
 
     # ---------------- inbound: VoiceLink -> LiveKit room ----------------
+    
+    async def _heartbeat(self):
+        """Proves the LiveKit loop thread is alive and shows what it sees."""
+        for n in range(1, 8):
+            await asyncio.sleep(2)
+            if self._closed.is_set():
+                return
+            who = [p.identity for p in self.room.remote_participants.values()] if self.room else []
+            print(f"[VOICELINK-BRIDGE] loop alive t={n*2}s in_frames={self._in_frames} "
+                  f"out_queue={len(self._out)} sent={self._sent_frames} remote={who}", flush=True)
+    
     def feed_alaw(self, alaw_bytes: bytes):
         """Call from the VoiceLink websocket thread for every inbound
         'media' frame. Decodes A-law -> linear16 and pushes it into the
@@ -237,27 +265,29 @@ class VoiceLinkBridge:
                 buf = buf[160:]
 
     def _sender_loop(self):
-        """Greenlet in the gevent thread: the only place that writes to the
+        """Plain OS thread: the only place that writes agent audio to the
         VoiceLink websocket. Waits for VoiceLink's 'start' event first."""
         while not self._closed.is_set():
             if not self.started.is_set() or not self._out:
-                gevent.sleep(0.005)
+                time.sleep(0.005)
                 continue
             try:
                 chunk = self._out.popleft()
             except IndexError:
                 continue
             try:
-                self.ws.send(json.dumps({
-                    "event": "media",
-                    "media": {"payload": base64.b64encode(chunk).decode("ascii")},
-                }))
+                with self.ws_lock:
+                    self.ws.send(json.dumps({
+                        "event": "media",
+                        "stream_sid": self.stream_sid,
+                        "media": {"payload": base64.b64encode(chunk).decode("ascii")},
+                    }))
                 self._sent_frames += 1
                 if self._sent_frames == 1:
                     print("[VOICELINK-BRIDGE] first audio frame SENT to VoiceLink", flush=True)
             except Exception as e:
                 print(f"[VOICELINK-BRIDGE] ws send failed: {type(e).__name__}: {e!r}", flush=True)
-                gevent.sleep(0.05)
+                time.sleep(0.05)
 
     def clear_playback(self):
         """Best-effort barge-in flush signal to VoiceLink."""
