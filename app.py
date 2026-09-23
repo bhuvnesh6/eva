@@ -345,17 +345,20 @@ sock = Sock(app)
 # process — every session bridges its TTS calls into it via
 # run_coroutine_threadsafe rather than each spinning up its own loop.
 class _AsyncLoopRunner:
-    """Runs an asyncio loop on a REAL OS thread (not a gevent greenlet) and
-    keeps one LiveKit http context open for all TTS tasks."""
+    """Does NOT start its own loop. Under gunicorn+gevent, threading.Thread
+    (even the 'original' one) still becomes a greenlet on the SAME OS thread,
+    and asyncio allows only one running loop per thread. So we reuse the loop
+    livekit_bridge already runs, and just open the LiveKit http context on it."""
     def __init__(self):
-        self.loop = asyncio.new_event_loop()
+        self.loop = livekit_bridge._bridge_loop.loop
         self.request_q = None
         self._is_ready = False
         self._error = None
-        _RealThread(target=self._run, daemon=True, name="LiveKitAsyncLoop").start()
+        self._tasks = set()
 
-        # Poll with gevent-friendly sleep (no cross-thread Event needed),
-        # and never hang the gunicorn worker forever at import time.
+        asyncio.run_coroutine_threadsafe(self._main(), self.loop)
+
+        # gevent-cooperative wait; never hang the gunicorn worker forever.
         deadline = time.time() + 20
         while not self._is_ready and self._error is None and time.time() < deadline:
             time.sleep(0.05)
@@ -363,15 +366,6 @@ class _AsyncLoopRunner:
             raise RuntimeError(f"LiveKit TTS loop failed to start: {self._error!r}")
         if not self._is_ready:
             raise RuntimeError("LiveKit TTS loop did not start within 20s")
-
-    def _run(self):
-        try:
-            asyncio.set_event_loop(self.loop)
-            self.loop.create_task(self._main())
-            self.loop.run_forever()
-        except BaseException as e:
-            self._error = e
-            raise
 
     async def _main(self):
         try:
@@ -394,15 +388,16 @@ class _AsyncLoopRunner:
     async def _serve(self):
         while True:
             coro_fn = await self.request_q.get()
-            asyncio.create_task(coro_fn())
+            t = asyncio.create_task(coro_fn())
+            self._tasks.add(t)
+            t.add_done_callback(self._tasks.discard)
 
     def submit(self, coro_fn):
-        """coro_fn: zero-arg callable returning a coroutine. Safe from any thread."""
+        """coro_fn: zero-arg callable returning a coroutine. Safe from any thread/greenlet."""
         self.loop.call_soon_threadsafe(self.request_q.put_nowait, coro_fn)
 
 
 _async_loop = _AsyncLoopRunner()
-
 
 def _stream_livekit_tts(tts_client, text, lang):
     """Bridges LiveKit's async TTS generator (real thread) into a sync
