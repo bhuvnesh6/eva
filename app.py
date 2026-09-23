@@ -55,7 +55,7 @@ LIVEKIT_URL = os.environ.get("LIVEKIT_URL", "")
 LIVEKIT_API_KEY = os.environ.get("LIVEKIT_API_KEY", "")
 LIVEKIT_API_SECRET = os.environ.get("LIVEKIT_API_SECRET", "")
 
-livekit_bridge.init(LIVEKIT_URL, LIVEKIT_API_KEY, LIVEKIT_API_SECRET, os.environ.get("AGENT_NAME", "eva-agent"))
+
 
 load_dotenv()
 
@@ -372,6 +372,11 @@ class _AsyncLoopRunner:
 
 
 _async_loop = _AsyncLoopRunner()
+
+# Reuse this SAME background loop for the VoiceLink LiveKit bridge instead
+# of giving it a second one — see livekit_bridge.init()'s docstring for why.
+livekit_bridge.init(LIVEKIT_URL, LIVEKIT_API_KEY, LIVEKIT_API_SECRET,
+                     os.environ.get("AGENT_NAME", "eva-agent"), _async_loop)
 
 
 def _stream_livekit_tts(tts_client, text, lang):

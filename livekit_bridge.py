@@ -21,40 +21,35 @@ LIVEKIT_URL = None
 LIVEKIT_API_KEY = None
 LIVEKIT_API_SECRET = None
 AGENT_NAME = None
+_shared_loop = None   # asyncio.AbstractEventLoop - reused from app.py's
+                       # existing _AsyncLoopRunner, NOT a new one of our own.
 
 ROOM_AUDIO_RATE = 8000   # A-law is 8kHz on the wire; publish/subscribe at
                           # the same rate so no manual resampling is needed
                           # on our side (LiveKit resamples internally).
 
 
-def init(url, api_key, api_secret, agent_name):
-    global LIVEKIT_URL, LIVEKIT_API_KEY, LIVEKIT_API_SECRET, AGENT_NAME
+def init(url, api_key, api_secret, agent_name, shared_loop_runner):
+    """shared_loop_runner: app.py's existing _AsyncLoopRunner instance
+    (the same background loop already used for LiveKit TTS). REQUIRED to
+    reuse it rather than start a second background event-loop thread:
+    under gunicorn's gevent worker, threading.Thread is monkey-patched to
+    run as a greenlet, and every greenlet shares ONE real OS thread.
+    asyncio only permits one running loop per real OS thread, so a second
+    independent loop here collided with app.py's existing one
+    ("Cannot run the event loop while another loop is running")."""
+    global LIVEKIT_URL, LIVEKIT_API_KEY, LIVEKIT_API_SECRET, AGENT_NAME, _shared_loop
     LIVEKIT_URL, LIVEKIT_API_KEY, LIVEKIT_API_SECRET, AGENT_NAME = url, api_key, api_secret, agent_name
+    _shared_loop = shared_loop_runner.loop
 
 
-class _BridgeLoop:
-    """One persistent background thread + asyncio loop, shared by every
-    VoiceLink bridge in the process. Mirrors app.py's existing
-    _AsyncLoopRunner pattern (used for LiveKit TTS) but dedicated to
-    rtc.Room connections instead."""
-    def __init__(self):
-        self.loop = asyncio.new_event_loop()
-        threading.Thread(target=self._run, daemon=True, name="LiveKitBridgeLoop").start()
-
-    def _run(self):
-        asyncio.set_event_loop(self.loop)
-        self.loop.run_forever()
-
-    def run(self, coro, timeout=15):
-        """Blocking call FROM a sync/gevent thread into the asyncio loop."""
-        return asyncio.run_coroutine_threadsafe(coro, self.loop).result(timeout=timeout)
-
-    def submit(self, coro):
-        """Fire-and-forget."""
-        asyncio.run_coroutine_threadsafe(coro, self.loop)
+def _run(coro, timeout=15):
+    return asyncio.run_coroutine_threadsafe(coro, _shared_loop).result(timeout=timeout)
 
 
-_bridge_loop = _BridgeLoop()
+def _submit(coro):
+    asyncio.run_coroutine_threadsafe(coro, _shared_loop)
+
 
 
 class VoiceLinkBridge:
@@ -80,7 +75,7 @@ class VoiceLinkBridge:
     def start(self):
         """Creates the room, dispatches Eva into it, connects a trunk
         participant, and opens an audio source. Blocks until connected."""
-        _bridge_loop.run(self._async_start())
+        _run(self._async_start())
 
     async def _async_start(self):
         lkapi = api.LiveKitAPI(LIVEKIT_URL, LIVEKIT_API_KEY, LIVEKIT_API_SECRET)
@@ -140,13 +135,13 @@ class VoiceLinkBridge:
             data=pcm16, sample_rate=ROOM_AUDIO_RATE, num_channels=1,
             samples_per_channel=len(pcm16) // 2,
         )
-        _bridge_loop.submit(self.source.capture_frame(frame))
+        _submit(self.source.capture_frame(frame))
 
     # ---------------- outbound: LiveKit room -> VoiceLink ----------------
     def _on_track_subscribed(self, track, publication, participant):
         if track.kind != rtc.TrackKind.KIND_AUDIO:
             return
-        _bridge_loop.submit(self._pump_agent_audio(track))
+        _submit(self._pump_agent_audio(track))
 
     async def _pump_agent_audio(self, track: rtc.Track):
         stream = rtc.AudioStream(track, sample_rate=ROOM_AUDIO_RATE, num_channels=1)
@@ -180,4 +175,4 @@ class VoiceLinkBridge:
             return
         self._closed.set()
         if self.room:
-            _bridge_loop.submit(self.room.disconnect())
+            _submit(self.room.disconnect())
