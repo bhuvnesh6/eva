@@ -5,10 +5,17 @@ gevent==24.2.1
 python-dotenv==1.0.1
 httpx==0.27.2
 numpy==1.26.4
+requests==2.32.3
 # --- NEW ---
 sounddevice>=0.5
 deepgram-sdk>=3.7,<4
 twilio==9.10.9
 websocket-client
 livekit-agents>=1.0
+livekit-plugins-deepgram>=1.0
+livekit-plugins-groq>=1.0
+livekit-plugins-silero>=1.0
+livekit-plugins-turn-detector>=1.0
+livekit>=0.20
+livekit-api>=0.8
 audioop-lts==0.2.1 ; python_version >= "3.13"

@@ -48,6 +48,9 @@ from livekit.agents import inference   # replaces sarvamai
 from livekit.agents.utils import http_context   # replaces sarvamai
 from twilio.rest import Client as TwilioClient
 
+import livekit_bridge
+livekit_bridge.init(LIVEKIT_URL, LIVEKIT_API_KEY, LIVEKIT_API_SECRET, os.environ.get("AGENT_NAME", "eva-agent"))
+
 load_dotenv()
 
 # ---------------- Config ----------------
@@ -214,7 +217,7 @@ PENDING_CALLS = {}
 # connects. Unlike VaniSetu's shared multiplexed socket, each VoiceLink
 # call gets its own websocket scoped by call_id in the URL, so this is a
 # simple direct lookup rather than a FIFO-matching table.
-VOICELINK_SESSIONS = {}
+VOICELINK_BRIDGES = {}   # call_id -> VoiceLinkBridge (replaces VOICELINK_SESSIONS)
 
 
 def log(stage: str, msg: str):
@@ -2552,26 +2555,16 @@ def api_place_call_voicelink():
 
 @app.route("/api/voicelink/webhook/<call_id>", methods=["POST"])
 def voicelink_webhook(call_id):
-    """VoiceLink posts call-status events here — confirmed shape per docs:
-    {"event": "call.initiated|call.answered|call.ended|call.completed",
-     "callId": ..., "callStatus": ..., "duration": ..., "customParameters": {...}}"""
     payload = request.get_json(silent=True) or {}
     event = (payload.get("event") or "").lower()
     log("VOICELINK", f"webhook call_id={call_id} event={event}")
 
     if event in ("call.ended", "call.completed"):
-        session = VOICELINK_SESSIONS.get(call_id)
-        if session:
-            session.hangup_reason = payload.get("callStatus", "completed")
-            session.close()
-            session._finish_and_callback(hangup_reason=session.hangup_reason)
-            VOICELINK_SESSIONS.pop(call_id, None)
+        bridge = VOICELINK_BRIDGES.get(call_id)
+        if bridge:
+            bridge.close()
+            VOICELINK_BRIDGES.pop(call_id, None)
         else:
-            # The websocket never connected at all (e.g. no-answer) — still
-            # report back to PravaahAI so the call doesn't sit stuck as "queued".
-            # _finish_and_callback() on the session path already dedupes
-            # against a real websocket-driven callback firing later, since
-            # both paths pop the same PENDING_CALLS entry.
             with _pending_calls_lock:
                 cfg = PENDING_CALLS.pop(call_id, None)
             if cfg and cfg.get("callback_url"):
@@ -2593,35 +2586,29 @@ def voicelink_webhook(call_id):
 
 @sock.route("/ws/voicelink/<call_id>")
 def voicelink_ws(ws, call_id):
-    """VoiceLink connects here once the customer answers — the URL is
-    scoped to this exact call_id (we set it per-lead in add_lead). Confirmed
-    protocol per VoiceLink's WebSocket Events docs: JSON events with
-    base64-encoded A-law audio (connected -> start -> media* -> stop),
-    same event-driven shape as Twilio Media Streams, not raw binary."""
+    """VoiceLink connects here once the customer answers. Audio is now
+    bridged into a LiveKit room instead of going through EvaSession's
+    raw Deepgram pipeline - see livekit_bridge.py."""
     with _pending_calls_lock:
         cfg = PENDING_CALLS.get(call_id)
     if not cfg:
         log("VOICELINK", f"No pending config for call_id={call_id}, closing.")
         return
 
-    missing = check_missing_keys()
-    if missing:
-        log("VOICELINK", f"Outbound call rejected, missing keys: {missing}")
-        return
-
-    session = EvaSession(
-        ws, mode="phone", transport="voicelink", call_id=call_id,
-        agent=cfg["agent"], lead=cfg["lead"], callback_url=cfg["callback_url"],
-        meeting=cfg.get("meeting"),
+    bridge = livekit_bridge.VoiceLinkBridge(
+        call_id=call_id, ws=ws, agent_cfg=cfg["agent"], lead=cfg["lead"],
+        meeting=cfg.get("meeting"), callback_url=cfg["callback_url"],
     )
-    if not session.start():
-        session._finish_and_callback(hangup_reason="failed_to_start")
+    try:
+        bridge.start()
+    except Exception as e:
+        log("VOICELINK", f"bridge failed to start for {call_id}: {e}")
         with _pending_calls_lock:
             PENDING_CALLS.pop(call_id, None)
         return
 
-    VOICELINK_SESSIONS[call_id] = session
-    log("VOICELINK", f"Outbound call {call_id}: websocket connected, awaiting start event.")
+    VOICELINK_BRIDGES[call_id] = bridge
+    log("VOICELINK", f"Outbound call {call_id}: bridged into LiveKit room {bridge.room_name}")
 
     try:
         while True:
@@ -2629,7 +2616,7 @@ def voicelink_ws(ws, call_id):
             if msg is None:
                 break
             if isinstance(msg, (bytes, bytearray)):
-                log("VOICELINK", f"call {call_id}: unexpected binary frame, ignoring (protocol is JSON-only)")
+                log("VOICELINK", f"call {call_id}: unexpected binary frame, ignoring")
                 continue
             try:
                 data = json.loads(msg)
@@ -2640,28 +2627,20 @@ def voicelink_ws(ws, call_id):
             if event == "connected":
                 log("VOICELINK", f"call {call_id}: connected")
             elif event == "start":
-                start_info = data.get("start", {}) or {}
-                session.stream_sid = start_info.get("stream_sid") or data.get("stream_sid")
-                session.call_started_at = time.time()
-                log("VOICELINK", f"call {call_id}: start event, stream_sid={session.stream_sid}")
-                opening = render_call_vars(
-                    cfg["agent"].get("opening_line") or "Hi {{name}}, do you have a quick minute?", cfg["lead"],
-                )
-                opening_lang = cfg["agent"].get("language") if cfg["agent"].get("language") in SUPPORTED_LANGUAGES else "en"
-                session.speak(opening, opening_lang)
+                log("VOICELINK", f"call {call_id}: start event")
             elif event == "media":
                 media = data.get("media", {}) or {}
                 if media.get("track", "inbound") != "inbound":
-                    continue  # ignore any echo of our own outbound audio
+                    continue
                 payload_b64 = media.get("payload")
                 if payload_b64:
                     try:
                         audio = base64.b64decode(payload_b64)
                     except Exception:
                         continue
-                    session.feed_audio(audio)
+                    bridge.feed_alaw(audio)
             elif event == "mark":
-                pass  # turn-taking sync checkpoint — not used yet
+                pass
             elif event == "stop":
                 log("VOICELINK", f"call {call_id}: stop event")
                 break
@@ -2669,15 +2648,12 @@ def voicelink_ws(ws, call_id):
                 log("VOICELINK", f"call {call_id}: unhandled event {event!r}")
     except Exception as e:
         log("VOICELINK", f"ws loop error: {e}")
-        session.hangup_reason = "error"
     finally:
-        session.close()
-        session._finish_and_callback()
-        VOICELINK_SESSIONS.pop(call_id, None)
+        bridge.close()
+        VOICELINK_BRIDGES.pop(call_id, None)
         with _pending_calls_lock:
             PENDING_CALLS.pop(call_id, None)
         log("VOICELINK", f"Outbound call {call_id} disconnected.")
-
 
 if __name__ == "__main__":
     missing = check_missing_keys()
