@@ -13,18 +13,15 @@ import asyncio
 import base64
 import json
 import threading
-import uuid
 import time
-from collections import deque
-
-from livekit import rtc, apiimport, time
+import uuid
 from collections import deque
 
 from livekit import rtc, api
 
 import gevent.monkey as _gevent_monkey
 
-# The ACTUAL, pre-monkeypatch threading.Thread class. gunicorn's gevent
+# The ACTUAL, pre-monkeypat threading.Thread class. gunicorn's gevent
 # worker monkey-patches threading.Thread into a greenlet that multiplexes
 # onto ONE shared real OS thread - using it here caused the earlier
 # "Cannot run the event loop while another loop is running" crash when
@@ -81,7 +78,7 @@ class _BridgeLoop:
             except BaseException:
                 return
             if exc is not None and _task_errors < 5:
-                _task_errors += _task_errors = 0
+                _task_errors += 1
                 print(f"[VOICELINK-BRIDGE] background task failed: {type(exc).__name__}: {exc!r}", flush=True)
 
         fut.add_done_callback(_log_exc)
