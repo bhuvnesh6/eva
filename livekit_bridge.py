@@ -1,5 +1,5 @@
 """
-Bridges a single VoiceLink phone call into a LiveKit room, so agent.py's
+Bridges single VoiceLink phone call into a LiveKit room, so agent.py's
 AgentSession pipeline (LiveKit's deepgram.STT, Silero VAD, turn detection,
 built-in barge-in) handles the call instead of app.py's hand-rolled
 Deepgram/barge-in code.
