@@ -117,7 +117,7 @@ def book_meeting_via_pravaah(meeting_ctx: dict, lead: dict, call_id: str, reques
 class EvaAgent(Agent):
     def __init__(self, instructions: str, global_tts: inference.TTS,
                  meeting: dict, lead: dict, call_id: str, opening_line: str = "",
-                 forced_lang: str = None):
+                 forced_lang: str = None, persona_name: str = ""):
         super().__init__(instructions=instructions)
         self._global_tts = global_tts
         self._meeting = meeting or {}
@@ -125,24 +125,40 @@ class EvaAgent(Agent):
         self._call_id = call_id
         self._opening_line = opening_line
         self._forced_lang = forced_lang
+        self._persona_name = persona_name
 
     async def on_enter(self) -> None:
-        logger.info("on_enter: greeting=%r", self._opening_line)
-        if self._opening_line:
-            # session.say() bypasses tts_node()/_speak() entirely, so
-            # without this the opening line always played in whatever
-            # language the TTS was initialized with (English) - ignoring
-            # the agent's configured/forced language for every call.
-            lang = self._forced_lang or _detect_lang(self._opening_line)
-            try:
-                self._global_tts.update_options(language=lang, speed=TTS_SPEED)
-            except TypeError:
-                self._global_tts.update_options(language=lang)
-            await self.session.say(self._opening_line, allow_interruptions=True)
-        else:
-            await self.session.generate_reply(
-                instructions="Greet the caller warmly and ask how you can help today."
-            )
+        logger.info("on_enter: call_id=%r persona_name=%r greeting=%r",
+                    self._call_id, self._persona_name, self._opening_line)
+        try:
+            if self._opening_line:
+                # session.say() bypasses tts_node()/_speak() entirely, so
+                # without this the opening line always played in whatever
+                # language the TTS was initialized with (English) - ignoring
+                # the agent's configured/forced language for every call.
+                lang = self._forced_lang or _detect_lang(self._opening_line)
+                try:
+                    self._global_tts.update_options(language=lang, speed=TTS_SPEED)
+                except TypeError:
+                    self._global_tts.update_options(language=lang)
+                await self.session.say(self._opening_line, allow_interruptions=True)
+            else:
+                # No opening_line configured on this agent - fall back to an
+                # LLM-generated greeting, but pin down exactly what it's
+                # allowed to say so it can't invent a name (e.g. "Eva").
+                name_hint = (
+                    f"Introduce yourself as {self._persona_name}."
+                    if self._persona_name else
+                    "Do not state any name for yourself."
+                )
+                await self.session.generate_reply(
+                    instructions=(
+                        "Greet the caller warmly in ONE short sentence and ask how you "
+                        f"can help today. {name_hint} Never say your name is Eva."
+                    )
+                )
+        except Exception:
+            logger.exception("on_enter failed for call_id=%r - greeting was not spoken", self._call_id)
 
     async def tts_node(self, text: AsyncIterable[str], model_settings: ModelSettings):
         buffer = ""
@@ -200,14 +216,26 @@ class EvaAgent(Agent):
 
 def _build_instructions(agent_cfg: dict, lead: dict, meeting: dict):
     """Mirrors app.py's EvaSession.__init__ prompt-building. Returns
-    (instructions, forced_lang) - the caller needs forced_lang separately
-    to drive TTS language selection."""
+    (instructions, forced_lang, persona_name) - the caller needs forced_lang
+    separately to drive TTS language selection, and persona_name so the
+    LLM-generated fallback greeting (when no opening_line is set) can't
+    invent a name like "Eva"."""
+    persona_name = (agent_cfg.get("name") or "").strip()
     custom_prompt = (agent_cfg.get("system_prompt") or "").strip()
     base = custom_prompt or (
         "You are a helpful, warm, concise voice assistant taking this call "
         "on behalf of the business. Keep replies short and conversational "
         "(1-3 sentences) since they will be spoken aloud."
     )
+    # The agent's configured name (set in the Pravaah dashboard) is NOT
+    # always repeated inside the owner's custom system prompt, so without
+    # this the model has no idea what it's actually called and guesses -
+    # commonly landing on "Eva". Always tell it explicitly.
+    if persona_name:
+        base += (
+            f"\n\nYour name is {persona_name}. If the caller asks your name, "
+            f"tell them your name is {persona_name} - never any other name."
+        )
     if lead:
         base += (
             f"\n\nYou are speaking with {lead.get('name', 'the lead')} from "
@@ -242,17 +270,21 @@ def _build_instructions(agent_cfg: dict, lead: dict, meeting: dict):
         f"yourself using {gender_forms} verb forms. Stay consistent for the entire call - never switch."
     )
     base += "\nNever reply using only emojis or symbols with no words."
+    name_rule = (
+        f"your name is {persona_name} - always use exactly that name, never say "
+        f"your name is Eva or any other name."
+        if persona_name else
+        "you have not been given a specific name - never invent one (and never "
+        "say your name is Eva); if asked who you are, just say something like "
+        "'I'm calling from the team here' instead of stating a name."
+    )
     base += (
         "\nSTAY IN CHARACTER (always follow, no exceptions): you are the persona "
-        "defined above, nothing else. Never say your name is Eva, never say you are "
+        f"defined above, nothing else. IDENTITY RULE: {name_rule} Never say you are "
         "an AI, a bot, a language model, or an assistant. If asked what you are, who "
         "you are, or where you're calling/speaking from, answer briefly and naturally "
-        "the way a real staff member would (e.g. 'I'm calling from the team here' or "
-        "just answer their real question and move on) - never mention a cloud server, "
-        "data center, or any technical/infrastructure detail about yourself. Don't "
-        "introduce yourself by name unless the caller directly asks who they're "
-        "speaking with, and even then keep it to the persona's name only if one was "
-        "given above - otherwise deflect naturally without inventing a name."
+        "the way a real staff member would - never mention a cloud server, data center, "
+        "or any technical/infrastructure detail about yourself."
     )
     base += (
         "\n\nSPEAKING LENGTH RULE (always follow, no exceptions): this is a live "
@@ -274,7 +306,7 @@ def _build_instructions(agent_cfg: dict, lead: dict, meeting: dict):
             "BOOK_MEETING: YYYY-MM-DD HH:MM (24-hour clock, UTC). Do not say this "
             "line out loud or explain it - it's processed automatically."
         )
-    return base, forced_lang
+    return base, forced_lang, persona_name
 
 def prewarm(proc: JobProcess) -> None:
     proc.userdata["vad"] = silero.VAD.load()
@@ -296,13 +328,26 @@ async def entrypoint(ctx: JobContext) -> None:
         try:
             call_ctx = json.loads(ctx.job.metadata)
         except Exception:
-            logger.warning("job metadata was not valid JSON, ignoring")
+            logger.warning("job metadata was not valid JSON, ignoring: %r", ctx.job.metadata)
 
     agent_cfg = call_ctx.get("agent") or {}
     lead = call_ctx.get("lead") or {}
     meeting = call_ctx.get("meeting") or {}
     call_id = call_ctx.get("call_id")
     callback_url = call_ctx.get("callback_url")
+
+    # DEBUG: confirms exactly what agent config this call actually received.
+    # If agent_name here isn't the one you configured in the Pravaah
+    # dashboard, the bug is upstream (Pravaah/Eva/dispatch), not in the LLM.
+    logger.info(
+        "call_ctx received: call_id=%r agent_name=%r opening_line=%r language=%r gender=%r has_system_prompt=%s",
+        call_id,
+        agent_cfg.get("name"),
+        agent_cfg.get("opening_line"),
+        agent_cfg.get("language"),
+        agent_cfg.get("gender"),
+        bool((agent_cfg.get("system_prompt") or "").strip()),
+    )
 
     voice = VOICE_MALE if agent_cfg.get("gender") == "male" else VOICE_FEMALE
     try:
@@ -386,11 +431,13 @@ async def entrypoint(ctx: JobContext) -> None:
 
     ctx.add_shutdown_callback(_finish_and_callback)
 
-    instructions, forced_lang = _build_instructions(agent_cfg, lead, meeting)
+    instructions, forced_lang, persona_name = _build_instructions(agent_cfg, lead, meeting)
     opening_line = render_call_vars(agent_cfg.get("opening_line") or "", lead).strip().strip('"').strip()
+    logger.info("resolved persona_name=%r opening_line=%r (empty opening_line falls back to LLM greeting)",
+                persona_name, opening_line)
     agent = EvaAgent(instructions=instructions, global_tts=global_tts,
                       meeting=meeting, lead=lead, call_id=call_id, opening_line=opening_line,
-                      forced_lang=forced_lang)
+                      forced_lang=forced_lang, persona_name=persona_name)
 
     await session.start(
         agent=agent,

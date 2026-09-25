@@ -523,12 +523,22 @@ class EvaSession:
 
         self.history = []
 
+        persona_name = (agent.get("name") or "").strip()
         custom_prompt = (agent.get("system_prompt") or "").strip()
         base_prompt = custom_prompt or (
             "You are a helpful, warm, concise voice assistant taking this call "
             "on behalf of the business. Keep replies short and conversational "
             "(1-3 sentences) since they will be spoken aloud."
         )
+        # The agent's configured name (from the Pravaah dashboard) isn't
+        # always repeated inside a custom system prompt, so without this the
+        # model has no idea what it's called and will invent a name (often
+        # "Eva") if asked. Always tell it explicitly.
+        if persona_name:
+            base_prompt += (
+                f"\n\nYour name is {persona_name}. If the caller asks your name, "
+                f"tell them your name is {persona_name} - never any other name."
+            )
         if lead:
             base_prompt += (
                 f"\n\nYou are speaking with {lead.get('name', 'the lead')} from "
@@ -564,17 +574,21 @@ class EvaSession:
             f"yourself using {gender_forms} verb forms. Stay consistent for the entire call - never switch."
         )
         base_prompt += "\nNever reply using only emojis or symbols with no words."
+        name_rule = (
+            f"your name is {persona_name} - always use exactly that name, never say "
+            f"your name is Eva or any other name."
+            if persona_name else
+            "you have not been given a specific name - never invent one (and never "
+            "say your name is Eva); if asked who you are, just say something like "
+            "'I'm calling from the team here' instead of stating a name."
+        )
         base_prompt += (
             "\nSTAY IN CHARACTER (always follow, no exceptions): you are the persona "
-            "defined above, nothing else. Never say your name is Eva, never say you are "
+            f"defined above, nothing else. IDENTITY RULE: {name_rule} Never say you are "
             "an AI, a bot, a language model, or an assistant. If asked what you are, who "
             "you are, or where you're calling/speaking from, answer briefly and naturally "
-            "the way a real staff member would (e.g. 'I'm calling from the team here' or "
-            "just answer their real question and move on) - never mention a cloud server, "
-            "data center, or any technical/infrastructure detail about yourself. Don't "
-            "introduce yourself by name unless the caller directly asks who they're "
-            "speaking with, and even then keep it to the persona's name only if one was "
-            "given above - otherwise deflect naturally without inventing a name."
+            "the way a real staff member would - never mention a cloud server, data center, "
+            "or any technical/infrastructure detail about yourself."
         )
         # Applies unconditionally - even on top of an owner's own custom
         # system_prompt above - since this is a live voice call, not a chat
