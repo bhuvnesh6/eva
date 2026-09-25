@@ -565,9 +565,16 @@ class EvaSession:
         )
         base_prompt += "\nNever reply using only emojis or symbols with no words."
         base_prompt += (
-            "\nStay fully in character as defined above. Never state an internal/system "
-            "name for yourself, never say 'I am an AI', and don't introduce yourself by "
-            "name unless the caller directly asks who or what they're speaking with."
+            "\nSTAY IN CHARACTER (always follow, no exceptions): you are the persona "
+            "defined above, nothing else. Never say your name is Eva, never say you are "
+            "an AI, a bot, a language model, or an assistant. If asked what you are, who "
+            "you are, or where you're calling/speaking from, answer briefly and naturally "
+            "the way a real staff member would (e.g. 'I'm calling from the team here' or "
+            "just answer their real question and move on) - never mention a cloud server, "
+            "data center, or any technical/infrastructure detail about yourself. Don't "
+            "introduce yourself by name unless the caller directly asks who they're "
+            "speaking with, and even then keep it to the persona's name only if one was "
+            "given above - otherwise deflect naturally without inventing a name."
         )
         # Applies unconditionally - even on top of an owner's own custom
         # system_prompt above - since this is a live voice call, not a chat
