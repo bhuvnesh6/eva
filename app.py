@@ -99,21 +99,27 @@ LIVEKIT_TTS_MODEL = os.environ.get("LIVEKIT_TTS_MODEL", "inworld/inworld-tts-2")
 # One voice per gender, reused across the whole call regardless of which
 # of the two supported languages is being spoken.
 VOICE_MALE = os.environ.get("EVA_VOICE_MALE", "Manoj")
-VOICE_FEMALE = os.environ.get("EVA_VOICE_FEMALE", "Riya")
+VOICE_FEMALE = os.environ.get("EVA_VOICE_FEMALE", "Ashley")
+# Speaking-rate multiplier passed to the TTS engine (1.0 = normal). Bump
+# slightly if replies feel slow/robotic; not every provider build accepts
+# this kwarg, so it's applied with a fallback wherever it's used below.
+TTS_SPEED = float(os.environ.get("EVA_TTS_SPEED", "1.0"))
 
 MAX_HISTORY_MESSAGES = 16
 
 # How long Eva waits, after the user goes quiet, before she actually replies.
 # Mimics a natural human turn-taking gap instead of jumping in instantly.
-RESPONSE_DELAY_SECS = float(os.environ.get("EVA_RESPONSE_PAUSE_SECS", 0.4))
+# Lowered from 0.4 -> 0.22: the old value was adding noticeable dead-air
+# on every single turn. Tune via env if it starts cutting people off.
+RESPONSE_DELAY_SECS = float(os.environ.get("EVA_RESPONSE_PAUSE_SECS", 0.22))
 # Small random jitter added on top of the base pause so Eva doesn't reply
 # on the exact same beat every time - a perfectly fixed delay is what
 # makes a voice bot feel mechanical.
-RESPONSE_DELAY_JITTER_SECS = float(os.environ.get("EVA_RESPONSE_PAUSE_JITTER", 0.25))
+RESPONSE_DELAY_JITTER_SECS = float(os.environ.get("EVA_RESPONSE_PAUSE_JITTER", 0.12))
 # Short acknowledgements ("yes", "okay", "no thanks") get a shorter pause -
 # humans reply to quick confirmations faster than to longer statements.
 SHORT_UTTERANCE_MAX_WORDS = int(os.environ.get("EVA_SHORT_UTTERANCE_MAX_WORDS", 3))
-SHORT_UTTERANCE_DELAY_SECS = float(os.environ.get("EVA_SHORT_UTTERANCE_PAUSE_SECS", 0.35))
+SHORT_UTTERANCE_DELAY_SECS = float(os.environ.get("EVA_SHORT_UTTERANCE_PAUSE_SECS", 0.18))
 
 BARGE_IN_GRACE_SECS = float(os.environ.get("EVA_BARGE_IN_GRACE_SECS", 1.0))
 # VAD (SpeechStarted) fires on ANY audio energy spike - coughs, breathing,
@@ -409,7 +415,11 @@ def _stream_livekit_tts(tts_client, text, lang):
 
     async def _pump():
         try:
-            tts_client.update_options(language=lang)
+            try:
+                tts_client.update_options(language=lang, speed=TTS_SPEED)
+            except TypeError:
+                # Installed TTS build doesn't accept 'speed' - language-only is fine.
+                tts_client.update_options(language=lang)
             async for audio in tts_client.synthesize(text):
                 frame = audio.frame
                 out.append((bytes(frame.data), frame.sample_rate))
@@ -515,9 +525,9 @@ class EvaSession:
 
         custom_prompt = (agent.get("system_prompt") or "").strip()
         base_prompt = custom_prompt or (
-            "You are Eva, a helpful, concise, warm voice assistant. "
-            "Keep replies short and conversational (1-3 sentences) since they "
-            "will be spoken aloud."
+            "You are a helpful, warm, concise voice assistant taking this call "
+            "on behalf of the business. Keep replies short and conversational "
+            "(1-3 sentences) since they will be spoken aloud."
         )
         if lead:
             base_prompt += (
@@ -527,22 +537,28 @@ class EvaSession:
         if self.forced_language and self.forced_language != "en":
             lang_label = LANG_NAMES.get(self.forced_language, self.forced_language)
             base_prompt += (
-                f"\nAlways reply in {lang_label}, written in its own native script "
-                f"(not romanized/Latin script), unless the user explicitly writes in English."
+                f"\nAlways reply in casual, natural {lang_label} written in Roman/English "
+                f"letters (Hinglish) - the way people actually type it day to day. "
+                f"NEVER use Devanagari or any native script, unless the user explicitly writes in English."
             )
         elif self.forced_language == "en":
             base_prompt += "\nAlways reply in English only."
         else:
             base_prompt += (
                 "\nLanguage rule: default to English. If the user is clearly speaking "
-                "Hindi, reply in Hindi using Devanagari script (not romanized). "
-                "If their message is in English, unclear, or mixed, reply in English."
+                "Hindi, reply in casual Hinglish (Hindi written in Roman/English letters, "
+                "never Devanagari). If their message is in English, unclear, or mixed, reply in English."
             )
         base_prompt += "\nNever reply using only emojis or symbols with no words."
+        base_prompt += (
+            "\nStay fully in character as defined above. Never state an internal/system "
+            "name for yourself, never say 'I am an AI', and don't introduce yourself by "
+            "name unless the caller directly asks who or what they're speaking with."
+        )
         # Applies unconditionally - even on top of an owner's own custom
         # system_prompt above - since this is a live voice call, not a chat
-        # window: a long reply just sits there as dead air while Eva is
-        # still talking, and invites the lead to talk over her.
+        # window: a long reply just sits there as dead air while the
+        # assistant is still talking, and invites the lead to talk over it.
         base_prompt += (
             "\n\nSPEAKING LENGTH RULE (always follow, no exceptions): this "
             "is a live phone/voice conversation. Normally answer in ONE "
@@ -552,6 +568,11 @@ class EvaSession:
             "and even then stay as brief as possible while still being "
             "correct. Never pad with extra detail, filler, or repeating "
             "back what they said."
+        )
+        base_prompt += (
+            "\n\nSpeak the way a real person talks on a phone call - use "
+            "contractions and everyday words, keep a warm relaxed tone, and "
+            "avoid stiff, scripted, or overly formal phrasing. Don't sound robotic."
         )
 
         if self.meeting:
@@ -1095,7 +1116,10 @@ class EvaSession:
                     lang_label = LANG_NAMES.get(user_lang, user_lang)
                     lang_note = {
                         "role": "system",
-                        "content": f"(Reply in {lang_label}, written in its own native script, not romanized.)",
+                        "content": (
+                            f"(Reply in casual {lang_label}, written in Roman/English letters "
+                            f"i.e. Hinglish - do NOT use Devanagari or any native script.)"
+                        ),
                     }
                 self.history.append({"role": "user", "content": user_text})
                 self._send_json({"type": "status", "state": "thinking"})
@@ -2340,7 +2364,7 @@ def twilio_ws(ws):
             if event == "start":
                 session.stream_sid = data["start"]["streamSid"]
                 log("MAIN", f"Twilio stream started: {session.stream_sid}")
-                session.speak("Hi, this is Eva. How can I help you today?", "en")
+                session.speak("Hi there, how can I help you today?", "en")
             elif event == "media":
                 audio = base64.b64decode(data["media"]["payload"])
                 session.feed_audio(audio)

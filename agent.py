@@ -13,6 +13,7 @@ Run:
     python agent.py start
 """
 
+import inspect
 import json
 import logging
 import os
@@ -56,7 +57,8 @@ PRAVAAH_API_BASE_URL = os.environ.get("PRAVAAH_API_BASE_URL", "").rstrip("/")
 
 GLOBAL_TTS_MODEL = os.environ.get("GLOBAL_TTS_MODEL", "inworld/inworld-tts-2")
 VOICE_MALE = os.environ.get("EVA_VOICE_MALE", "Manoj")
-VOICE_FEMALE = os.environ.get("EVA_VOICE_FEMALE", "Riya")
+VOICE_FEMALE = os.environ.get("EVA_VOICE_FEMALE", "Ashley")
+TTS_SPEED = float(os.environ.get("EVA_TTS_SPEED", "1.0"))
 
 SENTENCE_END_RE = re.compile(r"([.!?।\n])")
 HINDI_RE = re.compile(r"[\u0900-\u097F]")
@@ -114,13 +116,15 @@ def book_meeting_via_pravaah(meeting_ctx: dict, lead: dict, call_id: str, reques
 
 class EvaAgent(Agent):
     def __init__(self, instructions: str, global_tts: inference.TTS,
-                 meeting: dict, lead: dict, call_id: str, opening_line: str = ""):
+                 meeting: dict, lead: dict, call_id: str, opening_line: str = "",
+                 forced_lang: str = None):
         super().__init__(instructions=instructions)
         self._global_tts = global_tts
         self._meeting = meeting or {}
         self._lead = lead or {}
         self._call_id = call_id
         self._opening_line = opening_line
+        self._forced_lang = forced_lang
 
     async def on_enter(self) -> None:
         logger.info("on_enter: greeting=%r", self._opening_line)
@@ -170,21 +174,30 @@ class EvaAgent(Agent):
         return (remainder + " " + message).strip() if remainder else message
 
     async def _speak(self, sentence: str):
-        lang = _detect_lang(sentence)
-        self._global_tts.update_options(language=lang)
+        # Prefer the call's configured language over script-detection: once
+        # Hindi replies are written in Hinglish (Roman script) there's no
+        # Devanagari left for _detect_lang to key off, so it would silently
+        # fall back to "en" every time and use the wrong voice/pronunciation.
+        lang = self._forced_lang or _detect_lang(sentence)
+        try:
+            self._global_tts.update_options(language=lang, speed=TTS_SPEED)
+        except TypeError:
+            self._global_tts.update_options(language=lang)
         logger.info("speaking [%s]: %s", LANG_NAMES.get(lang, lang), sentence[:60])
         async for audio in self._global_tts.synthesize(sentence):
             yield audio.frame
 
 
-def _build_instructions(agent_cfg: dict, lead: dict, meeting: dict) -> str:
-    """Mirrors app.py's EvaSession.__init__ prompt-building, minus the
-    speaking-length rule wording tweaks - kept close to the original."""
+
+def _build_instructions(agent_cfg: dict, lead: dict, meeting: dict):
+    """Mirrors app.py's EvaSession.__init__ prompt-building. Returns
+    (instructions, forced_lang) - the caller needs forced_lang separately
+    to drive TTS language selection."""
     custom_prompt = (agent_cfg.get("system_prompt") or "").strip()
     base = custom_prompt or (
-        "You are Eva, a helpful, concise, warm voice assistant. "
-        "Keep replies short and conversational (1-3 sentences) since they "
-        "will be spoken aloud."
+        "You are a helpful, warm, concise voice assistant taking this call "
+        "on behalf of the business. Keep replies short and conversational "
+        "(1-3 sentences) since they will be spoken aloud."
     )
     if lead:
         base += (
@@ -194,22 +207,33 @@ def _build_instructions(agent_cfg: dict, lead: dict, meeting: dict) -> str:
     forced_lang = agent_cfg.get("language") if agent_cfg.get("language") in SUPPORTED_LANGUAGES else None
     if forced_lang and forced_lang != "en":
         base += (
-            f"\nAlways reply in {LANG_NAMES.get(forced_lang, forced_lang)}, written in its own "
-            "native script (not romanized/Latin script), unless the user explicitly writes in English."
+            f"\nAlways reply in casual, natural {LANG_NAMES.get(forced_lang, forced_lang)} written "
+            "in Roman/English letters (Hinglish) - the way people actually type it day to day. "
+            "NEVER use Devanagari or any native script, unless the user explicitly writes in English."
         )
     elif forced_lang == "en":
         base += "\nAlways reply in English only."
     else:
         base += (
             "\nLanguage rule: default to English. If the user is clearly speaking "
-            "Hindi, reply in Hindi using Devanagari script (not romanized). "
-            "If their message is in English, unclear, or mixed, reply in English."
+            "Hindi, reply in casual Hinglish (Hindi written in Roman/English letters, "
+            "never Devanagari). If their message is in English, unclear, or mixed, reply in English."
         )
     base += "\nNever reply using only emojis or symbols with no words."
+    base += (
+        "\nStay fully in character as defined above. Never state an internal/system "
+        "name for yourself, never say 'I am an AI', and don't introduce yourself by "
+        "name unless the caller directly asks who or what they're speaking with."
+    )
     base += (
         "\n\nSPEAKING LENGTH RULE (always follow, no exceptions): this is a live "
         "phone/voice conversation. Normally answer in ONE short sentence. At most "
         "2-3 short sentences for a normal question."
+    )
+    base += (
+        "\n\nSpeak the way a real person talks on a phone call - use contractions "
+        "and everyday words, keep a warm relaxed tone, and avoid stiff, scripted, "
+        "or overly formal phrasing. Don't sound robotic."
     )
     if meeting:
         base += (
@@ -221,8 +245,7 @@ def _build_instructions(agent_cfg: dict, lead: dict, meeting: dict) -> str:
             "BOOK_MEETING: YYYY-MM-DD HH:MM (24-hour clock, UTC). Do not say this "
             "line out loud or explain it - it's processed automatically."
         )
-    return base
-
+    return base, forced_lang
 
 def prewarm(proc: JobProcess) -> None:
     proc.userdata["vad"] = silero.VAD.load()
@@ -253,7 +276,10 @@ async def entrypoint(ctx: JobContext) -> None:
     callback_url = call_ctx.get("callback_url")
 
     voice = VOICE_MALE if agent_cfg.get("gender") == "male" else VOICE_FEMALE
-    global_tts = inference.TTS(model=GLOBAL_TTS_MODEL, voice=voice, language="en")
+    try:
+        global_tts = inference.TTS(model=GLOBAL_TTS_MODEL, voice=voice, language="en", speed=TTS_SPEED)
+    except TypeError:
+        global_tts = inference.TTS(model=GLOBAL_TTS_MODEL, voice=voice, language="en")
 
     if LLM_PROVIDER == "gemini" and GEMINI_API_KEY:
         # NOTE: livekit.plugins doesn't ship a Gemini LLM plugin in the base
@@ -263,15 +289,28 @@ async def entrypoint(ctx: JobContext) -> None:
         logger.warning("LLM_PROVIDER=gemini requested but not wired up in agent.py yet — using Groq.")
     llm = groq.LLM(model=GROQ_MODEL, api_key=GROQ_API_KEY)
 
-    session = AgentSession(
+    # Tuned for lower latency + more natural barge-in. min_endpointing_delay/
+    # max_endpointing_delay/preemptive_generation/resume_false_interruption/
+    # false_interruption_timeout are recent livekit-agents additions - the
+    # inspect-based filter below drops any that your installed version
+    # doesn't recognize, so this can't crash on an older build.
+    _session_kwargs = dict(
         vad=ctx.proc.userdata["vad"],
         stt=deepgram.STT(model="nova-3", language="multi"),
         llm=llm,
         tts=global_tts,
         turn_detection=MultilingualModel(),
         allow_interruptions=True,
-        min_interruption_duration=0.5,
+        min_interruption_duration=0.4,
+        min_endpointing_delay=0.3,
+        max_endpointing_delay=3.0,
+        preemptive_generation=True,       # start generating before the user's turn is fully finalized
+        resume_false_interruption=True,   # resume speaking if a "barge-in" turns out to be noise
+        false_interruption_timeout=1.5,
     )
+    _valid_params = set(inspect.signature(AgentSession.__init__).parameters)
+    _session_kwargs = {k: v for k, v in _session_kwargs.items() if k in _valid_params}
+    session = AgentSession(**_session_kwargs)
 
     session.on("error", lambda ev: logger.error("SESSION ERROR: %r", getattr(ev, "error", ev)))
     session.on("agent_state_changed",
@@ -318,10 +357,11 @@ async def entrypoint(ctx: JobContext) -> None:
 
     ctx.add_shutdown_callback(_finish_and_callback)
 
-    instructions = _build_instructions(agent_cfg, lead, meeting)
+    instructions, forced_lang = _build_instructions(agent_cfg, lead, meeting)
     opening_line = render_call_vars(agent_cfg.get("opening_line") or "", lead).strip().strip('"').strip()
     agent = EvaAgent(instructions=instructions, global_tts=global_tts,
-                      meeting=meeting, lead=lead, call_id=call_id, opening_line=opening_line)
+                      meeting=meeting, lead=lead, call_id=call_id, opening_line=opening_line,
+                      forced_lang=forced_lang)
 
     await session.start(
         agent=agent,
