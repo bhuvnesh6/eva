@@ -219,6 +219,19 @@ def _build_instructions(agent_cfg: dict, lead: dict, meeting: dict):
             "Hindi, reply in casual Hinglish (Hindi written in Roman/English letters, "
             "never Devanagari). If their message is in English, unclear, or mixed, reply in English."
         )
+    # Same gender-agreement rule as app.py's EvaSession - keeps karta/karti
+    # consistent with agent_cfg.gender (the same field that picks the voice
+    # a few lines up in entrypoint()). Default matches the voice-selection
+    # default (female) when gender isn't set.
+    gender_forms = (
+        "masculine (e.g. main karta hoon, main bol raha hoon, main tha)"
+        if agent_cfg.get("gender") == "male" else
+        "feminine (e.g. main karti hoon, main bol rahi hoon, main thi)"
+    )
+    base += (
+        f"\nGRAMMATICAL GENDER: whenever you speak Hindi or Hinglish, always refer to "
+        f"yourself using {gender_forms} verb forms. Stay consistent for the entire call - never switch."
+    )
     base += "\nNever reply using only emojis or symbols with no words."
     base += (
         "\nStay fully in character as defined above. Never state an internal/system "

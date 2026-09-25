@@ -549,6 +549,20 @@ class EvaSession:
                 "Hindi, reply in casual Hinglish (Hindi written in Roman/English letters, "
                 "never Devanagari). If their message is in English, unclear, or mixed, reply in English."
             )
+        # Hindi/Hinglish verbs conjugate by the speaker's gender (e.g. "karta
+        # hoon" vs "karti hoon") - without this the LLM guesses randomly and
+        # flips mid-call. Locked to the agent's configured gender (self.gender,
+        # same field that picks VOICE_MALE/VOICE_FEMALE above) so it stays
+        # consistent for the whole conversation.
+        gender_forms = (
+            "masculine (e.g. main karta hoon, main bol raha hoon, main tha)"
+            if self.gender == "male" else
+            "feminine (e.g. main karti hoon, main bol rahi hoon, main thi)"
+        )
+        base_prompt += (
+            f"\nGRAMMATICAL GENDER: whenever you speak Hindi or Hinglish, always refer to "
+            f"yourself using {gender_forms} verb forms. Stay consistent for the entire call - never switch."
+        )
         base_prompt += "\nNever reply using only emojis or symbols with no words."
         base_prompt += (
             "\nStay fully in character as defined above. Never state an internal/system "
