@@ -253,17 +253,6 @@ def _build_instructions(agent_cfg: dict, lead: dict, meeting: dict):
         "introduce yourself by name unless the caller directly asks who they're "
         "speaking with, and even then keep it to the persona's name only if one was "
         "given above - otherwise deflect naturally without inventing a name."
-    )    base += (
-        "\nSTAY IN CHARACTER (always follow, no exceptions): you are the persona "
-        "defined above, nothing else. Never say your name is Eva, never say you are "
-        "an AI, a bot, a language model, or an assistant. If asked what you are, who "
-        "you are, or where you're calling/speaking from, answer briefly and naturally "
-        "the way a real staff member would (e.g. 'I'm calling from the team here' or "
-        "just answer their real question and move on) - never mention a cloud server, "
-        "data center, or any technical/infrastructure detail about yourself. Don't "
-        "introduce yourself by name unless the caller directly asks who they're "
-        "speaking with, and even then keep it to the persona's name only if one was "
-        "given above - otherwise deflect naturally without inventing a name."
     )
     base += (
         "\n\nSPEAKING LENGTH RULE (always follow, no exceptions): this is a live "
