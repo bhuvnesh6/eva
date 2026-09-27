@@ -36,7 +36,7 @@ from livekit.agents import (
     cli,
     inference,
 )
-from livekit.plugins import deepgram, groq, silero
+from livekit.plugins import deepgram, groq, openai, sarvam, silero
 from livekit.plugins.turn_detector.multilingual import MultilingualModel
 
 load_dotenv()
@@ -46,18 +46,28 @@ logger = logging.getLogger("eva-agent")
 
 AGENT_NAME = os.environ.get("AGENT_NAME", "eva-agent")
 
-LLM_PROVIDER = os.environ.get("LLM_PROVIDER", "groq").strip().lower()
+LLM_PROVIDER = os.environ.get("LLM_PROVIDER", "cloudflare").strip().lower()
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 GROQ_MODEL = os.environ.get("GROQ_MODEL", "openai/gpt-oss-120b")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.5-flash-lite")
 
+# ---------------- Cloudflare Workers AI (LLM) ----------------
+CLOUDFLARE_ACCOUNT_ID = os.environ.get("CLOUDFLARE_ACCOUNT_ID", "")
+CLOUDFLARE_API_TOKEN = os.environ.get("CLOUDFLARE_API_TOKEN", "")
+CLOUDFLARE_MODEL = os.environ.get("CLOUDFLARE_MODEL", "@cf/meta/llama-3.2-1b-instruct")
+CLOUDFLARE_TEMPERATURE = float(os.environ.get("CLOUDFLARE_TEMPERATURE", "0.4"))
+
+# ---------------- Sarvam (TTS) ----------------
+SARVAM_TTS_MODEL = os.environ.get("SARVAM_TTS_MODEL", "bulbul:v3")
+SARVAM_TTS_TEMPERATURE = float(os.environ.get("SARVAM_TTS_TEMPERATURE", "0.6"))
+
 EVA_API_SECRET = os.environ.get("EVA_API_SECRET", "")
 PRAVAAH_API_BASE_URL = os.environ.get("PRAVAAH_API_BASE_URL", "").rstrip("/")
 
 GLOBAL_TTS_MODEL = os.environ.get("GLOBAL_TTS_MODEL", "inworld/inworld-tts-2")
-VOICE_MALE = os.environ.get("EVA_VOICE_MALE", "Manoj")
-VOICE_FEMALE = os.environ.get("EVA_VOICE_FEMALE", "Ashley")
+VOICE_MALE = os.environ.get("EVA_VOICE_MALE", "shubh")
+VOICE_FEMALE = os.environ.get("EVA_VOICE_FEMALE", "priya")
 TTS_SPEED = float(os.environ.get("EVA_TTS_SPEED", "1.0"))
 
 SENTENCE_END_RE = re.compile(r"([.!?।\n])")
@@ -69,6 +79,11 @@ SUPPORTED_LANGUAGES = {"en", "hi"}
 
 def _detect_lang(text: str) -> str:
     return "hi" if HINDI_RE.search(text) else "en"
+
+
+def _sarvam_lang_code(lang: str) -> str:
+    """Internal 'en'/'hi' -> Sarvam's BCP-47 target_language_code."""
+    return "hi-IN" if lang == "hi" else "en-IN"
 
 
 def render_call_vars(text: str, lead: dict) -> str:
@@ -138,9 +153,9 @@ class EvaAgent(Agent):
                 # the agent's configured/forced language for every call.
                 lang = self._forced_lang or _detect_lang(self._opening_line)
                 try:
-                    self._global_tts.update_options(language=lang, speed=TTS_SPEED)
-                except TypeError:
-                    self._global_tts.update_options(language=lang)
+                    self._global_tts.update_options(target_language_code=_sarvam_lang_code(lang), pace=TTS_SPEED)
+                except Exception:
+                    logger.warning("sarvam TTS update_options failed on opening line, using TTS defaults")
                 await self.session.say(self._opening_line, allow_interruptions=True)
             else:
                 # No opening_line configured on this agent - fall back to an
@@ -205,9 +220,9 @@ class EvaAgent(Agent):
         # fall back to "en" every time and use the wrong voice/pronunciation.
         lang = self._forced_lang or _detect_lang(sentence)
         try:
-            self._global_tts.update_options(language=lang, speed=TTS_SPEED)
-        except TypeError:
-            self._global_tts.update_options(language=lang)
+            self._global_tts.update_options(target_language_code=_sarvam_lang_code(lang), pace=TTS_SPEED)
+        except Exception:
+            logger.warning("sarvam TTS update_options failed for %r, using TTS defaults", sentence[:30])
         logger.info("speaking [%s]: %s", LANG_NAMES.get(lang, lang), sentence[:60])
         async for audio in self._global_tts.synthesize(sentence):
             yield audio.frame
@@ -350,18 +365,26 @@ async def entrypoint(ctx: JobContext) -> None:
     )
 
     voice = VOICE_MALE if agent_cfg.get("gender") == "male" else VOICE_FEMALE
-    try:
-        global_tts = inference.TTS(model=GLOBAL_TTS_MODEL, voice=voice, language="en", speed=TTS_SPEED)
-    except TypeError:
-        global_tts = inference.TTS(model=GLOBAL_TTS_MODEL, voice=voice, language="en")
+    global_tts = sarvam.TTS(
+        target_language_code="en-IN",   # overridden per-sentence in EvaAgent._speak()/on_enter()
+        speaker=voice,
+        model=SARVAM_TTS_MODEL,
+        pace=TTS_SPEED,
+        temperature=SARVAM_TTS_TEMPERATURE,
+    )
 
-    if LLM_PROVIDER == "gemini" and GEMINI_API_KEY:
-        # NOTE: livekit.plugins doesn't ship a Gemini LLM plugin in the base
-        # install used elsewhere in this project - if you need Gemini here
-        # too, either add livekit-plugins-google or keep Groq for the
-        # VoiceLink path only. Left as Groq below until confirmed.
+    if LLM_PROVIDER == "cloudflare" and CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_API_TOKEN:
+        llm = openai.LLM(
+            model=CLOUDFLARE_MODEL,
+            api_key=CLOUDFLARE_API_TOKEN,
+            base_url=f"https://api.cloudflare.com/client/v4/accounts/{CLOUDFLARE_ACCOUNT_ID}/ai/v1",
+            temperature=CLOUDFLARE_TEMPERATURE,
+        )
+    elif LLM_PROVIDER == "gemini" and GEMINI_API_KEY:
         logger.warning("LLM_PROVIDER=gemini requested but not wired up in agent.py yet — using Groq.")
-    llm = groq.LLM(model=GROQ_MODEL, api_key=GROQ_API_KEY)
+        llm = groq.LLM(model=GROQ_MODEL, api_key=GROQ_API_KEY)
+    else:
+        llm = groq.LLM(model=GROQ_MODEL, api_key=GROQ_API_KEY)
 
     # Tuned for lower latency + more natural barge-in. min_endpointing_delay/
     # max_endpointing_delay/preemptive_generation/resume_false_interruption/

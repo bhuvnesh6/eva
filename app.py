@@ -98,8 +98,12 @@ LIVEKIT_API_SECRET = os.environ.get("LIVEKIT_API_SECRET", "")
 LIVEKIT_TTS_MODEL = os.environ.get("LIVEKIT_TTS_MODEL", "inworld/inworld-tts-2")
 # One voice per gender, reused across the whole call regardless of which
 # of the two supported languages is being spoken.
-VOICE_MALE = os.environ.get("EVA_VOICE_MALE", "Manoj")
-VOICE_FEMALE = os.environ.get("EVA_VOICE_FEMALE", "Ashley")
+# Sarvam bulbul:v2 speaker names. Female: anushka/manisha/vidya/arya.
+# Male: abhilash/karun/hitesh. Full/updated list: docs.sarvam.ai (TTS).
+# bulbul:v3 speaker catalog (different from v2's). Male: shubh (default),
+# aditya, rahul, rohan, amit, dev... Female: ritu, priya, neha, pooja...
+VOICE_MALE = os.environ.get("EVA_VOICE_MALE", "shubh")
+VOICE_FEMALE = os.environ.get("EVA_VOICE_FEMALE", "priya")
 # Speaking-rate multiplier passed to the TTS engine (1.0 = normal). Bump
 # slightly if replies feel slow/robotic; not every provider build accepts
 # this kwarg, so it's applied with a fallback wherever it's used below.
@@ -149,22 +153,42 @@ BARGE_IN_MIN_VOLUME_MULAW = int(os.environ.get("EVA_BARGE_IN_MIN_VOLUME_MULAW", 
 BARGE_IN_MIN_VOLUME_ALAW = int(os.environ.get("EVA_BARGE_IN_MIN_VOLUME_ALAW", 350))
 DEEPGRAM_API_KEY = os.environ.get("DEEPGRAM_API_KEY")
 SARVAM_API_KEY = os.environ.get("SARVAM_API_KEY")
+SARVAM_TTS_MODEL = os.environ.get("SARVAM_TTS_MODEL", "bulbul:v3")
+SARVAM_TTS_URL = "https://api.sarvam.ai/text-to-speech"
+SARVAM_SUPPORTED_RATES = (8000, 16000, 22050, 24000)
+# bulbul:v3 has no pitch/loudness controls (unlike v2) but adds
+# "temperature" (0.01-1.0, default 0.6) - controls expressiveness/randomness.
+SARVAM_TTS_TEMPERATURE = float(os.environ.get("SARVAM_TTS_TEMPERATURE", "0.6"))
+# Internal "en"/"hi" -> Sarvam's BCP-47 target_language_code.
+SARVAM_LANG_CODES = {"en": "en-IN", "hi": "hi-IN"}
 
 # ---------------- LLM provider switch ----------------
 # Set LLM_PROVIDER=gemini in .env to swap Eva's brain from Groq to Gemini,
 # or LLM_PROVIDER=groq to go back — no code changes needed either way.
 # Both API keys can sit in .env at once; only the selected one is used.
-LLM_PROVIDER = os.environ.get("LLM_PROVIDER", "groq").strip().lower()  # "groq" | "gemini"
+LLM_PROVIDER = os.environ.get("LLM_PROVIDER", "cloudflare").strip().lower()  # "cloudflare" | "groq" | "gemini"
 
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 GROQ_MODEL = os.environ.get("GROQ_MODEL", "openai/gpt-oss-120b")
 
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
-# Flash-Lite = Google's cheapest/fastest Gemini tier (lowest token cost +
-# latency) — a good match since Eva's replies are already forced to 1-3
-# short sentences. Bump to GEMINI_MODEL=gemini-3.5-flash in .env if you
-# want smarter replies at higher cost.
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.5-flash-lite")
+
+# ---------------- Cloudflare Workers AI (LLM) ----------------
+# Uses Workers AI's OpenAI-compatible endpoint, so the SSE delta shape is
+# identical to Groq's - _stream_chat_cloudflare() below mirrors
+# _stream_chat_groq() almost line for line.
+CLOUDFLARE_ACCOUNT_ID = os.environ.get("CLOUDFLARE_ACCOUNT_ID", "")
+CLOUDFLARE_API_TOKEN = os.environ.get("CLOUDFLARE_API_TOKEN", "")
+CLOUDFLARE_MODEL = os.environ.get("CLOUDFLARE_MODEL", "@cf/meta/llama-3.2-1b-instruct")
+# Kept small on purpose - Eva's replies are 1-3 spoken sentences anyway,
+# so there's no reason to pay for (or wait on) a long completion.
+CLOUDFLARE_MAX_TOKENS = int(os.environ.get("CLOUDFLARE_MAX_TOKENS", "120"))
+CLOUDFLARE_TEMPERATURE = float(os.environ.get("CLOUDFLARE_TEMPERATURE", "0.4"))
+CLOUDFLARE_CHAT_URL = (
+    f"https://api.cloudflare.com/client/v4/accounts/{CLOUDFLARE_ACCOUNT_ID}/ai/v1/chat/completions"
+    if CLOUDFLARE_ACCOUNT_ID else ""
+)
 
 
 def check_missing_keys():
@@ -174,12 +198,15 @@ def check_missing_keys():
         ("LIVEKIT_API_KEY", LIVEKIT_API_KEY),
         ("LIVEKIT_API_SECRET", LIVEKIT_API_SECRET),
     ]
-    if LLM_PROVIDER == "gemini":
+    if LLM_PROVIDER == "cloudflare":
+        checks.append(("CLOUDFLARE_ACCOUNT_ID", CLOUDFLARE_ACCOUNT_ID))
+        checks.append(("CLOUDFLARE_API_TOKEN", CLOUDFLARE_API_TOKEN))
+    elif LLM_PROVIDER == "gemini":
         checks.append(("GEMINI_API_KEY", GEMINI_API_KEY))
     else:
         checks.append(("GROQ_API_KEY", GROQ_API_KEY))
+    checks.append(("SARVAM_API_KEY", SARVAM_API_KEY))
     return [n for n, v in checks if not v]
-
 # ---------------- Twilio (phone call) config ----------------
 PHONE_RATE = 8000               # Twilio Media Streams is fixed at 8kHz mu-law
 
@@ -446,6 +473,51 @@ def _stream_livekit_tts(tts_client, text, lang):
             raise item
         yield item
 
+def sarvam_tts_synthesize(text: str, lang: str, voice: str, sample_rate: int):
+    """One blocking REST call to Sarvam TTS. Returns (pcm16_bytes,
+    actual_sample_rate). Sarvam has no TTS websocket/streaming, so this is
+    a plain requests.post() - fine since it only ever runs on the per-call
+    TTS-loop thread (_tts_loop), never on a gevent-cooperative thread.
+    actual_sample_rate may differ from the requested one (snapped to the
+    nearest rate Sarvam supports) - _tts_loop's existing audioop.ratecv
+    resample step (already there from the old LiveKit TTS path) silently
+    handles that mismatch, so callers don't need to care."""
+    sr = min(SARVAM_SUPPORTED_RATES, key=lambda r: abs(r - sample_rate))
+    resp = requests.post(
+        SARVAM_TTS_URL,
+        headers={"API-Subscription-Key": SARVAM_API_KEY, "Content-Type": "application/json"},
+        json={
+            "inputs": [text],
+            "target_language_code": SARVAM_LANG_CODES.get(lang, "en-IN"),
+            "speaker": voice,
+            "pace": TTS_SPEED,
+            "temperature": SARVAM_TTS_TEMPERATURE,  # ignored/harmless if model is ever switched back to bulbul:v2
+            "speech_sample_rate": sr,
+            "enable_preprocessing": True,
+            "model": SARVAM_TTS_MODEL,
+        },
+        timeout=20,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    wav_bytes = base64.b64decode(data["audios"][0])
+    # Sarvam returns a standard 44-byte-header PCM WAV at speech_sample_rate.
+    pcm16 = wav_bytes[44:] if wav_bytes[:4] == b"RIFF" else wav_bytes
+    return pcm16, sr
+
+
+def _stream_sarvam_tts(text: str, lang: str, voice: str, sample_rate: int, chunk_ms: int = 100):
+    """Same (pcm_bytes, src_rate) generator contract _tts_loop already
+    consumes (previously satisfied by _stream_livekit_tts). Sarvam gives us
+    the whole sentence in one shot, so we chunk it ourselves afterward -
+    keeps _tts_loop's interrupt_flag check responsive mid-sentence instead
+    of sending one giant blob."""
+    pcm16, sr = sarvam_tts_synthesize(text, lang, voice, sample_rate)
+    chunk_bytes = max(2, int(sr * (chunk_ms / 1000.0)) * 2)
+    chunk_bytes -= chunk_bytes % 2
+    for i in range(0, len(pcm16), chunk_bytes):
+        yield pcm16[i:i + chunk_bytes], sr
+
 # ============================================================
 # One EvaSession per WebSocket connection
 # ============================================================
@@ -526,103 +598,44 @@ class EvaSession:
         persona_name = (agent.get("name") or "").strip()
         custom_prompt = (agent.get("system_prompt") or "").strip()
         base_prompt = custom_prompt or (
-            "You are a helpful, warm, concise voice assistant taking this call "
-            "on behalf of the business. Keep replies short and conversational "
-            "(1-3 sentences) since they will be spoken aloud."
+            "You are a warm, concise voice assistant on a call for this business. "
+            "Reply in 1-3 short spoken sentences."
         )
-        # The agent's configured name (from the Pravaah dashboard) isn't
-        # always repeated inside a custom system prompt, so without this the
-        # model has no idea what it's called and will invent a name (often
-        # "Eva") if asked. Always tell it explicitly.
         if persona_name:
-            base_prompt += (
-                f"\n\nYour name is {persona_name}. If the caller asks your name, "
-                f"tell them your name is {persona_name} - never any other name."
-            )
+            base_prompt += f" Your name is {persona_name}; never say any other name."
+        else:
+            base_prompt += " Never state a name for yourself; never say your name is Eva."
         if lead:
             base_prompt += (
-                f"\n\nYou are speaking with {lead.get('name', 'the lead')} from "
-                f"{lead.get('business_name', 'their business')}. Use their name naturally, don't overuse it."
+                f" You're speaking with {lead.get('name', 'the lead')} from "
+                f"{lead.get('business_name', 'their business')}."
             )
+
         if self.forced_language and self.forced_language != "en":
             lang_label = LANG_NAMES.get(self.forced_language, self.forced_language)
-            base_prompt += (
-                f"\nAlways reply in casual, natural {lang_label} written in Roman/English "
-                f"letters (Hinglish) - the way people actually type it day to day. "
-                f"NEVER use Devanagari or any native script, unless the user explicitly writes in English."
-            )
+            base_prompt += f" Reply only in casual {lang_label}, Roman script (Hinglish), never Devanagari."
         elif self.forced_language == "en":
-            base_prompt += "\nAlways reply in English only."
+            base_prompt += " Reply in English only."
         else:
-            base_prompt += (
-                "\nLanguage rule: default to English. If the user is clearly speaking "
-                "Hindi, reply in casual Hinglish (Hindi written in Roman/English letters, "
-                "never Devanagari). If their message is in English, unclear, or mixed, reply in English."
-            )
-        # Hindi/Hinglish verbs conjugate by the speaker's gender (e.g. "karta
-        # hoon" vs "karti hoon") - without this the LLM guesses randomly and
-        # flips mid-call. Locked to the agent's configured gender (self.gender,
-        # same field that picks VOICE_MALE/VOICE_FEMALE above) so it stays
-        # consistent for the whole conversation.
-        gender_forms = (
-            "masculine (e.g. main karta hoon, main bol raha hoon, main tha)"
-            if self.gender == "male" else
-            "feminine (e.g. main karti hoon, main bol rahi hoon, main thi)"
-        )
+            base_prompt += " Default to English; if the user speaks Hindi, reply in Hinglish (Roman script, never Devanagari)."
+
+        gender_forms = "masculine" if self.gender == "male" else "feminine"
+        base_prompt += f" In Hindi/Hinglish always use {gender_forms} self-reference verb forms, consistently."
+
         base_prompt += (
-            f"\nGRAMMATICAL GENDER: whenever you speak Hindi or Hinglish, always refer to "
-            f"yourself using {gender_forms} verb forms. Stay consistent for the entire call - never switch."
-        )
-        base_prompt += "\nNever reply using only emojis or symbols with no words."
-        name_rule = (
-            f"your name is {persona_name} - always use exactly that name, never say "
-            f"your name is Eva or any other name."
-            if persona_name else
-            "you have not been given a specific name - never invent one (and never "
-            "say your name is Eva); if asked who you are, just say something like "
-            "'I'm calling from the team here' instead of stating a name."
-        )
-        base_prompt += (
-            "\nSTAY IN CHARACTER (always follow, no exceptions): you are the persona "
-            f"defined above, nothing else. IDENTITY RULE: {name_rule} Never say you are "
-            "an AI, a bot, a language model, or an assistant. If asked what you are, who "
-            "you are, or where you're calling/speaking from, answer briefly and naturally "
-            "the way a real staff member would - never mention a cloud server, data center, "
-            "or any technical/infrastructure detail about yourself."
-        )
-        # Applies unconditionally - even on top of an owner's own custom
-        # system_prompt above - since this is a live voice call, not a chat
-        # window: a long reply just sits there as dead air while the
-        # assistant is still talking, and invites the lead to talk over it.
-        base_prompt += (
-            "\n\nSPEAKING LENGTH RULE (always follow, no exceptions): this "
-            "is a live phone/voice conversation. Normally answer in ONE "
-            "short sentence. At most 2-3 short sentences for a normal "
-            "question. Only go longer than that if the lead explicitly asks "
-            "for a real explanation, a walkthrough, or a list of things - "
-            "and even then stay as brief as possible while still being "
-            "correct. Never pad with extra detail, filler, or repeating "
-            "back what they said."
-        )
-        base_prompt += (
-            "\n\nSpeak the way a real person talks on a phone call - use "
-            "contractions and everyday words, keep a warm relaxed tone, and "
-            "avoid stiff, scripted, or overly formal phrasing. Don't sound robotic."
+            " Never reply using only emojis. Stay in character always: never say you're "
+            "an AI, bot, or assistant; if asked, answer briefly like a real staff member, "
+            "no technical/infra details. Speak like a real phone call - contractions, warm, "
+            "brief, never repeat back what they said."
         )
 
         if self.meeting:
             base_prompt += (
-                "\n\nYou can book a meeting for this lead. Meetings are "
-                f"{self.meeting.get('duration_minutes', 30)} minutes long. "
-                f"Available windows: {self.meeting.get('availability_text', '')}. "
-                "The lead's name and phone number are already known to you — never ask for "
-                "them again, only ask for their preferred meeting date and time. "
-                "Once they confirm one specific date and time, output EXACTLY one line in "
-                "this format and nothing else on that line: "
-                "BOOK_MEETING: YYYY-MM-DD HH:MM (24-hour clock, UTC). "
-                "Do not say this line out loud or explain it to the lead — it is processed "
-                "automatically and you will be told right after whether it was confirmed, "
-                "so you can relay that to them."
+                f" You can book meetings ({self.meeting.get('duration_minutes', 30)} min). "
+                f"Available: {self.meeting.get('availability_text', '')}. The lead's name/phone "
+                "are already known - only ask their preferred date/time. On confirmation output "
+                "EXACTLY: BOOK_MEETING: YYYY-MM-DD HH:MM (24h UTC) - nothing else on that line, "
+                "never say it aloud."
             )
 
         self.system_prompt = {"role": "system", "content": base_prompt}
@@ -636,9 +649,9 @@ class EvaSession:
         self.dg_connection.on(LiveTranscriptionEvents.Error, self._dg_error)
         self.dg_connection.on(LiveTranscriptionEvents.Close, self._dg_close)
 
-        # --- NEW ---
-        self.tts = inference.TTS(model=LIVEKIT_TTS_MODEL, voice=self.voice_name, language="en")
-
+        # TTS is now a plain Sarvam REST call per sentence (see
+        # sarvam_tts_synthesize / _stream_sarvam_tts above) - no persistent
+        # client object needed here like the old LiveKit inference.TTS.
     # ---------- outbound helpers ----------
     def _send_json(self, obj):
         # Twilio's Media Stream socket only understands its own event schema
@@ -1054,11 +1067,13 @@ class EvaSession:
             self.history = self.history[-MAX_HISTORY_MESSAGES:]
 
     def _stream_chat(self, client: httpx.Client, messages):
-        """Dispatches to whichever provider LLM_PROVIDER selects. Both
+        """Dispatches to whichever provider LLM_PROVIDER selects. All
         generators below yield plain text deltas, so nothing downstream
         (sentence-splitting, TTS queue, BOOK_MEETING detection) needs to
         know or care which LLM is actually live."""
-        if LLM_PROVIDER == "gemini":
+        if LLM_PROVIDER == "cloudflare":
+            yield from self._stream_chat_cloudflare(client, messages)
+        elif LLM_PROVIDER == "gemini":
             yield from self._stream_chat_gemini(client, messages)
         else:
             yield from self._stream_chat_groq(client, messages)
@@ -1082,6 +1097,30 @@ class EvaSession:
                         yield delta
                 except Exception:
                     continue
+                
+    def _stream_chat_cloudflare(self, client: httpx.Client, messages):
+        """Cloudflare Workers AI via its OpenAI-compatible endpoint - same
+        SSE delta shape as Groq, so this mirrors _stream_chat_groq exactly."""
+        payload = {
+            "model": CLOUDFLARE_MODEL, "messages": messages, "stream": True,
+            "max_tokens": CLOUDFLARE_MAX_TOKENS, "temperature": CLOUDFLARE_TEMPERATURE,
+        }
+        headers = {"Authorization": f"Bearer {CLOUDFLARE_API_TOKEN}", "Content-Type": "application/json"}
+        with client.stream("POST", CLOUDFLARE_CHAT_URL, json=payload, headers=headers, timeout=30) as resp:
+            resp.raise_for_status()
+            for line in resp.iter_lines():
+                if not line or not line.startswith("data:"):
+                    continue
+                data = line[len("data:"):].strip()
+                if data == "[DONE]":
+                    break
+                try:
+                    obj = json.loads(data)
+                    delta = obj["choices"][0]["delta"].get("content")
+                    if delta:
+                        yield delta
+                except Exception:
+                    continue            
 
     def _stream_chat_gemini(self, client: httpx.Client, messages):
         """Gemini has no OpenAI-style flat messages list — "system" role
@@ -1249,7 +1288,7 @@ class EvaSession:
                 target_rate, target_codec = TTS_SAMPLE_RATE, "linear16"
 
             if gen is None:
-                gen = _stream_livekit_tts(self.tts, sentence, lang)
+                gen = _stream_sarvam_tts(sentence, lang, self.voice_name, target_rate)
 
             resample_state = None
             leftover = b""
@@ -1264,7 +1303,7 @@ class EvaSession:
                         try:
                             next_sentence, next_lang = self.sentence_q.get_nowait()
                             pending_fetch = (next_sentence, next_lang,
-                                             _stream_livekit_tts(self.tts, next_sentence, next_lang))
+                                             _stream_sarvam_tts(next_sentence, next_lang, self.voice_name, target_rate))
                         except queue.Empty:
                             pass
                     if self.interrupt_flag.is_set():
