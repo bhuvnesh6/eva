@@ -604,7 +604,7 @@ class EvaSession:
         if persona_name:
             base_prompt += f" Your name is {persona_name}; never say any other name."
         else:
-            base_prompt += " Never state a name for yourself; never say your name is Eva."
+            base_prompt += " Never state a name for yourself."
         if lead:
             base_prompt += (
                 f" You're speaking with {lead.get('name', 'the lead')} from "

@@ -169,7 +169,7 @@ class EvaAgent(Agent):
                 await self.session.generate_reply(
                     instructions=(
                         "Greet the caller warmly in ONE short sentence and ask how you "
-                        f"can help today. {name_hint} Never say your name is Eva."
+                        f"can help today. {name_hint}"
                     )
                 )
         except Exception:
@@ -286,12 +286,11 @@ def _build_instructions(agent_cfg: dict, lead: dict, meeting: dict):
     )
     base += "\nNever reply using only emojis or symbols with no words."
     name_rule = (
-        f"your name is {persona_name} - always use exactly that name, never say "
-        f"your name is Eva or any other name."
+        f"your name is {persona_name} - always use exactly that name."
         if persona_name else
-        "you have not been given a specific name - never invent one (and never "
-        "say your name is Eva); if asked who you are, just say something like "
-        "'I'm calling from the team here' instead of stating a name."
+        "you have not been given a specific name - never invent one; if asked who you "
+        "are, just say something like 'I'm calling from the team here' instead of "
+        "stating a name."
     )
     base += (
         "\nSTAY IN CHARACTER (always follow, no exceptions): you are the persona "
@@ -363,6 +362,11 @@ async def entrypoint(ctx: JobContext) -> None:
         agent_cfg.get("gender"),
         bool((agent_cfg.get("system_prompt") or "").strip()),
     )
+    # logger.info from the job subprocess wasn't showing up in `docker logs`
+    # last debug session - plain print() to stdout always gets through.
+    print(f"[EVA-DEBUG] call_id={call_id} agent_name={agent_cfg.get('name')!r} "
+          f"opening_line={agent_cfg.get('opening_line')!r} "
+          f"has_system_prompt={bool((agent_cfg.get('system_prompt') or '').strip())}", flush=True)
 
     voice = VOICE_MALE if agent_cfg.get("gender") == "male" else VOICE_FEMALE
     global_tts = sarvam.TTS(
