@@ -177,6 +177,16 @@ class VoiceLinkBridge:
             "call_id": self.call_id,
             "callback_url": self.callback_url,
         })
+        # Full agent/lead/meeting exactly as received from Pravaah, right
+        # before it's handed to LiveKit's dispatch — confirms the bridge
+        # itself didn't drop or mangle anything from app.py.
+        print(f"[VOICELINK-BRIDGE] agent_cfg from Pravaah for call_id={self.call_id}: "
+              f"{json.dumps(self.agent_cfg, default=str)}", flush=True)
+        print(f"[VOICELINK-BRIDGE] lead from Pravaah for call_id={self.call_id}: "
+              f"{json.dumps(self.lead, default=str)}", flush=True)
+        print(f"[VOICELINK-BRIDGE] meeting from Pravaah for call_id={self.call_id}: "
+              f"{json.dumps(self.meeting, default=str)}", flush=True)
+        print(f"[VOICELINK-BRIDGE] full dispatch metadata for call_id={self.call_id}: {metadata}", flush=True)
         lkapi = self._lk_api()
         try:
             dispatch_result = await lkapi.agent_dispatch.create_dispatch(

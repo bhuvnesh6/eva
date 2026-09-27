@@ -368,6 +368,16 @@ async def entrypoint(ctx: JobContext) -> None:
           f"opening_line={agent_cfg.get('opening_line')!r} "
           f"has_system_prompt={bool((agent_cfg.get('system_prompt') or '').strip())}", flush=True)
 
+    # FULL agent/lead/meeting payload exactly as this job received it, so
+    # the entire Pravaah-sent config is visible in one place instead of
+    # guessing which field is wrong.
+    logger.info("call_ctx FULL agent for call_id=%r: %s", call_id, json.dumps(agent_cfg, default=str))
+    logger.info("call_ctx FULL lead for call_id=%r: %s", call_id, json.dumps(lead, default=str))
+    logger.info("call_ctx FULL meeting for call_id=%r: %s", call_id, json.dumps(meeting, default=str))
+    print(f"[EVA-DEBUG] FULL agent for call_id={call_id}: {json.dumps(agent_cfg, default=str)}", flush=True)
+    print(f"[EVA-DEBUG] FULL lead for call_id={call_id}: {json.dumps(lead, default=str)}", flush=True)
+    print(f"[EVA-DEBUG] FULL meeting for call_id={call_id}: {json.dumps(meeting, default=str)}", flush=True)
+
     voice = VOICE_MALE if agent_cfg.get("gender") == "male" else VOICE_FEMALE
     global_tts = sarvam.TTS(
         target_language_code="en-IN",   # overridden per-sentence in EvaAgent._speak()/on_enter()

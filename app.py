@@ -2657,6 +2657,15 @@ def api_place_call_voicelink():
     meeting = data.get("meeting") or {}
     callback_url = data.get("callback_url")
 
+    # Full dump of exactly what Pravaah sent for this VoiceLink call, so the
+    # agent config can be inspected end-to-end without guessing which field
+    # is wrong. Also mirrored to print() in case log() output is filtered.
+    log("MAIN", f"[VoiceLink] /api/calls/voicelink call_id={call_id} -> "
+                f"customer_number={customer_number} did_number={did_number}")
+    log("MAIN", f"[VoiceLink] agent from Pravaah: {json.dumps(agent, default=str)}")
+    log("MAIN", f"[VoiceLink] lead from Pravaah: {json.dumps(lead, default=str)}")
+    log("MAIN", f"[VoiceLink] meeting from Pravaah: {json.dumps(meeting, default=str)}")
+
     if not (call_id and customer_number and did_number and callback_url):
         return jsonify({"ok": False, "error": "call_id, customer_number, did_number and callback_url are required"}), 400
     if not (login_username and login_password):
