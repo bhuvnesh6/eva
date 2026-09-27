@@ -180,7 +180,7 @@ GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.5-flash-lite")
 # _stream_chat_groq() almost line for line.
 CLOUDFLARE_ACCOUNT_ID = os.environ.get("CLOUDFLARE_ACCOUNT_ID", "")
 CLOUDFLARE_API_TOKEN = os.environ.get("CLOUDFLARE_API_TOKEN", "")
-CLOUDFLARE_MODEL = os.environ.get("CLOUDFLARE_MODEL", "@cf/meta/llama-3.2-1b-instruct")
+CLOUDFLARE_MODEL = os.environ.get("CLOUDFLARE_MODEL", "openai/gpt-6-sol")
 # Kept small on purpose - Eva's replies are 1-3 spoken sentences anyway,
 # so there's no reason to pay for (or wait on) a long completion.
 CLOUDFLARE_MAX_TOKENS = int(os.environ.get("CLOUDFLARE_MAX_TOKENS", "120"))
