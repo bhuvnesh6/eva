@@ -12,7 +12,7 @@ Run:
     python agent.py dev
     python agent.py start
 """
-
+import asyncio
 import inspect
 import json
 import logging
@@ -477,6 +477,8 @@ async def entrypoint(ctx: JobContext) -> None:
                lambda ev: logger.info("USER SAID (final=%s): %s", ev.is_final, ev.transcript))
 
     transcript = []
+    call_started_at = time.time()
+    max_duration_secs = int(agent_cfg.get("max_duration_secs") or 0) or None
 
     def _on_item_added(ev):
         # VERIFY against your installed livekit-agents version: event name
@@ -505,7 +507,7 @@ async def entrypoint(ctx: JobContext) -> None:
                         "call_id": call_id,
                         "status": "completed" if transcript else "no_response",
                         "hangup_reason": "completed",
-                        "duration_secs": 0,  # TODO: track actual call duration
+                        "duration_secs": round(time.time() - call_started_at, 1),
                         "transcript": transcript,
                     },
                     timeout=15,
@@ -542,6 +544,18 @@ async def entrypoint(ctx: JobContext) -> None:
         room=ctx.room,
         room_output_options=RoomOutputOptions(transcription_enabled=True),
     )
+
+    if max_duration_secs:
+        async def _max_duration_watchdog():
+            await asyncio.sleep(max_duration_secs)
+            logger.info("call_id=%r hit max duration (%ss), closing.", call_id, max_duration_secs)
+            try:
+                await session.say("Thank you ji, aapse baat karke achha laga.", allow_interruptions=False)
+            except Exception:
+                pass
+            ctx.shutdown(reason="max_duration_reached")
+
+        _watchdog_task = asyncio.create_task(_max_duration_watchdog())
 
 
 if __name__ == "__main__":
