@@ -289,9 +289,9 @@ def _build_instructions(agent_cfg: dict, lead: dict, meeting: dict):
         base += "\nAlways reply in English only."
     else:
         base += (
-            "\nLanguage rule: default to English. If the user is clearly speaking "
-            "Hindi, reply in casual Hinglish (Hindi written in Roman/English letters, "
-            "never Devanagari). If their message is in English, unclear, or mixed, reply in English."
+            "\nLanguage rule: follow the persona's language style above. Default to casual "
+            "Hinglish (Hindi written in Roman/English letters, never Devanagari). "
+            "Only switch to full English if the caller clearly speaks only English."
         )
     # Same gender-agreement rule as app.py's EvaSession - keeps karta/karti
     # consistent with agent_cfg.gender (the same field that picks the voice
@@ -520,6 +520,22 @@ async def entrypoint(ctx: JobContext) -> None:
     opening_line = re.sub(r'[“”„«»"]', "", opening_line).strip()   # drop curly/straight double quotes
     logger.info("resolved persona_name=%r opening_line=%r (empty opening_line falls back to LLM greeting)",
                 persona_name, opening_line)
+
+    # Language used for TTS pronunciation. If Pravaah sends language="auto",
+    # use Hindi (hi-IN), which reads Roman-script Hinglish naturally.
+    # Speaker/voice is fixed at TTS creation, so the voice stays constant all call.
+    tts_lang = forced_lang or "hi"
+
+    agent = EvaAgent(
+        instructions=instructions,
+        global_tts=global_tts,
+        meeting=meeting,
+        lead=lead,
+        call_id=call_id,
+        opening_line=opening_line,
+        forced_lang=tts_lang,
+        persona_name=persona_name,
+    )
 
     await session.start(
         agent=agent,
