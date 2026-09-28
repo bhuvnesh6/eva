@@ -516,13 +516,10 @@ async def entrypoint(ctx: JobContext) -> None:
     ctx.add_shutdown_callback(_finish_and_callback)
 
     instructions, forced_lang, persona_name = _build_instructions(agent_cfg, lead, meeting)
-        opening_line = render_call_vars(agent_cfg.get("opening_line") or "", lead)
-        opening_line = re.sub(r'[“”„«»"]', "", opening_line).strip()   # drop curly/straight double quotes anywhere
+    opening_line = render_call_vars(agent_cfg.get("opening_line") or "", lead)
+    opening_line = re.sub(r'[“”„«»"]', "", opening_line).strip()   # drop curly/straight double quotes
     logger.info("resolved persona_name=%r opening_line=%r (empty opening_line falls back to LLM greeting)",
                 persona_name, opening_line)
-    agent = EvaAgent(instructions=instructions, global_tts=global_tts,
-                      meeting=meeting, lead=lead, call_id=call_id, opening_line=opening_line,
-                      forced_lang=forced_lang, persona_name=persona_name)
 
     await session.start(
         agent=agent,
