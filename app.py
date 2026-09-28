@@ -166,7 +166,18 @@ SARVAM_LANG_CODES = {"en": "en-IN", "hi": "hi-IN"}
 # Set LLM_PROVIDER=gemini in .env to swap Eva's brain from Groq to Gemini,
 # or LLM_PROVIDER=groq to go back — no code changes needed either way.
 # Both API keys can sit in .env at once; only the selected one is used.
-LLM_PROVIDER = os.environ.get("LLM_PROVIDER", "cloudflare").strip().lower()  # "cloudflare" | "groq" | "gemini"
+LLM_PROVIDER = os.environ.get("LLM_PROVIDER", "sarvam").strip().lower()  # "sarvam" | "cloudflare" | "groq" | "gemini"
+
+# ---------------- Sarvam LLM (conversational, voice-agent tuned) ----------------
+# Reuses SARVAM_API_KEY (same key as TTS). Reasoning is disabled in the
+# request because reasoning tokens are billed and add latency on calls.
+SARVAM_LLM_MODEL = os.environ.get("SARVAM_LLM_MODEL", "sarvam-105b-conversations")
+SARVAM_LLM_URL = "https://api.sarvam.ai/v1/chat/completions"
+SARVAM_LLM_TEMPERATURE = float(os.environ.get("SARVAM_LLM_TEMPERATURE", "0.4"))
+# ~650 chars is about 1 minute of speech. Token cap is the hard cost ceiling;
+# the char cap below ends the reply cleanly at a sentence boundary.
+SARVAM_LLM_MAX_TOKENS = int(os.environ.get("SARVAM_LLM_MAX_TOKENS", "240"))
+SARVAM_LLM_MAX_REPLY_CHARS = int(os.environ.get("SARVAM_LLM_MAX_REPLY_CHARS", "650"))
 
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 GROQ_MODEL = os.environ.get("GROQ_MODEL", "openai/gpt-oss-120b")
@@ -198,7 +209,9 @@ def check_missing_keys():
         ("LIVEKIT_API_KEY", LIVEKIT_API_KEY),
         ("LIVEKIT_API_SECRET", LIVEKIT_API_SECRET),
     ]
-    if LLM_PROVIDER == "cloudflare":
+    if LLM_PROVIDER == "sarvam":
+        pass   # SARVAM_API_KEY is already checked at the bottom of this function
+    elif LLM_PROVIDER == "cloudflare":
         checks.append(("CLOUDFLARE_ACCOUNT_ID", CLOUDFLARE_ACCOUNT_ID))
         checks.append(("CLOUDFLARE_API_TOKEN", CLOUDFLARE_API_TOKEN))
     elif LLM_PROVIDER == "gemini":
@@ -622,6 +635,11 @@ class EvaSession:
         gender_forms = "masculine" if self.gender == "male" else "feminine"
         base_prompt += f" In Hindi/Hinglish always use {gender_forms} self-reference verb forms, consistently."
 
+        base_prompt += (
+            " LENGTH RULE (always follow): this is a live phone call. Reply in 1-2 short "
+            "spoken sentences, under 500 characters, never more than 650. No lists, no long "
+            "explanations - give the key point only and let them ask for more."
+        )
         base_prompt += (
             " Never reply using only emojis. Stay in character always: never say you're "
             "an AI, bot, or assistant; if asked, answer briefly like a real staff member, "
@@ -1071,12 +1089,82 @@ class EvaSession:
         generators below yield plain text deltas, so nothing downstream
         (sentence-splitting, TTS queue, BOOK_MEETING detection) needs to
         know or care which LLM is actually live."""
-        if LLM_PROVIDER == "cloudflare":
+        if LLM_PROVIDER == "sarvam":
+            yield from self._stream_chat_sarvam(client, messages)
+        elif LLM_PROVIDER == "cloudflare":
             yield from self._stream_chat_cloudflare(client, messages)
         elif LLM_PROVIDER == "gemini":
             yield from self._stream_chat_gemini(client, messages)
         else:
             yield from self._stream_chat_groq(client, messages)
+
+    def _stream_chat_sarvam(self, client: httpx.Client, messages):
+        """Sarvam chat completions (OpenAI-style SSE). Sarvam is strict about
+        message shape, so we normalize first: only one leading system message,
+        later system notes (booking result, per-turn language note) get folded
+        into the message before them, consecutive same-role messages are
+        merged, and the first non-system message must be from the user."""
+        system_parts, chat = [], []
+        for m in messages:
+            role, text = m.get("role"), (m.get("content") or "")
+            if not text:
+                continue
+            if role == "system":
+                if chat:
+                    chat[-1]["content"] += "\n" + text
+                else:
+                    system_parts.append(text)
+                continue
+            if chat and chat[-1]["role"] == role:
+                chat[-1]["content"] += "\n" + text
+            else:
+                chat.append({"role": role, "content": text})
+        while chat and chat[0]["role"] != "user":
+            chat.pop(0)
+
+        out_messages = chat
+        if system_parts:
+            out_messages = [{"role": "system", "content": "\n\n".join(system_parts)}] + chat
+
+        payload = {
+            "model": SARVAM_LLM_MODEL,
+            "messages": out_messages,
+            "stream": True,
+            "max_tokens": SARVAM_LLM_MAX_TOKENS,
+            "temperature": SARVAM_LLM_TEMPERATURE,
+            "reasoning_effort": None,   # no reasoning tokens = cheaper + faster
+        }
+        headers = {"api-subscription-key": SARVAM_API_KEY, "Content-Type": "application/json"}
+
+        sent_chars = 0
+        with client.stream("POST", SARVAM_LLM_URL, json=payload, headers=headers, timeout=30) as resp:
+            if resp.status_code >= 400:
+                resp.read()
+                log("LLM", f"Sarvam HTTP {resp.status_code}: {resp.text[:300]}")
+            resp.raise_for_status()
+            for line in resp.iter_lines():
+                if not line or not line.startswith("data:"):
+                    continue
+                data = line[len("data:"):].strip()
+                if data == "[DONE]":
+                    break
+                try:
+                    obj = json.loads(data)
+                    delta = obj["choices"][0]["delta"].get("content")
+                except Exception:
+                    continue
+                if not delta:
+                    continue
+
+                # Char cap: once we're past the limit, finish the current
+                # sentence and stop, so the reply never ends mid-word.
+                if sent_chars + len(delta) >= SARVAM_LLM_MAX_REPLY_CHARS:
+                    m_end = SENTENCE_END_RE.search(delta)
+                    if m_end:
+                        yield delta[:m_end.end()]
+                        return
+                sent_chars += len(delta)
+                yield delta    
 
     def _stream_chat_groq(self, client: httpx.Client, messages):
         payload = {"model": GROQ_MODEL, "messages": messages, "stream": True}

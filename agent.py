@@ -46,7 +46,7 @@ logger = logging.getLogger("eva-agent")
 
 AGENT_NAME = os.environ.get("AGENT_NAME", "eva-agent")
 
-LLM_PROVIDER = os.environ.get("LLM_PROVIDER", "cloudflare").strip().lower()
+LLM_PROVIDER = os.environ.get("LLM_PROVIDER", "sarvam").strip().lower()
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 GROQ_MODEL = os.environ.get("GROQ_MODEL", "openai/gpt-oss-120b")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
@@ -57,6 +57,12 @@ CLOUDFLARE_ACCOUNT_ID = os.environ.get("CLOUDFLARE_ACCOUNT_ID", "")
 CLOUDFLARE_API_TOKEN = os.environ.get("CLOUDFLARE_API_TOKEN", "")
 CLOUDFLARE_MODEL = os.environ.get("CLOUDFLARE_MODEL", "openai/gpt-6-sol")
 CLOUDFLARE_TEMPERATURE = float(os.environ.get("CLOUDFLARE_TEMPERATURE", "0.4"))
+
+# ---------------- Sarvam (LLM) ----------------
+SARVAM_API_KEY = os.environ.get("SARVAM_API_KEY", "")
+SARVAM_LLM_MODEL = os.environ.get("SARVAM_LLM_MODEL", "sarvam-105b-conversations")
+SARVAM_LLM_TEMPERATURE = float(os.environ.get("SARVAM_LLM_TEMPERATURE", "0.4"))
+SARVAM_LLM_MAX_TOKENS = int(os.environ.get("SARVAM_LLM_MAX_TOKENS", "240"))
 
 # ---------------- Sarvam (TTS) ----------------
 SARVAM_TTS_MODEL = os.environ.get("SARVAM_TTS_MODEL", "bulbul:v3")
@@ -302,8 +308,9 @@ def _build_instructions(agent_cfg: dict, lead: dict, meeting: dict):
     )
     base += (
         "\n\nSPEAKING LENGTH RULE (always follow, no exceptions): this is a live "
-        "phone/voice conversation. Normally answer in ONE short sentence. At most "
-        "2-3 short sentences for a normal question."
+        "phone/voice conversation. Normally answer in ONE or TWO short sentences, "
+        "under 500 characters - never more than 650. No lists, no long explanations: "
+        "give the key point and let the caller ask for more."
     )
     base += (
         "\n\nSpeak the way a real person talks on a phone call - use contractions "
@@ -387,7 +394,24 @@ async def entrypoint(ctx: JobContext) -> None:
         temperature=SARVAM_TTS_TEMPERATURE,
     )
 
-    if LLM_PROVIDER == "cloudflare" and CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_API_TOKEN:
+    if LLM_PROVIDER == "sarvam" and SARVAM_API_KEY:
+        # Sarvam accepts "Authorization: Bearer <key>", so LiveKit's OpenAI
+        # plugin works against its /v1 endpoint. max_tokens + reasoning_effort
+        # go through extra_body; the inspect filter drops any kwarg your
+        # installed livekit-agents version doesn't support.
+        _llm_kwargs = dict(
+            model=SARVAM_LLM_MODEL,
+            api_key=SARVAM_API_KEY,
+            base_url="https://api.sarvam.ai/v1",
+            temperature=SARVAM_LLM_TEMPERATURE,
+            extra_body={"max_tokens": SARVAM_LLM_MAX_TOKENS, "reasoning_effort": None},
+        )
+        _llm_valid = set(inspect.signature(openai.LLM.__init__).parameters)
+        if "extra_body" not in _llm_valid:
+            logger.warning("openai.LLM has no extra_body in this version - max_tokens/reasoning_effort NOT applied; "
+                           "only the prompt limits reply length.")
+        llm = openai.LLM(**{k: v for k, v in _llm_kwargs.items() if k in _llm_valid})
+    elif LLM_PROVIDER == "cloudflare" and CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_API_TOKEN:
         llm = openai.LLM(
             model=CLOUDFLARE_MODEL,
             api_key=CLOUDFLARE_API_TOKEN,
