@@ -81,6 +81,9 @@ HINDI_RE = re.compile(r"[\u0900-\u097F]")
 BOOK_MEETING_RE = re.compile(r"BOOK_MEETING:\s*(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2})")
 LANG_NAMES = {"en": "English", "hi": "Hindi"}
 SUPPORTED_LANGUAGES = {"en", "hi"}
+SPEAKABLE_RE = re.compile(r"[A-Za-z0-9\u0900-\u097F]")
+# Hard ceiling on spoken chars per reply (~15 chars/sec of audio => 200 chars ~ 13s)
+MAX_SPOKEN_CHARS = int(os.environ.get("EVA_MAX_SPOKEN_CHARS", "200"))
 
 
 def _detect_lang(text: str) -> str:
@@ -183,6 +186,9 @@ class EvaAgent(Agent):
 
     async def tts_node(self, text: AsyncIterable[str], model_settings: ModelSettings):
         buffer = ""
+        spoken_chars = 0
+        capped = False
+
         async for chunk in text:
             buffer += chunk
             parts = SENTENCE_END_RE.split(buffer)
@@ -193,16 +199,25 @@ class EvaAgent(Agent):
             buffer = parts[i] if i < len(parts) else ""
 
             sentence = complete.strip()
-            if sentence:
-                sentence = await self._handle_booking_tag(sentence)
-                if sentence:
-                    async for frame in self._speak(sentence):
-                        yield frame
+            if not sentence:
+                continue
+            has_tag = bool(BOOK_MEETING_RE.search(sentence))
+            sentence = await self._handle_booking_tag(sentence)
+            # skip empty / punctuation-only text (Sarvam 400s on it), and drop
+            # anything past the cap - except a booking confirmation.
+            if not sentence or not SPEAKABLE_RE.search(sentence) or (capped and not has_tag):
+                continue
+            async for frame in self._speak(sentence):
+                yield frame
+            spoken_chars += len(sentence)
+            if spoken_chars >= MAX_SPOKEN_CHARS:
+                capped = True
 
         tail = buffer.strip()
         if tail:
+            has_tag = bool(BOOK_MEETING_RE.search(tail))
             tail = await self._handle_booking_tag(tail)
-            if tail:
+            if tail and SPEAKABLE_RE.search(tail) and (not capped or has_tag):
                 async for frame in self._speak(tail):
                     yield frame
 
@@ -242,7 +257,8 @@ def _build_instructions(agent_cfg: dict, lead: dict, meeting: dict):
     LLM-generated fallback greeting (when no opening_line is set) can't
     invent a name like "Eva"."""
     persona_name = (agent_cfg.get("name") or "").strip()
-    custom_prompt = (agent_cfg.get("system_prompt") or "").strip()
+    custom_prompt = re.split(r"You can also book meetings on the account owner",
+                             (agent_cfg.get("system_prompt") or ""))[0].strip()
     base = custom_prompt or (
         "You are a helpful, warm, concise voice assistant taking this call "
         "on behalf of the business. Keep replies short and conversational "
@@ -308,9 +324,12 @@ def _build_instructions(agent_cfg: dict, lead: dict, meeting: dict):
     )
     base += (
         "\n\nSPEAKING LENGTH RULE (always follow, no exceptions): this is a live "
-        "phone/voice conversation. Normally answer in ONE or TWO short sentences, "
-        "under 500 characters - never more than 650. No lists, no long explanations: "
-        "give the key point and let the caller ask for more."
+        "phone call. Each reply is ONE short sentence, at most two. Target 100-150 "
+        "characters, never above 200. Never read the example lines in the script word "
+        "for word - compress them to the shortest natural version. Acknowledge in 2-3 "
+        "words, then ask ONE question. Never say 'Sir/Ma'am' out loud as a pair: use the "
+        "caller's name with 'ji' (e.g. 'Bhuvi ji'), or just 'ji'. Keep any closing "
+        "summary to one sentence."
     )
     base += (
         "\n\nSpeak the way a real person talks on a phone call - use contractions "
@@ -393,7 +412,11 @@ async def entrypoint(ctx: JobContext) -> None:
         pace=TTS_SPEED,
         temperature=SARVAM_TTS_TEMPERATURE,
     )
-
+    try:
+        global_tts.prewarm()   # open the Sarvam WebSocket now, not on the first sentence
+    except Exception:
+        pass
+ 
     if LLM_PROVIDER == "sarvam" and SARVAM_API_KEY:
         # Sarvam accepts "Authorization: Bearer <key>", so LiveKit's OpenAI
         # plugin works against its /v1 endpoint. max_tokens + reasoning_effort
@@ -437,7 +460,7 @@ async def entrypoint(ctx: JobContext) -> None:
         turn_detection=MultilingualModel(),
         allow_interruptions=True,
         min_interruption_duration=0.4,
-        min_endpointing_delay=0.3,
+        min_endpointing_delay=0.2,
         max_endpointing_delay=3.0,
         preemptive_generation=True,       # start generating before the user's turn is fully finalized
         resume_false_interruption=True,   # resume speaking if a "barge-in" turns out to be noise
@@ -493,7 +516,8 @@ async def entrypoint(ctx: JobContext) -> None:
     ctx.add_shutdown_callback(_finish_and_callback)
 
     instructions, forced_lang, persona_name = _build_instructions(agent_cfg, lead, meeting)
-    opening_line = render_call_vars(agent_cfg.get("opening_line") or "", lead).strip().strip('"').strip()
+        opening_line = render_call_vars(agent_cfg.get("opening_line") or "", lead)
+        opening_line = re.sub(r'[“”„«»"]', "", opening_line).strip()   # drop curly/straight double quotes anywhere
     logger.info("resolved persona_name=%r opening_line=%r (empty opening_line falls back to LLM greeting)",
                 persona_name, opening_line)
     agent = EvaAgent(instructions=instructions, global_tts=global_tts,

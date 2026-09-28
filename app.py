@@ -378,6 +378,7 @@ def render_call_vars(text: str, lead: dict) -> str:
     (same merge-tag convention as PravaahAI's templates)."""
     for key in ("name", "business_name", "email", "phone", "website", "description"):
         text = text.replace("{{%s}}" % key, str((lead or {}).get(key, "") or ""))
+    text = re.sub(r'[“”„«»"]', "", text)
     return text
 
 
@@ -609,7 +610,8 @@ class EvaSession:
         self.history = []
 
         persona_name = (agent.get("name") or "").strip()
-        custom_prompt = (agent.get("system_prompt") or "").strip()
+        custom_prompt = re.split(r"You can also book meetings on the account owner",
+                                 (agent.get("system_prompt") or ""))[0].strip()
         base_prompt = custom_prompt or (
             "You are a warm, concise voice assistant on a call for this business. "
             "Reply in 1-3 short spoken sentences."
