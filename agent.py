@@ -381,7 +381,7 @@ def _build_instructions(agent_cfg: dict, lead: dict, meeting: dict):
     return base, forced_lang, persona_name
 
 def prewarm(proc: JobProcess) -> None:
-    proc.userdata["vad"] = silero.VAD.load()
+    proc.userdata["vad"] = silero.VAD.load(min_silence_duration=0.35)
 
 
 server = AgentServer()
@@ -505,8 +505,17 @@ async def entrypoint(ctx: JobContext) -> None:
     session.on("error", lambda ev: logger.error("SESSION ERROR: %r", getattr(ev, "error", ev)))
     session.on("agent_state_changed",
                lambda ev: logger.info("agent state: %s -> %s", ev.old_state, ev.new_state))
-    session.on("user_input_transcribed",
-               lambda ev: logger.info("USER SAID (final=%s): %s", ev.is_final, ev.transcript))
+    _pending_interim = {"text": "", "t": 0.0}
+
+    def _on_user_transcribed(ev):
+        logger.info("USER SAID (final=%s): %s", ev.is_final, ev.transcript)
+        if ev.is_final:
+            _pending_interim["text"] = ""
+        else:
+            _pending_interim["text"] = ev.transcript
+            _pending_interim["t"] = time.time()
+
+    session.on("user_input_transcribed", _on_user_transcribed)
 
     def _log_latency(ev):
         # Look for: end_of_utterance_delay (turn wait), ttft (LLM first token),
@@ -607,6 +616,30 @@ async def entrypoint(ctx: JobContext) -> None:
         room=ctx.room,
         room_output_options=RoomOutputOptions(transcription_enabled=True),
     )
+
+    async def _stuck_turn_watchdog():
+        """If Deepgram never sends a final transcript, force the turn through
+        after 2s of silence instead of leaving the caller in dead air."""
+        while True:
+            await asyncio.sleep(0.5)
+            text = _pending_interim["text"]
+            if not text or time.time() - _pending_interim["t"] < 2.0:
+                continue
+            if str(getattr(session, "user_state", "listening")) == "speaking":
+                continue
+            if str(getattr(session, "agent_state", "listening")) != "listening":
+                continue
+            _pending_interim["text"] = ""
+            logger.warning("STUCK TURN: forcing reply for interim=%r", text)
+            try:
+                if hasattr(session, "commit_user_turn"):
+                    session.commit_user_turn()
+                else:
+                    session.generate_reply(user_input=text)
+            except Exception:
+                logger.exception("stuck-turn recovery failed")
+
+    asyncio.create_task(_stuck_turn_watchdog())
 
     if max_duration_secs:
         async def _max_duration_watchdog():

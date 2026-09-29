@@ -2862,6 +2862,7 @@ def voicelink_webhook(call_id):
     payload = request.get_json(silent=True) or {}
     event = (payload.get("event") or "").lower()
     log("VOICELINK", f"webhook call_id={call_id} event={event} recordingUrl={payload.get('recordingUrl')!r}")
+    log("VOICELINK", f"webhook FULL payload: {json.dumps(payload, default=str)[:2000]}")
 
     if event == "call.ended":
         bridge = VOICELINK_BRIDGES.get(call_id)
@@ -2900,7 +2901,11 @@ def voicelink_webhook(call_id):
         # soon as the transcript lands - see /api/internal/call-result).
         with _call_results_lock:
             e = CALL_RESULTS.setdefault(call_id, _new_call_result())
-            e["recording_url"] = payload.get("recordingUrl") or ""
+            _rec = (
+                payload.get("recordingUrl") or payload.get("recording_url")
+                or payload.get("recordingURL") or payload.get("recording") or ""
+            )
+            e["recording_url"] = _rec if isinstance(_rec, str) else ""
             e["recording_done"] = True
             if payload.get("duration"):
                 e["duration_secs"] = payload["duration"]
