@@ -162,6 +162,30 @@ SARVAM_TTS_TEMPERATURE = float(os.environ.get("SARVAM_TTS_TEMPERATURE", "0.6"))
 # Internal "en"/"hi" -> Sarvam's BCP-47 target_language_code.
 SARVAM_LANG_CODES = {"en": "en-IN", "hi": "hi-IN"}
 
+# ---------------- IVR (play recording -> wait -> STT -> hang up) ----------------
+import io
+import wave
+
+IVR_WAIT_SECS = float(os.environ.get("EVA_IVR_WAIT_SECS", 5))
+IVR_MAX_EXTEND_SECS = float(os.environ.get("EVA_IVR_MAX_EXTEND_SECS", 3))   # extra time if caller is still mid-sentence
+IVR_STT_LANGUAGE = os.environ.get("EVA_IVR_STT_LANGUAGE", "multi")
+IVR_MIN_SPEECH_RMS = int(os.environ.get("EVA_IVR_MIN_SPEECH_RMS", 250))     # 16-bit RMS below this = silence/noise
+IVR_PLAY_LEAD_SECS = 0.3
+
+IVR_NO_TOKENS = {"no", "nope", "nah", "nahi", "nahin", "nahii", "nai", "mat", "नहीं", "नही", "नहिं", "मत"}
+IVR_NO_PHRASES = ("not interested", "don't", "dont", "do not", "no thanks", "no thank you")
+
+_IVR_AUDIO_CACHE = {}
+_ivr_cache_lock = threading.Lock()
+
+
+def ivr_is_negative(text: str) -> bool:
+    t = (text or "").lower()
+    if any(p in t for p in IVR_NO_PHRASES):
+        return True
+    tokens = re.findall(r"[\w\u0900-\u097F]+", t)
+    return any(tok in IVR_NO_TOKENS for tok in tokens)
+
 # ---------------- LLM provider switch ----------------
 # Set LLM_PROVIDER=gemini in .env to swap Eva's brain from Groq to Gemini,
 # or LLM_PROVIDER=groq to go back — no code changes needed either way.
@@ -297,6 +321,7 @@ def _new_call_result():
         "hangup_reason": "completed", "duration_secs": 0,
         "recording_url": None, "recording_done": False,
         "sent": False, "timer": None,
+        "extra": {},          # extra fields merged into the Pravah callback (used by IVR)
     }
 
 
@@ -336,8 +361,21 @@ def _finalize_call(call_id, force=False):
             "transcript": transcript,
             "recording_url": e["recording_url"] or "",
         }
+        payload.update(e.get("extra") or {})
         callback_url = e["callback_url"]
 
+    try:
+        requests.post(
+            callback_url,
+            headers={"X-Eva-Secret": EVA_API_SECRET, "Content-Type": "application/json"},
+            json=payload, timeout=15,
+        )
+        log("VOICELINK", f"callback sent for {call_id} (recording_url={'yes' if payload['recording_url'] else 'no'})")
+    except Exception as e:
+        log("VOICELINK", f"callback POST failed for {call_id}: {e}")
+    finally:
+        with _call_results_lock:
+            CALL_RESULTS.pop(call_id, None)
     try:
         requests.post(
             callback_url,
@@ -2796,7 +2834,8 @@ def api_place_call_voicelink():
     """PravaahAI calls this to have Eva place an outbound call over
     VoiceLink instead of Twilio/VaniSetu. Body: {call_id, customer_number,
     did_number, voicelink_login_email, voicelink_login_password, agent,
-    lead, callback_url}. Auth: header X-Eva-Secret must match EVA_API_SECRET."""
+    lead, callback_url, call_mode ("ai"|"ivr"), ivr:{audio_url, wait_secs, text}}.
+    Auth: header X-Eva-Secret must match EVA_API_SECRET."""
     if not EVA_API_SECRET or request.headers.get("X-Eva-Secret") != EVA_API_SECRET:
         return jsonify({"ok": False, "error": "Invalid or missing X-Eva-Secret"}), 401
     if not PUBLIC_BASE_URL:
@@ -2816,25 +2855,29 @@ def api_place_call_voicelink():
     lead = data.get("lead", {}) or {}
     meeting = data.get("meeting") or {}
     callback_url = data.get("callback_url")
+    call_mode = "ivr" if data.get("call_mode") == "ivr" else "ai"
+    ivr = data.get("ivr") or {}
 
-    # Full dump of exactly what Pravaah sent for this VoiceLink call, so the
-    # agent config can be inspected end-to-end without guessing which field
-    # is wrong. Also mirrored to print() in case log() output is filtered.
-    log("MAIN", f"[VoiceLink] /api/calls/voicelink call_id={call_id} -> "
+    log("MAIN", f"[VoiceLink] /api/calls/voicelink call_id={call_id} mode={call_mode} -> "
                 f"customer_number={customer_number} did_number={did_number}")
-    log("MAIN", f"[VoiceLink] agent from Pravaah: {json.dumps(agent, default=str)}")
-    log("MAIN", f"[VoiceLink] lead from Pravaah: {json.dumps(lead, default=str)}")
-    log("MAIN", f"[VoiceLink] meeting from Pravaah: {json.dumps(meeting, default=str)}")
+    log("MAIN", f"[VoiceLink] agent from Pravah: {json.dumps(agent, default=str)}")
+    log("MAIN", f"[VoiceLink] lead from Pravah: {json.dumps(lead, default=str)}")
+    log("MAIN", f"[VoiceLink] meeting from Pravah: {json.dumps(meeting, default=str)}")
+    if call_mode == "ivr":
+        log("MAIN", f"[VoiceLink] ivr from Pravah: {json.dumps(ivr, default=str)}")
 
     if not (call_id and customer_number and did_number and callback_url):
         return jsonify({"ok": False, "error": "call_id, customer_number, did_number and callback_url are required"}), 400
     if not (login_username and login_password):
         return jsonify({"ok": False, "error": "voicelink_login_username and voicelink_login_password are required"}), 400
+    if call_mode == "ivr" and not ivr.get("audio_url"):
+        return jsonify({"ok": False, "error": "IVR call requires ivr.audio_url"}), 400
 
     with _pending_calls_lock:
         PENDING_CALLS[call_id] = {
             "agent": agent, "lead": lead, "callback_url": callback_url,
             "created_at": time.time(), "meeting": meeting,
+            "call_mode": call_mode, "ivr": ivr,
         }
 
     ws_scheme_base = PUBLIC_BASE_URL.replace("https://", "wss://").replace("http://", "ws://")
@@ -2853,9 +2896,8 @@ def api_place_call_voicelink():
         return jsonify({"ok": False, "error": err}), 502
 
     queue_id = result.get("outbound_queue_id") or (result.get("data") or {}).get("outbound_queue_id")
-    log("MAIN", f"Outbound VoiceLink call requested: call_id={call_id} -> {customer_number} (did={did_number})")
+    log("MAIN", f"Outbound VoiceLink call requested: call_id={call_id} -> {customer_number} (did={did_number}, mode={call_mode})")
     return jsonify({"ok": True, "call_sid": queue_id or call_id})
-
 
 @app.route("/api/voicelink/webhook/<call_id>", methods=["POST"])
 def voicelink_webhook(call_id):
@@ -2943,6 +2985,325 @@ def api_internal_call_result(call_id):
     _finalize_call(call_id)
     return jsonify({"ok": True})
 
+
+# ============================================================
+# VoiceLink IVR — plays a fixed recording, waits, STT, hangs up
+# (completely separate from the LiveKit bridge)
+# ============================================================
+def _ivr_decode(b: bytes) -> bytes:
+    """Phone codec -> linear16."""
+    if VOICELINK_CODEC in ("mulaw", "ulaw"):
+        return audioop.ulaw2lin(b, 2)
+    return audioop.alaw2lin(b, 2)
+
+
+def _ivr_encode(pcm: bytes) -> bytes:
+    """linear16 -> phone codec."""
+    if VOICELINK_CODEC in ("mulaw", "ulaw"):
+        return audioop.lin2ulaw(pcm, 2)
+    return audioop.lin2alaw(pcm, 2)
+
+
+def load_ivr_audio(url: str) -> bytes:
+    """Downloads the IVR WAV from Cloudinary and converts it to
+    8kHz mono in the VoiceLink codec. Cached per URL (URL changes on regenerate)."""
+    with _ivr_cache_lock:
+        cached = _IVR_AUDIO_CACHE.get(url)
+    if cached:
+        return cached
+
+    resp = requests.get(url, timeout=25)
+    resp.raise_for_status()
+    with wave.open(io.BytesIO(resp.content), "rb") as wf:
+        channels, width, rate = wf.getnchannels(), wf.getsampwidth(), wf.getframerate()
+        frames = wf.readframes(wf.getnframes())
+    if width != 2:
+        frames = audioop.lin2lin(frames, width, 2)
+    if channels > 1:
+        frames = audioop.tomono(frames, 2, 0.5, 0.5)
+    if rate != VOICELINK_RATE:
+        frames, _ = audioop.ratecv(frames, 2, 1, rate, VOICELINK_RATE, None)
+    encoded = _ivr_encode(frames)
+
+    with _ivr_cache_lock:
+        if len(_IVR_AUDIO_CACHE) > 50:
+            _IVR_AUDIO_CACHE.clear()
+        _IVR_AUDIO_CACHE[url] = encoded
+    return encoded
+
+
+def deepgram_transcribe_pcm(pcm16: bytes, rate: int) -> str:
+    """One-shot (pre-recorded) Deepgram STT on the caller's reply."""
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(rate)
+        wf.writeframes(pcm16)
+    resp = requests.post(
+        "https://api.deepgram.com/v1/listen",
+        params={"model": "nova-3", "language": IVR_STT_LANGUAGE, "smart_format": "true", "punctuate": "true"},
+        headers={"Authorization": f"Token {DEEPGRAM_API_KEY}", "Content-Type": "audio/wav"},
+        data=buf.getvalue(), timeout=25,
+    )
+    resp.raise_for_status()
+    alt = resp.json()["results"]["channels"][0]["alternatives"][0]
+    return (alt.get("transcript") or "").strip()
+
+
+class VoiceLinkIVRSession:
+    """One IVR call: play audio -> wait for reply -> STT -> hang up -> report."""
+
+    def __init__(self, ws, call_id, cfg):
+        self.ws = ws
+        self.call_id = call_id
+        self.cfg = cfg
+        self.ivr = cfg.get("ivr") or {}
+        self.callback_url = cfg.get("callback_url")
+        self.audio_url = self.ivr.get("audio_url", "")
+        try:
+            self.wait_secs = float(self.ivr.get("wait_secs") or IVR_WAIT_SECS)
+        except (TypeError, ValueError):
+            self.wait_secs = IVR_WAIT_SECS
+
+        self.started = threading.Event()
+        self.stop_event = threading.Event()
+        self.listening = threading.Event()
+        self.done = threading.Event()
+        self.ws_lock = threading.Lock()
+        self.inbound_lock = threading.Lock()
+        self.inbound = bytearray()      # linear16 of what the caller said during the wait window
+        self.last_rms = 0
+
+        self.stream_sid = None
+        self.call_started_at = None
+        self.duration = 0
+        self.transcript = []
+        self.reply_text = ""
+        self.answered = False
+        self.lead_status = "cold"
+        self.hangup_reason = "ivr_completed"
+        self._reported = False
+        self._report_lock = threading.Lock()
+
+    # ----- called from the websocket loop -----
+    def start(self):
+        threading.Thread(target=self._run, daemon=True, name=f"IVR-{self.call_id}").start()
+
+    def on_start(self, data):
+        start_obj = data.get("start") or {}
+        self.stream_sid = (start_obj.get("stream_sid") or start_obj.get("streamSid")
+                           or data.get("stream_sid") or data.get("streamSid"))
+        # needed to hang up the call from our side (stop event carries callSid)
+        self.call_sid = (start_obj.get("call_sid") or start_obj.get("callSid")
+                         or data.get("call_sid") or data.get("callSid"))
+        self.call_started_at = time.time()
+        self.started.set()
+        log("IVR", f"call {self.call_id}: start event received (call_sid={self.call_sid})")
+
+    def feed_alaw(self, audio: bytes):
+        if not audio or not self.listening.is_set():
+            return
+        try:
+            pcm = _ivr_decode(audio)
+            self.last_rms = audioop.rms(pcm, 2)
+        except Exception:
+            return
+        with self.inbound_lock:
+            self.inbound.extend(pcm)
+
+    def close(self):
+        """Called when the call/websocket ends (or VoiceLink's call.ended webhook arrives)."""
+        self.stop_event.set()
+
+    # ----- internals -----
+    def _send_media(self, audio_bytes: bytes) -> bool:
+        with self.ws_lock:
+            try:
+                self.ws.send(json.dumps({
+                    "event": "media",
+                    "media": {"payload": base64.b64encode(audio_bytes).decode("ascii")},
+                }))
+                return True
+            except Exception:
+                return False
+
+    def _play(self, audio: bytes) -> bool:
+        """Sends the audio paced at real-time speed. Returns False if the call ended mid-way."""
+        chunk_bytes = max(160, int(VOICELINK_RATE * 0.1))   # 100ms per chunk (1 byte/sample)
+        t0 = time.time()
+        for i in range(0, len(audio), chunk_bytes):
+            if self.stop_event.is_set():
+                return False
+            wait = (t0 + (i / VOICELINK_RATE) - IVR_PLAY_LEAD_SECS) - time.time()
+            if wait > 0 and self.stop_event.wait(wait):
+                return False
+            if not self._send_media(audio[i:i + chunk_bytes]):
+                return False
+        end_at = t0 + len(audio) / VOICELINK_RATE + 0.1
+        remaining = end_at - time.time()
+        if remaining > 0 and self.stop_event.wait(remaining):
+            return False
+        return True
+
+    def _transcribe(self) -> str:
+        with self.inbound_lock:
+            pcm = bytes(self.inbound)
+        if len(pcm) < int(VOICELINK_RATE * 2 * 0.3):
+            return ""
+        win = int(VOICELINK_RATE * 0.1) * 2
+        loud = any(audioop.rms(pcm[i:i + win], 2) >= IVR_MIN_SPEECH_RMS for i in range(0, len(pcm), win))
+        if not loud:
+            return ""
+        try:
+            return deepgram_transcribe_pcm(pcm, VOICELINK_RATE)
+        except Exception as e:
+            log("IVR", f"call {self.call_id}: STT failed: {e}")
+            return ""
+
+    def _hangup(self):
+        """Hang up from Eva's side: send VoiceLink's `stop` event with the
+        callSid we got in the `start` event, then close the socket as a fallback."""
+        call_sid = getattr(self, "call_sid", None)
+        if call_sid:
+            with self.ws_lock:
+                try:
+                    self.ws.send(json.dumps({"event": "stop", "stop": {"callSid": call_sid}}))
+                    log("IVR", f"call {self.call_id}: stop event sent (call_sid={call_sid})")
+                except Exception as e:
+                    log("IVR", f"call {self.call_id}: could not send stop event: {e}")
+            time.sleep(0.3)   # let VoiceLink process the stop before the socket closes
+        try:
+            self.ws.close()
+        except Exception:
+            pass
+
+
+
+    def _run(self):
+        try:
+            try:
+                alaw = load_ivr_audio(self.audio_url)
+            except Exception as e:
+                log("IVR", f"call {self.call_id}: could not load IVR audio: {e}")
+                self.hangup_reason = "ivr_audio_error"
+                return
+
+            if not self.started.wait(timeout=20):
+                self.hangup_reason = "no_start_event"
+                return
+
+            if not self._play(alaw):
+                self.hangup_reason = "hangup_during_playback"
+                return
+
+            self.transcript.append({
+                "role": "agent",
+                "text": (self.ivr.get("text") or "[IVR recording played]"),
+                "ts": time.time(),
+            })
+
+            # wait for the caller's reply
+            self.listening.set()
+            self.stop_event.wait(self.wait_secs)
+            extended = 0.0
+            while (not self.stop_event.is_set() and extended < IVR_MAX_EXTEND_SECS
+                   and self.last_rms >= IVR_MIN_SPEECH_RMS):
+                self.stop_event.wait(0.2)
+                extended += 0.2
+            self.listening.clear()
+
+            text = self._transcribe()
+            if text:
+                self.answered = True
+                self.reply_text = text
+                self.lead_status = "cold" if ivr_is_negative(text) else "warm"
+                self.transcript.append({"role": "lead", "text": text, "ts": time.time()})
+            else:
+                self.answered = False
+                self.lead_status = "cold"
+                self.hangup_reason = "no_reply"
+            log("IVR", f"call {self.call_id}: reply={text!r} -> {self.lead_status}")
+        except Exception as e:
+            log("IVR", f"call {self.call_id}: error {type(e).__name__}: {e!r}")
+            self.hangup_reason = "error"
+        finally:
+            if self.call_started_at:
+                self.duration = round(time.time() - self.call_started_at, 1)
+            self.listening.clear()
+            self._hangup()
+            self.done.set()
+
+    def report(self):
+        """Hands transcript + result to the same VoiceLink finalize flow
+        (waits for recording URL from call.completed, then POSTs to Pravah)."""
+        with self._report_lock:
+            if self._reported:
+                return
+            self._reported = True
+        with _call_results_lock:
+            e = CALL_RESULTS.setdefault(self.call_id, _new_call_result())
+            e["callback_url"] = e["callback_url"] or self.callback_url
+            e["transcript"] = self.transcript
+            e["status"] = "completed" if self.answered else "no_response"
+            e["hangup_reason"] = self.hangup_reason
+            if not e["duration_secs"]:
+                e["duration_secs"] = self.duration
+            e["extra"] = {
+                "call_mode": "ivr",
+                "ivr_answered": self.answered,
+                "ivr_reply": self.reply_text,
+                "ivr_lead_status": self.lead_status,
+            }
+        _arm_finalize_timer(self.call_id)
+        _finalize_call(self.call_id)
+
+
+def _run_voicelink_ivr(ws, call_id, cfg):
+    session = VoiceLinkIVRSession(ws, call_id, cfg)
+    VOICELINK_BRIDGES[call_id] = session      # so the call.ended webhook can close it
+    session.start()
+    log("VOICELINK", f"Outbound call {call_id}: IVR mode, audio={session.audio_url}")
+
+    try:
+        while True:
+            msg = ws.receive()
+            if msg is None:
+                break
+            if isinstance(msg, (bytes, bytearray)):
+                continue
+            try:
+                data = json.loads(msg)
+            except Exception:
+                continue
+
+            event = data.get("event")
+            if event == "start":
+                session.on_start(data)
+            elif event == "media":
+                media = data.get("media", {}) or {}
+                if media.get("track", "inbound") != "inbound":
+                    continue
+                payload_b64 = media.get("payload")
+                if payload_b64:
+                    try:
+                        session.feed_alaw(base64.b64decode(payload_b64))
+                    except Exception:
+                        continue
+            elif event == "stop":
+                log("VOICELINK", f"call {call_id}: stop event")
+                break
+    except Exception as e:
+        log("VOICELINK", f"IVR ws loop error: {e}")
+    finally:
+        session.close()
+        session.done.wait(timeout=25)
+        session.report()
+        VOICELINK_BRIDGES.pop(call_id, None)
+        with _pending_calls_lock:
+            PENDING_CALLS.pop(call_id, None)
+        log("VOICELINK", f"IVR call {call_id} disconnected.")
+
 #did update
 
 @sock.route("/ws/voicelink/<call_id>")
@@ -2954,6 +3315,11 @@ def voicelink_ws(ws, call_id):
         cfg = PENDING_CALLS.get(call_id)
     if not cfg:
         log("VOICELINK", f"No pending config for call_id={call_id}, closing.")
+        return
+
+    # IVR calls: play recording -> wait -> STT -> hang up (no LiveKit)
+    if cfg.get("call_mode") == "ivr":
+        _run_voicelink_ivr(ws, call_id, cfg)
         return
 
     bridge = livekit_bridge.VoiceLinkBridge(
