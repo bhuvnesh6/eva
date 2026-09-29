@@ -281,6 +281,76 @@ PENDING_CALLS = {}
 # simple direct lookup rather than a FIFO-matching table.
 VOICELINK_BRIDGES = {}   # call_id -> VoiceLinkBridge (replaces VOICELINK_SESSIONS)
 
+# ---------------- VoiceLink: transcript + recording URL are delivered together ----------------
+# Transcript comes from agent.py when the call ends; recordingUrl comes later in
+# VoiceLink's call.completed webhook. We hold both here and POST ONE callback to
+# Pravaah once both are in (or after RECORDING_WAIT_SECS, without the recording).
+# NOTE: in-memory -> run gunicorn with a single worker (as you do now for websockets).
+RECORDING_WAIT_SECS = int(os.environ.get("EVA_RECORDING_WAIT_SECS", 90))
+CALL_RESULTS = {}
+_call_results_lock = threading.Lock()
+
+
+def _new_call_result():
+    return {
+        "callback_url": None, "transcript": None, "status": None,
+        "hangup_reason": "completed", "duration_secs": 0,
+        "recording_url": None, "recording_done": False,
+        "sent": False, "timer": None,
+    }
+
+
+def _arm_finalize_timer(call_id):
+    """Safety net: if call.completed never arrives, send without recording."""
+    with _call_results_lock:
+        e = CALL_RESULTS.setdefault(call_id, _new_call_result())
+        if e["sent"] or e["timer"]:
+            return
+        t = threading.Timer(RECORDING_WAIT_SECS, _finalize_call, args=(call_id, True))
+        t.daemon = True
+        e["timer"] = t
+        t.start()
+
+
+def _finalize_call(call_id, force=False):
+    with _call_results_lock:
+        e = CALL_RESULTS.get(call_id)
+        if not e or e["sent"]:
+            return
+        ready = e["transcript"] is not None and e["recording_done"]
+        if not (ready or force):
+            return
+        if not e["callback_url"]:
+            if force:
+                CALL_RESULTS.pop(call_id, None)
+            return
+        e["sent"] = True
+        if e["timer"]:
+            e["timer"].cancel()
+        transcript = e["transcript"] or []
+        payload = {
+            "call_id": call_id,
+            "status": e["status"] or ("completed" if transcript else "no_response"),
+            "hangup_reason": e["hangup_reason"],
+            "duration_secs": e["duration_secs"],
+            "transcript": transcript,
+            "recording_url": e["recording_url"] or "",
+        }
+        callback_url = e["callback_url"]
+
+    try:
+        requests.post(
+            callback_url,
+            headers={"X-Eva-Secret": EVA_API_SECRET, "Content-Type": "application/json"},
+            json=payload, timeout=15,
+        )
+        log("VOICELINK", f"callback sent for {call_id} (recording_url={'yes' if payload['recording_url'] else 'no'})")
+    except Exception as e:
+        log("VOICELINK", f"callback POST failed for {call_id}: {e}")
+    finally:
+        with _call_results_lock:
+            CALL_RESULTS.pop(call_id, None)
+
 
 def log(stage: str, msg: str):
     ts = time.strftime("%H:%M:%S")
@@ -2791,14 +2861,16 @@ def api_place_call_voicelink():
 def voicelink_webhook(call_id):
     payload = request.get_json(silent=True) or {}
     event = (payload.get("event") or "").lower()
-    log("VOICELINK", f"webhook call_id={call_id} event={event}")
+    log("VOICELINK", f"webhook call_id={call_id} event={event} recordingUrl={payload.get('recordingUrl')!r}")
 
-    if event in ("call.ended", "call.completed"):
+    if event == "call.ended":
         bridge = VOICELINK_BRIDGES.get(call_id)
         if bridge:
             bridge.close()
             VOICELINK_BRIDGES.pop(call_id, None)
         else:
+            # Never connected (no answer / busy / failed) - nothing to wait for,
+            # report straight away like before.
             with _pending_calls_lock:
                 cfg = PENDING_CALLS.pop(call_id, None)
             if cfg and cfg.get("callback_url"):
@@ -2810,12 +2882,54 @@ def voicelink_webhook(call_id):
                             "call_id": call_id, "status": "no_response",
                             "hangup_reason": payload.get("callStatus", event),
                             "duration_secs": payload.get("duration", 0), "transcript": [],
+                            "recording_url": payload.get("recordingUrl") or "",
                         },
                         timeout=15,
                     )
                 except Exception as e:
                     log("VOICELINK", f"callback POST failed for {call_id}: {e}")
+        # remember VoiceLink's own duration/status (more accurate than agent's clock)
+        if payload.get("duration"):
+            with _call_results_lock:
+                e = CALL_RESULTS.setdefault(call_id, _new_call_result())
+                e["duration_secs"] = payload["duration"]
+
+    elif event == "call.completed":
+        # Recording is ready. Store the URL, then send to Pravaah if the
+        # transcript from agent.py has already arrived (else it goes out as
+        # soon as the transcript lands - see /api/internal/call-result).
+        with _call_results_lock:
+            e = CALL_RESULTS.setdefault(call_id, _new_call_result())
+            e["recording_url"] = payload.get("recordingUrl") or ""
+            e["recording_done"] = True
+            if payload.get("duration"):
+                e["duration_secs"] = payload["duration"]
+        _arm_finalize_timer(call_id)
+        _finalize_call(call_id)
+
     return jsonify({"received": True})
+
+
+@app.route("/api/internal/call-result/<call_id>", methods=["POST"])
+def api_internal_call_result(call_id):
+    """agent.py posts the final transcript here when a VoiceLink call ends.
+    Auth: same X-Eva-Secret as everything else."""
+    if not EVA_API_SECRET or request.headers.get("X-Eva-Secret") != EVA_API_SECRET:
+        return jsonify({"ok": False, "error": "Invalid or missing X-Eva-Secret"}), 401
+    data = request.get_json(silent=True) or {}
+    with _call_results_lock:
+        e = CALL_RESULTS.setdefault(call_id, _new_call_result())
+        if data.get("callback_url"):
+            e["callback_url"] = data["callback_url"]
+        e["transcript"] = data.get("transcript") or []
+        e["status"] = data.get("status")
+        e["hangup_reason"] = data.get("hangup_reason") or "completed"
+        if not e["duration_secs"]:
+            e["duration_secs"] = data.get("duration_secs") or 0
+    log("VOICELINK", f"transcript received for {call_id} ({len(e['transcript'])} lines), waiting for recording url")
+    _arm_finalize_timer(call_id)
+    _finalize_call(call_id)
+    return jsonify({"ok": True})
 
 #did update
 
@@ -2893,6 +3007,12 @@ def voicelink_ws(ws, call_id):
         VOICELINK_BRIDGES.pop(call_id, None)
         with _pending_calls_lock:
             PENDING_CALLS.pop(call_id, None)
+        # Keep callback_url alive so transcript (agent.py) + recording URL
+        # (call.completed webhook) can still be delivered together afterwards.
+        with _call_results_lock:
+            _e = CALL_RESULTS.setdefault(call_id, _new_call_result())
+            _e["callback_url"] = _e["callback_url"] or cfg.get("callback_url")
+        _arm_finalize_timer(call_id)
         log("VOICELINK", f"Outbound call {call_id} disconnected.")
 
 if __name__ == "__main__":

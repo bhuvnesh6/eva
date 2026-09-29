@@ -62,7 +62,7 @@ CLOUDFLARE_TEMPERATURE = float(os.environ.get("CLOUDFLARE_TEMPERATURE", "0.4"))
 SARVAM_API_KEY = os.environ.get("SARVAM_API_KEY", "")
 SARVAM_LLM_MODEL = os.environ.get("SARVAM_LLM_MODEL", "sarvam-105b-conversations")
 SARVAM_LLM_TEMPERATURE = float(os.environ.get("SARVAM_LLM_TEMPERATURE", "0.4"))
-SARVAM_LLM_MAX_TOKENS = int(os.environ.get("SARVAM_LLM_MAX_TOKENS", "240"))
+SARVAM_LLM_MAX_TOKENS = int(os.environ.get("SARVAM_LLM_MAX_TOKENS", "140"))
 
 # ---------------- Sarvam (TTS) ----------------
 SARVAM_TTS_MODEL = os.environ.get("SARVAM_TTS_MODEL", "bulbul:v3")
@@ -74,7 +74,7 @@ PRAVAAH_API_BASE_URL = os.environ.get("PRAVAAH_API_BASE_URL", "").rstrip("/")
 GLOBAL_TTS_MODEL = os.environ.get("GLOBAL_TTS_MODEL", "inworld/inworld-tts-2")
 VOICE_MALE = os.environ.get("EVA_VOICE_MALE", "shubh")
 VOICE_FEMALE = os.environ.get("EVA_VOICE_FEMALE", "priya")
-TTS_SPEED = float(os.environ.get("EVA_TTS_SPEED", "1.0"))
+TTS_SPEED = max(0.8, min(1.4, float(os.environ.get("EVA_TTS_SPEED", "1.4"))))
 
 SENTENCE_END_RE = re.compile(r"([.!?।\n])")
 HINDI_RE = re.compile(r"[\u0900-\u097F]")
@@ -85,6 +85,26 @@ SPEAKABLE_RE = re.compile(r"[A-Za-z0-9\u0900-\u097F]")
 # Hard ceiling on spoken chars per reply (~15 chars/sec of audio => 200 chars ~ 13s)
 MAX_SPOKEN_CHARS = int(os.environ.get("EVA_MAX_SPOKEN_CHARS", "200"))
 
+# ---------------- Latency tuning ----------------
+# How long the agent waits after the caller stops before replying, worst case.
+# Was hard-coded 3.0 -> this was the biggest source of the 4-7s delay.
+MIN_ENDPOINTING_DELAY = float(os.environ.get("EVA_MIN_ENDPOINTING_DELAY", "0.2"))
+MAX_ENDPOINTING_DELAY = float(os.environ.get("EVA_MAX_ENDPOINTING_DELAY", "1.2"))
+# "multilingual" = smart turn-detector model (default). "vad" = plain silence-based,
+# fastest, but may cut in on slow talkers. Try "vad" if still too slow.
+TURN_DETECTION_MODE = os.environ.get("EVA_TURN_DETECTION", "multilingual").strip().lower()
+# First spoken chunk may be flushed at a comma once it has this many chars,
+# so TTS starts before the LLM finishes the whole first sentence.
+FIRST_CLAUSE_RE = re.compile(r"[,;](?=\s)")
+MIN_FIRST_CHUNK_CHARS = int(os.environ.get("EVA_MIN_FIRST_CHUNK_CHARS", "18"))
+
+# Where this worker can reach Eva's Flask app (app.py) to hand over the final
+# transcript. Same container -> http://127.0.0.1:8420 ; otherwise PUBLIC_BASE_URL.
+EVA_INTERNAL_BASE_URL = (
+    os.environ.get("EVA_INTERNAL_BASE_URL")
+    or os.environ.get("PUBLIC_BASE_URL")
+    or ("http://127.0.0.1:" + os.environ.get("PORT", "8420"))
+).rstrip("/")
 
 def _detect_lang(text: str) -> str:
     return "hi" if HINDI_RE.search(text) else "en"
@@ -199,6 +219,18 @@ class EvaAgent(Agent):
             buffer = parts[i] if i < len(parts) else ""
 
             sentence = complete.strip()
+
+            # Early flush: for the FIRST chunk of a reply only, don't wait for a
+            # full sentence - cut at the first comma once we have enough text.
+            # Shorter first chunk = LLM finishes it sooner AND Sarvam TTS
+            # synthesizes it faster, so the caller hears Eva ~0.5-1s earlier.
+            if not sentence and spoken_chars == 0:
+                for m in FIRST_CLAUSE_RE.finditer(buffer):
+                    if m.end() >= MIN_FIRST_CHUNK_CHARS:
+                        sentence = buffer[:m.end()].strip()
+                        buffer = buffer[m.end():]
+                        break
+
             if not sentence:
                 continue
             has_tag = bool(BOOK_MEETING_RE.search(sentence))
@@ -457,11 +489,11 @@ async def entrypoint(ctx: JobContext) -> None:
         stt=deepgram.STT(model="nova-3", language="multi"),
         llm=llm,
         tts=global_tts,
-        turn_detection=MultilingualModel(),
+        turn_detection=("vad" if TURN_DETECTION_MODE == "vad" else MultilingualModel()),
         allow_interruptions=True,
         min_interruption_duration=0.4,
-        min_endpointing_delay=0.2,
-        max_endpointing_delay=3.0,
+        min_endpointing_delay=MIN_ENDPOINTING_DELAY,
+        max_endpointing_delay=MAX_ENDPOINTING_DELAY,
         preemptive_generation=True,       # start generating before the user's turn is fully finalized
         resume_false_interruption=True,   # resume speaking if a "barge-in" turns out to be noise
         false_interruption_timeout=1.5,
@@ -475,6 +507,18 @@ async def entrypoint(ctx: JobContext) -> None:
                lambda ev: logger.info("agent state: %s -> %s", ev.old_state, ev.new_state))
     session.on("user_input_transcribed",
                lambda ev: logger.info("USER SAID (final=%s): %s", ev.is_final, ev.transcript))
+
+    def _log_latency(ev):
+        # Look for: end_of_utterance_delay (turn wait), ttft (LLM first token),
+        # ttfb (TTS first byte). Whichever is biggest is what to fix next.
+        try:
+            m = ev.metrics
+            logger.info("LATENCY %s %s", type(m).__name__, m)
+            print(f"[EVA-LATENCY] {type(m).__name__} {m}", flush=True)
+        except Exception:
+            pass
+
+    session.on("metrics_collected", _log_latency)
 
     transcript = []
     call_started_at = time.time()
@@ -496,22 +540,41 @@ async def entrypoint(ctx: JobContext) -> None:
     async def _finish_and_callback():
         for usage in session.usage.model_usage:
             logger.info("usage %s/%s: %s", usage.provider, usage.model, usage)
-        if not (callback_url and call_id and EVA_API_SECRET):
+        if not (call_id and EVA_API_SECRET):
+            return
+
+        headers = {"X-Eva-Secret": EVA_API_SECRET, "Content-Type": "application/json"}
+        result = {
+            "call_id": call_id,
+            "callback_url": callback_url,
+            "status": "completed" if transcript else "no_response",
+            "hangup_reason": "completed",
+            "duration_secs": round(time.time() - call_started_at, 1),
+            "transcript": transcript,
+        }
+
+        # 1) Preferred: hand the transcript to Eva's Flask app. It holds it until
+        #    VoiceLink's call.completed webhook brings the recording URL, then
+        #    sends ONE callback to Pravaah with transcript + recording_url.
+        try:
+            async with httpx.AsyncClient() as client:
+                r = await client.post(
+                    f"{EVA_INTERNAL_BASE_URL}/api/internal/call-result/{call_id}",
+                    headers=headers, json=result, timeout=10,
+                )
+            if r.status_code < 300:
+                logger.info("transcript handed to Eva app for call_id=%r", call_id)
+                return
+            logger.error("internal call-result HTTP %s: %s", r.status_code, r.text[:200])
+        except Exception as e:
+            logger.error(f"internal call-result POST failed for {call_id}: {e}")
+
+        # 2) Fallback: Flask unreachable -> post straight to Pravaah (no recording url).
+        if not callback_url:
             return
         try:
             async with httpx.AsyncClient() as client:
-                await client.post(
-                    callback_url,
-                    headers={"X-Eva-Secret": EVA_API_SECRET, "Content-Type": "application/json"},
-                    json={
-                        "call_id": call_id,
-                        "status": "completed" if transcript else "no_response",
-                        "hangup_reason": "completed",
-                        "duration_secs": round(time.time() - call_started_at, 1),
-                        "transcript": transcript,
-                    },
-                    timeout=15,
-                )
+                await client.post(callback_url, headers=headers, json=result, timeout=15)
         except Exception as e:
             logger.error(f"callback POST failed for {call_id}: {e}")
 
