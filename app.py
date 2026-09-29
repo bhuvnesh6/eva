@@ -2860,6 +2860,13 @@ def api_place_call_voicelink():
 @app.route("/api/voicelink/webhook/<call_id>", methods=["POST"])
 def voicelink_webhook(call_id):
     payload = request.get_json(silent=True) or {}
+    # VoiceLink nests call details (recordingUrl, durationSec, callStatus...) under "call".
+    # Flatten them to the top level so the code below can read them directly.
+    _call = payload.get("call") if isinstance(payload.get("call"), dict) else {}
+    if _call:
+        payload = {**_call, **{k: v for k, v in payload.items() if k != "call"}}
+        if _call.get("durationSec") is not None:
+            payload["duration"] = _call["durationSec"]
     event = (payload.get("event") or "").lower()
     log("VOICELINK", f"webhook call_id={call_id} event={event} recordingUrl={payload.get('recordingUrl')!r}")
     log("VOICELINK", f"webhook FULL payload: {json.dumps(payload, default=str)[:2000]}")
