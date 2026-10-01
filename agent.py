@@ -21,9 +21,13 @@ import re
 import time
 from typing import AsyncIterable
 
+import io
+import wave
+import audioop   # py3.13+: pip install audioop-lts (same as Eva app.py)
 import httpx
 import requests
 from dotenv import load_dotenv
+from livekit import rtc
 
 from livekit.agents import (
     Agent,
@@ -110,6 +114,57 @@ def _detect_lang(text: str) -> str:
     return "hi" if HINDI_RE.search(text) else "en"
 
 
+# ---------------- Pre-recorded opening line ----------------
+_OPENING_AUDIO_CACHE = {}   # (url, rate) -> mono PCM16 bytes
+
+
+async def _prepare_opening_audio(url: str, target_rate: int):
+    """Downloads the agent's pre-generated opening-line WAV (Cloudinary) and
+    converts it to mono PCM16 at the TTS output rate. Started as a background
+    task at the top of the call so it's ready before the greeting is needed."""
+    if not url:
+        return None
+    key = (url, target_rate)
+    cached = _OPENING_AUDIO_CACHE.get(key)
+    if cached:
+        return cached
+    try:
+        async with httpx.AsyncClient() as client:
+            r = await client.get(url, timeout=8)
+            r.raise_for_status()
+        with wave.open(io.BytesIO(r.content), "rb") as wf:
+            channels, width, rate = wf.getnchannels(), wf.getsampwidth(), wf.getframerate()
+            frames = wf.readframes(wf.getnframes())
+        if width != 2:
+            frames = audioop.lin2lin(frames, width, 2)
+        if channels > 1:
+            frames = audioop.tomono(frames, 2, 0.5, 0.5)
+        if rate != target_rate:
+            frames, _ = audioop.ratecv(frames, 2, 1, rate, target_rate, None)
+        if len(_OPENING_AUDIO_CACHE) > 50:
+            _OPENING_AUDIO_CACHE.clear()
+        _OPENING_AUDIO_CACHE[key] = frames
+        return frames
+    except Exception:
+        logger.exception("could not load pre-recorded opening audio: %s", url)
+        return None
+
+
+async def _pcm_frames(pcm: bytes, rate: int, chunk_ms: int = 20):
+    """Async generator of rtc.AudioFrame for session.say(audio=...)."""
+    step = max(2, (rate * chunk_ms // 1000) * 2)
+    for i in range(0, len(pcm), step):
+        chunk = pcm[i:i + step]
+        if len(chunk) % 2:
+            chunk = chunk[:-1]
+        if not chunk:
+            continue
+        yield rtc.AudioFrame(
+            data=chunk, sample_rate=rate, num_channels=1,
+            samples_per_channel=len(chunk) // 2,
+        )
+
+
 def _sarvam_lang_code(lang: str) -> str:
     """Internal 'en'/'hi' -> Sarvam's BCP-47 target_language_code."""
     return "hi-IN" if lang == "hi" else "en-IN"
@@ -161,7 +216,9 @@ def book_meeting_via_pravaah(meeting_ctx: dict, lead: dict, call_id: str, reques
 class EvaAgent(Agent):
     def __init__(self, instructions: str, global_tts: inference.TTS,
                  meeting: dict, lead: dict, call_id: str, opening_line: str = "",
-                 forced_lang: str = None, persona_name: str = ""):
+                 forced_lang: str = None, persona_name: str = "",
+                 opening_audio_task=None, opening_audio_text: str = "",
+                 opening_audio_rate: int = 22050):
         super().__init__(instructions=instructions)
         self._global_tts = global_tts
         self._meeting = meeting or {}
@@ -170,11 +227,42 @@ class EvaAgent(Agent):
         self._opening_line = opening_line
         self._forced_lang = forced_lang
         self._persona_name = persona_name
+        self._opening_audio_task = opening_audio_task
+        self._opening_audio_text = opening_audio_text
+        self._opening_audio_rate = opening_audio_rate
+
+    async def _play_prerecorded_opening(self) -> bool:
+        """Plays the pre-generated opening audio instantly. Interruptible like any
+        other speech (user barge-in stops it and the normal AI flow continues).
+        The text is added to chat context so the LLM knows it was already said.
+        Returns False if unavailable so the caller falls back to live TTS."""
+        if self._opening_audio_task is None:
+            return False
+        try:
+            pcm = await asyncio.wait_for(asyncio.shield(self._opening_audio_task), timeout=3.0)
+        except Exception:
+            logger.warning("opening audio not ready in time, falling back to live TTS")
+            return False
+        if not pcm:
+            return False
+        try:
+            await self.session.say(
+                self._opening_audio_text or self._opening_line,
+                audio=_pcm_frames(pcm, self._opening_audio_rate),
+                allow_interruptions=True,
+            )
+            logger.info("pre-recorded opening line played for call_id=%r", self._call_id)
+            return True
+        except Exception:
+            logger.exception("pre-recorded opening failed, falling back to live TTS")
+            return False
 
     async def on_enter(self) -> None:
         logger.info("on_enter: call_id=%r persona_name=%r greeting=%r",
                     self._call_id, self._persona_name, self._opening_line)
         try:
+            if await self._play_prerecorded_opening():
+                return
             if self._opening_line:
                 # session.say() bypasses tts_node()/_speak() entirely, so
                 # without this the opening line always played in whatever
@@ -448,6 +536,16 @@ async def entrypoint(ctx: JobContext) -> None:
         global_tts.prewarm()   # open the Sarvam WebSocket now, not on the first sentence
     except Exception:
         pass
+
+    # Pre-recorded opening line: start downloading NOW (in parallel with session
+    # setup) so it's ready the instant on_enter runs.
+    opening_audio_url = (agent_cfg.get("opening_audio_url") or "").strip()
+    opening_audio_text = (agent_cfg.get("opening_audio_text") or "").strip()
+    opening_audio_rate = int(getattr(global_tts, "sample_rate", 22050) or 22050)
+    opening_audio_task = (
+        asyncio.create_task(_prepare_opening_audio(opening_audio_url, opening_audio_rate))
+        if opening_audio_url else None
+    )
  
     if LLM_PROVIDER == "sarvam" and SARVAM_API_KEY:
         # Sarvam accepts "Authorization: Bearer <key>", so LiveKit's OpenAI
@@ -609,6 +707,9 @@ async def entrypoint(ctx: JobContext) -> None:
         opening_line=opening_line,
         forced_lang=tts_lang,
         persona_name=persona_name,
+        opening_audio_task=opening_audio_task,
+        opening_audio_text=opening_audio_text,
+        opening_audio_rate=opening_audio_rate,
     )
 
     await session.start(
