@@ -364,30 +364,7 @@ def _finalize_call(call_id, force=False):
         payload.update(e.get("extra") or {})
         callback_url = e["callback_url"]
 
-    try:
-        requests.post(
-            callback_url,
-            headers={"X-Eva-Secret": EVA_API_SECRET, "Content-Type": "application/json"},
-            json=payload, timeout=15,
-        )
-        log("VOICELINK", f"callback sent for {call_id} (recording_url={'yes' if payload['recording_url'] else 'no'})")
-    except Exception as e:
-        log("VOICELINK", f"callback POST failed for {call_id}: {e}")
-    finally:
-        with _call_results_lock:
-            CALL_RESULTS.pop(call_id, None)
-    try:
-        requests.post(
-            callback_url,
-            headers={"X-Eva-Secret": EVA_API_SECRET, "Content-Type": "application/json"},
-            json=payload, timeout=15,
-        )
-        log("VOICELINK", f"callback sent for {call_id} (recording_url={'yes' if payload['recording_url'] else 'no'})")
-    except Exception as e:
-        log("VOICELINK", f"callback POST failed for {call_id}: {e}")
-    finally:
-        with _call_results_lock:
-            CALL_RESULTS.pop(call_id, None)
+
 
 
 def log(stage: str, msg: str):
