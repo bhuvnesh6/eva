@@ -83,9 +83,40 @@ TTS_SPEED = max(0.8, min(1.4, float(os.environ.get("EVA_TTS_SPEED", "1.4"))))
 SENTENCE_END_RE = re.compile(r"([.!?।\n])")
 HINDI_RE = re.compile(r"[\u0900-\u097F]")
 BOOK_MEETING_RE = re.compile(r"BOOK_MEETING:\s*(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2})")
-LANG_NAMES = {"en": "English", "hi": "Hindi"}
-SUPPORTED_LANGUAGES = {"en", "hi"}
-SPEAKABLE_RE = re.compile(r"[A-Za-z0-9\u0900-\u097F]")
+LANGUAGES = {
+    "en":  {"name": "English",    "tts": "en-IN", "script": None},
+    "hi":  {"name": "Hindi",      "tts": "hi-IN", "script": None},   # Hinglish (Roman) - unchanged behaviour
+    "hr":  {"name": "Haryanvi",   "tts": "hi-IN", "script": "Devanagari", "dialect": True},
+    "raj": {"name": "Rajasthani", "tts": "hi-IN", "script": "Devanagari", "dialect": True},
+    "bho": {"name": "Bhojpuri",   "tts": "hi-IN", "script": "Devanagari", "dialect": True},
+    "pa":  {"name": "Punjabi",    "tts": "pa-IN", "script": "Gurmukhi"},
+    "gu":  {"name": "Gujarati",   "tts": "gu-IN", "script": "Gujarati"},
+    "mr":  {"name": "Marathi",    "tts": "mr-IN", "script": "Devanagari"},
+    "bn":  {"name": "Bengali",    "tts": "bn-IN", "script": "Bengali"},
+    "ta":  {"name": "Tamil",      "tts": "ta-IN", "script": "Tamil"},
+    "te":  {"name": "Telugu",     "tts": "te-IN", "script": "Telugu"},
+    "kn":  {"name": "Kannada",    "tts": "kn-IN", "script": "Kannada"},
+    "ml":  {"name": "Malayalam",  "tts": "ml-IN", "script": "Malayalam"},
+    "od":  {"name": "Odia",       "tts": "od-IN", "script": "Odia"},
+}
+LANG_NAMES = {k: v["name"] for k, v in LANGUAGES.items()}
+SUPPORTED_LANGUAGES = set(LANGUAGES)
+SPEAKABLE_RE = re.compile(r"[A-Za-z0-9\u0900-\u0D7F]")   # Latin + all major Indic scripts
+SCRIPT_LANG_RES = [
+    (re.compile(r"[\u0900-\u097F]"), "hi"),
+    (re.compile(r"[\u0980-\u09FF]"), "bn"),
+    (re.compile(r"[\u0A00-\u0A7F]"), "pa"),
+    (re.compile(r"[\u0A80-\u0AFF]"), "gu"),
+    (re.compile(r"[\u0B00-\u0B7F]"), "od"),
+    (re.compile(r"[\u0B80-\u0BFF]"), "ta"),
+    (re.compile(r"[\u0C00-\u0C7F]"), "te"),
+    (re.compile(r"[\u0C80-\u0CFF]"), "kn"),
+    (re.compile(r"[\u0D00-\u0D7F]"), "ml"),
+]
+SARVAM_STT_MODEL = os.environ.get("SARVAM_STT_MODEL", "saarika:v2.5")
+# "deepgram" (default) = auto-language calls use Deepgram multi. "sarvam" = auto calls use Sarvam
+# language auto-detect, which understands all Indian languages.
+AUTO_STT = os.environ.get("EVA_AUTO_STT", "deepgram").strip().lower()
 # Hard ceiling on spoken chars per reply (~15 chars/sec of audio => 200 chars ~ 13s)
 MAX_SPOKEN_CHARS = int(os.environ.get("EVA_MAX_SPOKEN_CHARS", "200"))
 
@@ -111,7 +142,51 @@ EVA_INTERNAL_BASE_URL = (
 ).rstrip("/")
 
 def _detect_lang(text: str) -> str:
-    return "hi" if HINDI_RE.search(text) else "en"
+    """Script-based: Devanagari -> hi, Gujarati script -> gu, Gurmukhi -> pa, ... else en."""
+    for rx, code in SCRIPT_LANG_RES:
+        if rx.search(text or ""):
+            return code
+    return "en"
+
+
+def _pick_tts_lang(text: str, forced: str = None) -> str:
+    """If the sentence is written in a specific Indic script, use that language's voice.
+    Otherwise use the call's configured language (so Haryanvi/Marathi in Devanagari
+    keep their own setting instead of collapsing to plain Hindi)."""
+    detected = _detect_lang(text)
+    if detected not in ("en", "hi"):
+        return detected
+    return forced or detected
+
+
+def _reply_language_rule(lang: str) -> str:
+    cfg = LANGUAGES.get(lang)
+    if not cfg or lang == "en":
+        return "Always reply in English only."
+    name = cfg["name"]
+    if not cfg["script"]:
+        return (f"Always reply in casual, natural {name} written in Roman/English letters (Hinglish) - the way "
+                "people actually type it day to day. NEVER use Devanagari or any native script, unless the user explicitly writes in English.")
+    rule = (f"Always reply in casual, natural spoken {name}, written in {cfg['script']} script "
+            "(never Roman letters), exactly how people talk on a phone call.")
+    if cfg.get("dialect"):
+        rule += f" Use real {name} words, grammar and tone - not standard textbook Hindi."
+    return rule
+
+
+def _build_stt(language):
+    """Regional languages -> Sarvam STT (understands Indian languages). English/Hindi/auto -> Deepgram
+    as before. If Sarvam STT can't be created, falls back to Deepgram so calls never fail."""
+    lang = language if language in SUPPORTED_LANGUAGES else None
+    regional = lang is not None and lang not in ("en", "hi")
+    if SARVAM_API_KEY and (regional or (lang is None and AUTO_STT == "sarvam")):
+        code = LANGUAGES[lang]["tts"] if lang else "unknown"
+        try:
+            logger.info("STT: using Sarvam (%s, model=%s)", code, SARVAM_STT_MODEL)
+            return sarvam.STT(language=code, model=SARVAM_STT_MODEL)
+        except Exception:
+            logger.exception("sarvam.STT failed to initialise - falling back to Deepgram")
+    return deepgram.STT(model="nova-3", language="multi")
 
 
 # ---------------- Pre-recorded opening line ----------------
@@ -166,8 +241,8 @@ async def _pcm_frames(pcm: bytes, rate: int, chunk_ms: int = 20):
 
 
 def _sarvam_lang_code(lang: str) -> str:
-    """Internal 'en'/'hi' -> Sarvam's BCP-47 target_language_code."""
-    return "hi-IN" if lang == "hi" else "en-IN"
+    """Internal language key -> Sarvam's BCP-47 target_language_code."""
+    return (LANGUAGES.get(lang) or LANGUAGES["en"])["tts"]
 
 
 def render_call_vars(text: str, lead: dict) -> str:
@@ -268,7 +343,7 @@ class EvaAgent(Agent):
                 # without this the opening line always played in whatever
                 # language the TTS was initialized with (English) - ignoring
                 # the agent's configured/forced language for every call.
-                lang = self._forced_lang or _detect_lang(self._opening_line)
+                lang = _pick_tts_lang(self._opening_line, self._forced_lang)
                 try:
                     self._global_tts.update_options(target_language_code=_sarvam_lang_code(lang), pace=TTS_SPEED)
                 except Exception:
@@ -359,7 +434,7 @@ class EvaAgent(Agent):
         # Hindi replies are written in Hinglish (Roman script) there's no
         # Devanagari left for _detect_lang to key off, so it would silently
         # fall back to "en" every time and use the wrong voice/pronunciation.
-        lang = self._forced_lang or _detect_lang(sentence)
+        lang = _pick_tts_lang(sentence, self._forced_lang)
         try:
             self._global_tts.update_options(target_language_code=_sarvam_lang_code(lang), pace=TTS_SPEED)
         except Exception:
@@ -399,19 +474,16 @@ def _build_instructions(agent_cfg: dict, lead: dict, meeting: dict):
             f"{lead.get('business_name', 'their business')}. Use their name naturally, don't overuse it."
         )
     forced_lang = agent_cfg.get("language") if agent_cfg.get("language") in SUPPORTED_LANGUAGES else None
-    if forced_lang and forced_lang != "en":
-        base += (
-            f"\nAlways reply in casual, natural {LANG_NAMES.get(forced_lang, forced_lang)} written "
-            "in Roman/English letters (Hinglish) - the way people actually type it day to day. "
-            "NEVER use Devanagari or any native script, unless the user explicitly writes in English."
-        )
-    elif forced_lang == "en":
-        base += "\nAlways reply in English only."
+    if forced_lang:
+        base += "\nLANGUAGE RULE (always follow): " + _reply_language_rule(forced_lang)
     else:
         base += (
             "\nLanguage rule: follow the persona's language style above. Default to casual "
             "Hinglish (Hindi written in Roman/English letters, never Devanagari). "
-            "Only switch to full English if the caller clearly speaks only English."
+            "Only switch to full English if the caller clearly speaks only English. "
+            "If the caller clearly speaks another Indian language (Gujarati, Punjabi, Marathi, Bengali, "
+            "Tamil, Telugu, Kannada, Malayalam, Odia, Haryanvi...), reply in that same language "
+            "in its own native script."
         )
     # Same gender-agreement rule as app.py's EvaSession - keeps karta/karti
     # consistent with agent_cfg.gender (the same field that picks the voice
@@ -423,8 +495,10 @@ def _build_instructions(agent_cfg: dict, lead: dict, meeting: dict):
         "feminine (e.g. main karti hoon, main bol rahi hoon, main thi)"
     )
     base += (
-        f"\nGRAMMATICAL GENDER: whenever you speak Hindi or Hinglish, always refer to "
-        f"yourself using {gender_forms} verb forms. Stay consistent for the entire call - never switch."
+        f"\nGRAMMATICAL GENDER: whenever you speak Hindi, Hinglish or any other gendered Indian "
+        f"language (Punjabi, Gujarati, Marathi, Haryanvi, etc.), always refer to yourself using the "
+        f"{'masculine' if agent_cfg.get('gender') == 'male' else 'feminine'} form of verbs and adjectives, "
+        f"e.g. for Hindi {gender_forms}. Stay consistent for the entire call - never switch."
     )
     base += "\nNever reply using only emojis or symbols with no words."
     name_rule = (
@@ -584,7 +658,7 @@ async def entrypoint(ctx: JobContext) -> None:
     # doesn't recognize, so this can't crash on an older build.
     _session_kwargs = dict(
         vad=ctx.proc.userdata["vad"],
-        stt=deepgram.STT(model="nova-3", language="multi"),
+        stt=_build_stt(agent_cfg.get("language")),
         llm=llm,
         tts=global_tts,
         turn_detection=("vad" if TURN_DETECTION_MODE == "vad" else MultilingualModel()),

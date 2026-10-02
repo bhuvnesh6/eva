@@ -79,14 +79,59 @@ SENTENCE_END_RE = re.compile(r"([.!?।\n])")
 # Matches Latin, Devanagari, Bengali, Tamil, Telugu, Kannada, or Malayalam
 # characters — used to decide if a chunk of text has anything speakable.
 # --- NEW ---
-SPEAKABLE_RE = re.compile(r"[A-Za-z0-9\u0900-\u097F]")   # Latin or Devanagari
+SPEAKABLE_RE = re.compile(r"[A-Za-z0-9\u0900-\u0D7F]")   # Latin + all major Indic scripts
 DEVANAGARI_RE = re.compile(r"[\u0900-\u097F]")
 BOOK_MEETING_RE = re.compile(r"BOOK_MEETING:\s*(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2})")
 
 
-# ---------------- Language support: English + Hindi only ----------------
-SUPPORTED_LANGUAGES = {"en", "hi"}
-LANG_NAMES = {"en": "English", "hi": "Hindi"}
+# ---------------- Language support: English, Hindi + Indian languages/dialects ----------------
+# tts = Sarvam language code (also used for Sarvam STT). script None = Roman/Hinglish.
+LANGUAGES = {
+    "en":  {"name": "English",    "tts": "en-IN", "script": None},
+    "hi":  {"name": "Hindi",      "tts": "hi-IN", "script": None},
+    "hr":  {"name": "Haryanvi",   "tts": "hi-IN", "script": "Devanagari", "dialect": True},
+    "raj": {"name": "Rajasthani", "tts": "hi-IN", "script": "Devanagari", "dialect": True},
+    "bho": {"name": "Bhojpuri",   "tts": "hi-IN", "script": "Devanagari", "dialect": True},
+    "pa":  {"name": "Punjabi",    "tts": "pa-IN", "script": "Gurmukhi"},
+    "gu":  {"name": "Gujarati",   "tts": "gu-IN", "script": "Gujarati"},
+    "mr":  {"name": "Marathi",    "tts": "mr-IN", "script": "Devanagari"},
+    "bn":  {"name": "Bengali",    "tts": "bn-IN", "script": "Bengali"},
+    "ta":  {"name": "Tamil",      "tts": "ta-IN", "script": "Tamil"},
+    "te":  {"name": "Telugu",     "tts": "te-IN", "script": "Telugu"},
+    "kn":  {"name": "Kannada",    "tts": "kn-IN", "script": "Kannada"},
+    "ml":  {"name": "Malayalam",  "tts": "ml-IN", "script": "Malayalam"},
+    "od":  {"name": "Odia",       "tts": "od-IN", "script": "Odia"},
+}
+SUPPORTED_LANGUAGES = set(LANGUAGES)
+LANG_NAMES = {k: v["name"] for k, v in LANGUAGES.items()}
+
+# script -> language key (Devanagari maps to "hi")
+SCRIPT_LANG_RES = [
+    (re.compile(r"[\u0900-\u097F]"), "hi"),
+    (re.compile(r"[\u0980-\u09FF]"), "bn"),
+    (re.compile(r"[\u0A00-\u0A7F]"), "pa"),
+    (re.compile(r"[\u0A80-\u0AFF]"), "gu"),
+    (re.compile(r"[\u0B00-\u0B7F]"), "od"),
+    (re.compile(r"[\u0B80-\u0BFF]"), "ta"),
+    (re.compile(r"[\u0C00-\u0C7F]"), "te"),
+    (re.compile(r"[\u0C80-\u0CFF]"), "kn"),
+    (re.compile(r"[\u0D00-\u0D7F]"), "ml"),
+]
+
+
+def reply_language_rule(lang: str) -> str:
+    """Prompt line telling the LLM which language + script to reply in."""
+    cfg = LANGUAGES.get(lang)
+    if not cfg or lang == "en":
+        return "Reply in English only."
+    name = cfg["name"]
+    if not cfg["script"]:
+        return f"Reply in casual {name}, written in Roman/English letters (Hinglish) - do NOT use Devanagari or any native script."
+    rule = (f"Reply only in casual, natural spoken {name}, written in {cfg['script']} script "
+            f"(never Roman letters), the way people actually talk on a phone call.")
+    if cfg.get("dialect"):
+        rule += f" Use real {name} words, grammar and tone - not standard textbook Hindi."
+    return rule
 
 # ---------------- LiveKit voice (TTS) ----------------
 # No more Sarvam — TTS now goes through LiveKit's hosted Inference API,
@@ -160,7 +205,7 @@ SARVAM_SUPPORTED_RATES = (8000, 16000, 22050, 24000)
 # "temperature" (0.01-1.0, default 0.6) - controls expressiveness/randomness.
 SARVAM_TTS_TEMPERATURE = float(os.environ.get("SARVAM_TTS_TEMPERATURE", "0.6"))
 # Internal "en"/"hi" -> Sarvam's BCP-47 target_language_code.
-SARVAM_LANG_CODES = {"en": "en-IN", "hi": "hi-IN"}
+SARVAM_LANG_CODES = {k: v["tts"] for k, v in LANGUAGES.items()}
 
 # ---------------- IVR (play recording -> wait -> STT -> hang up) ----------------
 import io
@@ -172,7 +217,19 @@ IVR_STT_LANGUAGE = os.environ.get("EVA_IVR_STT_LANGUAGE", "multi")
 IVR_MIN_SPEECH_RMS = int(os.environ.get("EVA_IVR_MIN_SPEECH_RMS", 250))     # 16-bit RMS below this = silence/noise
 IVR_PLAY_LEAD_SECS = 0.3
 
-IVR_NO_TOKENS = {"no", "nope", "nah", "nahi", "nahin", "nahii", "nai", "mat", "नहीं", "नही", "नहिं", "मत"}
+IVR_NO_TOKENS = {
+    "no", "nope", "nah", "nahi", "nahin", "nahii", "nai", "mat", "नहीं", "नही", "नहिं", "मत",
+    # Marathi / Haryanvi / Rajasthani / Bhojpuri
+    "नाही", "नको", "नका", "कोनी", "नाहीं", "नइखे", "नइखी",
+    # Gujarati / Punjabi
+    "ના", "નહીં", "નહિ", "નથી", "ਨਹੀਂ", "ਨਹੀ", "ਨਾ",
+    # Bengali / Odia
+    "না", "নয়", "ନାହିଁ", "ନା", "ନୁହେଁ",
+    # Tamil / Telugu / Kannada / Malayalam
+    "இல்லை", "வேண்டாம்", "வேணாம்", "లేదు", "వద్దు", "కాదు", "ಇಲ್ಲ", "ಬೇಡ", "ഇല്ല", "വേണ്ട", "അല്ല",
+}
+# "ना" is "no" in Haryanvi/Bhojpuri but also a filler in Hindi ("theek hai na") -> only counts in very short replies
+IVR_NO_TOKENS_SHORT_ONLY = {"ना"}
 IVR_NO_PHRASES = ("not interested", "don't", "dont", "do not", "no thanks", "no thank you")
 
 _IVR_AUDIO_CACHE = {}
@@ -183,8 +240,10 @@ def ivr_is_negative(text: str) -> bool:
     t = (text or "").lower()
     if any(p in t for p in IVR_NO_PHRASES):
         return True
-    tokens = re.findall(r"[\w\u0900-\u097F]+", t)
-    return any(tok in IVR_NO_TOKENS for tok in tokens)
+    tokens = re.findall(r"[\w\u0900-\u0DFF]+", t)   # \u0900-\u0DFF keeps Indic vowel signs inside words
+    if any(tok in IVR_NO_TOKENS for tok in tokens):
+        return True
+    return len(tokens) <= 3 and any(tok in IVR_NO_TOKENS_SHORT_ONLY for tok in tokens)
 
 # ---------------- LLM provider switch ----------------
 # Set LLM_PROVIDER=gemini in .env to swap Eva's brain from Groq to Gemini,
@@ -378,9 +437,12 @@ def is_speakable(text: str) -> bool:
 
 # --- NEW ---
 def detect_lang(text: str) -> str:
-    """English/Hindi only: Devanagari means Hindi, anything else (including
-    Hinglish/romanized Hindi) falls back to English."""
-    return "hi" if DEVANAGARI_RE.search(text) else "en"
+    """Script-based detection: Devanagari -> hi, Gujarati script -> gu, Gurmukhi -> pa, etc.
+    Anything else (including Roman-script Hinglish) falls back to English."""
+    for rx, code in SCRIPT_LANG_RES:
+        if rx.search(text or ""):
+            return code
+    return "en"
 
 
 def _build_ulaw_decode_table():
@@ -711,16 +773,17 @@ class EvaSession:
                 f"{lead.get('business_name', 'their business')}."
             )
 
-        if self.forced_language and self.forced_language != "en":
-            lang_label = LANG_NAMES.get(self.forced_language, self.forced_language)
-            base_prompt += f" Reply only in casual {lang_label}, Roman script (Hinglish), never Devanagari."
-        elif self.forced_language == "en":
-            base_prompt += " Reply in English only."
+        if self.forced_language:
+            base_prompt += " " + reply_language_rule(self.forced_language)
         else:
-            base_prompt += " Default to English; if the user speaks Hindi, reply in Hinglish (Roman script, never Devanagari)."
+            base_prompt += (
+                " Default to English; if the user speaks Hindi, reply in Hinglish (Roman script, never Devanagari). "
+                "If the user clearly speaks another Indian language (Gujarati, Punjabi, Marathi, Bengali, Tamil, "
+                "Telugu, Kannada, Malayalam, Odia, Haryanvi...), reply in that same language in its own native script."
+            )
 
         gender_forms = "masculine" if self.gender == "male" else "feminine"
-        base_prompt += f" In Hindi/Hinglish always use {gender_forms} self-reference verb forms, consistently."
+        base_prompt += f" In Hindi/Hinglish and every other gendered Indian language always use {gender_forms} self-reference verb forms, consistently."
 
         base_prompt += (
             " LENGTH RULE (always follow): this is a live phone call. Reply in 1-2 short "
@@ -1359,17 +1422,7 @@ class EvaSession:
                 # Tells the model exactly which script to answer in for THIS
                 # turn, matching what detect_lang() picked up. Native script
                 # (not romanized) so Sarvam's TTS pronounces it correctly.
-                if user_lang == "en":
-                    lang_note = {"role": "system", "content": "(Reply in English only.)"}
-                else:
-                    lang_label = LANG_NAMES.get(user_lang, user_lang)
-                    lang_note = {
-                        "role": "system",
-                        "content": (
-                            f"(Reply in casual {lang_label}, written in Roman/English letters "
-                            f"i.e. Hinglish - do NOT use Devanagari or any native script.)"
-                        ),
-                    }
+                lang_note = {"role": "system", "content": f"({reply_language_rule(user_lang)})"}
                 self.history.append({"role": "user", "content": user_text})
                 self._send_json({"type": "status", "state": "thinking"})
 
@@ -3028,6 +3081,42 @@ def deepgram_transcribe_pcm(pcm16: bytes, rate: int) -> str:
     return (alt.get("transcript") or "").strip()
 
 
+SARVAM_STT_URL = "https://api.sarvam.ai/speech-to-text"
+SARVAM_STT_MODEL = os.environ.get("SARVAM_STT_MODEL", "saarika:v2.5")
+
+
+def sarvam_transcribe_pcm(pcm16: bytes, rate: int, language_code: str) -> str:
+    """One-shot Sarvam STT (supports hi/bn/gu/kn/ml/mr/od/pa/ta/te/en)."""
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(rate)
+        wf.writeframes(pcm16)
+    resp = requests.post(
+        SARVAM_STT_URL,
+        headers={"api-subscription-key": SARVAM_API_KEY},
+        files={"file": ("reply.wav", buf.getvalue(), "audio/wav")},
+        data={"model": SARVAM_STT_MODEL, "language_code": language_code},
+        timeout=25,
+    )
+    resp.raise_for_status()
+    return (resp.json().get("transcript") or "").strip()
+
+
+def transcribe_ivr_pcm(pcm16: bytes, rate: int, language: str = "") -> str:
+    """Regional IVR languages -> Sarvam STT. English / Hindi / auto -> Deepgram (unchanged)."""
+    cfg = LANGUAGES.get(language or "")
+    if cfg and language not in ("en", "hi") and SARVAM_API_KEY:
+        try:
+            return sarvam_transcribe_pcm(pcm16, rate, cfg["tts"])
+        except Exception as e:
+            log("IVR", f"Sarvam STT failed ({language}), falling back to Deepgram: {e}")
+    return deepgram_transcribe_pcm(pcm16, rate)
+
+
+
+
 class VoiceLinkIVRSession:
     """One IVR call: play audio -> wait for reply -> STT -> hang up -> report."""
 
@@ -3133,7 +3222,7 @@ class VoiceLinkIVRSession:
         if not loud:
             return ""
         try:
-            return deepgram_transcribe_pcm(pcm, VOICELINK_RATE)
+            return transcribe_ivr_pcm(pcm, VOICELINK_RATE, self.ivr.get("language", ""))
         except Exception as e:
             log("IVR", f"call {self.call_id}: STT failed: {e}")
             return ""
