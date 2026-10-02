@@ -117,6 +117,9 @@ SARVAM_STT_MODEL = os.environ.get("SARVAM_STT_MODEL", "saarika:v2.5")
 # "deepgram" (default) = auto-language calls use Deepgram multi. "sarvam" = auto calls use Sarvam
 # language auto-detect, which understands all Indian languages.
 AUTO_STT = os.environ.get("EVA_AUTO_STT", "deepgram").strip().lower()
+# "1" = English/Hindi agents also use Sarvam STT with language auto-detect, so they can follow
+# a caller who asks to switch to Tamil/Gujarati/etc. mid-call.
+ALLOW_SWITCH_STT = os.environ.get("EVA_ALLOW_LANG_SWITCH_STT", "0") == "1"
 # Hard ceiling on spoken chars per reply (~15 chars/sec of audio => 200 chars ~ 13s)
 MAX_SPOKEN_CHARS = int(os.environ.get("EVA_MAX_SPOKEN_CHARS", "200"))
 
@@ -179,8 +182,9 @@ def _build_stt(language):
     as before. If Sarvam STT can't be created, falls back to Deepgram so calls never fail."""
     lang = language if language in SUPPORTED_LANGUAGES else None
     regional = lang is not None and lang not in ("en", "hi")
-    if SARVAM_API_KEY and (regional or (lang is None and AUTO_STT == "sarvam")):
-        code = LANGUAGES[lang]["tts"] if lang else "unknown"
+    auto_like = lang is None or lang in ("en", "hi")
+    if SARVAM_API_KEY and (regional or (auto_like and (AUTO_STT == "sarvam" or ALLOW_SWITCH_STT))):
+        code = LANGUAGES[lang]["tts"] if regional else "unknown"
         try:
             logger.info("STT: using Sarvam (%s, model=%s)", code, SARVAM_STT_MODEL)
             return sarvam.STT(language=code, model=SARVAM_STT_MODEL)
@@ -475,15 +479,21 @@ def _build_instructions(agent_cfg: dict, lead: dict, meeting: dict):
         )
     forced_lang = agent_cfg.get("language") if agent_cfg.get("language") in SUPPORTED_LANGUAGES else None
     if forced_lang:
-        base += "\nLANGUAGE RULE (always follow): " + _reply_language_rule(forced_lang)
+        base += (
+            "\nLANGUAGE RULE (always follow): "
+            + _reply_language_rule(forced_lang).replace("Always reply", "By default reply")
+            + " EXCEPTION: if the caller explicitly asks you to speak in another language "
+              "(for example 'please speak in Tamil'), switch to that language immediately, write in "
+              "its own native script, and stay in it until they ask to change again."
+        )
     else:
         base += (
             "\nLanguage rule: follow the persona's language style above. Default to casual "
             "Hinglish (Hindi written in Roman/English letters, never Devanagari). "
             "Only switch to full English if the caller clearly speaks only English. "
-            "If the caller clearly speaks another Indian language (Gujarati, Punjabi, Marathi, Bengali, "
-            "Tamil, Telugu, Kannada, Malayalam, Odia, Haryanvi...), reply in that same language "
-            "in its own native script."
+            "If the caller clearly speaks another Indian language, or asks you to speak in one "
+            "(Gujarati, Punjabi, Marathi, Bengali, Tamil, Telugu, Kannada, Malayalam, Odia, Haryanvi...), "
+            "switch to that language and reply in its own native script until they ask to change."
         )
     # Same gender-agreement rule as app.py's EvaSession - keeps karta/karti
     # consistent with agent_cfg.gender (the same field that picks the voice
