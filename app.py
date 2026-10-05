@@ -377,7 +377,8 @@ _call_results_lock = threading.Lock()
 def _new_call_result():
     return {
         "callback_url": None, "transcript": None, "status": None,
-        "hangup_reason": "completed", "duration_secs": 0,
+        "hangup_reason": "completed", "hangup_cause": "", "answered": False,
+        "duration_secs": 0,
         "recording_url": None, "recording_done": False,
         "sent": False, "timer": None,
         "extra": {},          # extra fields merged into the Pravah callback (used by IVR)
@@ -396,6 +397,47 @@ def _arm_finalize_timer(call_id):
         t.start()
 
 
+def _classify_call_result(e, transcript):
+    """Returns: answered | answered_no_reply | cut_by_user | not_answered"""
+    reason = (e.get("hangup_reason") or "").lower()
+    m = re.match(r"\s*(\d+)", str(e.get("hangup_cause") or ""))
+    code = m.group(1) if m else ""
+    lead_spoke = any(t.get("role") == "lead" for t in (transcript or []))
+    try:
+        dur = float(e.get("duration_secs") or 0)
+    except (TypeError, ValueError):
+        dur = 0.0
+
+    if not (e.get("answered") or lead_spoke):
+        # never picked up. Cause 16 while ringing = customer rejected/cut it; anything else = no answer/busy/unreachable
+        return "cut_by_user" if code == "16" else "not_answered"
+    if lead_spoke:
+        return "answered"
+    if reason == "hangup_during_playback":
+        return "cut_by_user"
+    if (e.get("extra") or {}).get("call_mode") != "ivr" and dur < 10:
+        return "cut_by_user"          # picked up and hung up straight away
+    return "answered_no_reply"        # picked up but stayed silent
+
+
+def _post_call_result(callback_url, payload):
+    """POST to Pravah, 3 attempts."""
+    for attempt in range(3):
+        try:
+            r = requests.post(
+                callback_url,
+                headers={"X-Eva-Secret": EVA_API_SECRET, "Content-Type": "application/json"},
+                json=payload, timeout=15,
+            )
+            log("CALLBACK", f"{payload.get('call_id')} -> Pravah HTTP {r.status_code} result={payload.get('call_result')}")
+            if r.status_code < 500:
+                return r.status_code < 300
+        except Exception as ex:
+            log("CALLBACK", f"POST failed for {payload.get('call_id')} (try {attempt + 1}): {ex}")
+        time.sleep(2)
+    return False
+
+
 def _finalize_call(call_id, force=False):
     with _call_results_lock:
         e = CALL_RESULTS.get(call_id)
@@ -412,10 +454,14 @@ def _finalize_call(call_id, force=False):
         if e["timer"]:
             e["timer"].cancel()
         transcript = e["transcript"] or []
+        call_result = _classify_call_result(e, transcript)
         payload = {
             "call_id": call_id,
             "status": e["status"] or ("completed" if transcript else "no_response"),
             "hangup_reason": e["hangup_reason"],
+            "hangup_cause": e.get("hangup_cause", ""),
+            "answered": bool(e.get("answered")),
+            "call_result": call_result,
             "duration_secs": e["duration_secs"],
             "transcript": transcript,
             "recording_url": e["recording_url"] or "",
@@ -423,6 +469,9 @@ def _finalize_call(call_id, force=False):
         payload.update(e.get("extra") or {})
         callback_url = e["callback_url"]
 
+    _post_call_result(callback_url, payload)
+    with _call_results_lock:
+        CALL_RESULTS.pop(call_id, None)
 
 
 
@@ -2932,8 +2981,7 @@ def api_place_call_voicelink():
 @app.route("/api/voicelink/webhook/<call_id>", methods=["POST"])
 def voicelink_webhook(call_id):
     payload = request.get_json(silent=True) or {}
-    # VoiceLink nests call details (recordingUrl, durationSec, callStatus...) under "call".
-    # Flatten them to the top level so the code below can read them directly.
+    # VoiceLink nests call details under "call" in some payloads - flatten.
     _call = payload.get("call") if isinstance(payload.get("call"), dict) else {}
     if _call:
         payload = {**_call, **{k: v for k, v in payload.items() if k != "call"}}
@@ -2943,41 +2991,26 @@ def voicelink_webhook(call_id):
     log("VOICELINK", f"webhook call_id={call_id} event={event} recordingUrl={payload.get('recordingUrl')!r}")
     log("VOICELINK", f"webhook FULL payload: {json.dumps(payload, default=str)[:2000]}")
 
-    if event == "call.ended":
-        bridge = VOICELINK_BRIDGES.get(call_id)
-        if bridge:
-            bridge.close()
-            VOICELINK_BRIDGES.pop(call_id, None)
-        else:
-            # Never connected (no answer / busy / failed) - nothing to wait for,
-            # report straight away like before.
-            with _pending_calls_lock:
-                cfg = PENDING_CALLS.pop(call_id, None)
-            if cfg and cfg.get("callback_url"):
-                try:
-                    requests.post(
-                        cfg["callback_url"],
-                        headers={"X-Eva-Secret": EVA_API_SECRET, "Content-Type": "application/json"},
-                        json={
-                            "call_id": call_id, "status": "no_response",
-                            "hangup_reason": payload.get("callStatus", event),
-                            "duration_secs": payload.get("duration", 0), "transcript": [],
-                            "recording_url": payload.get("recordingUrl") or "",
-                        },
-                        timeout=15,
-                    )
-                except Exception as e:
-                    log("VOICELINK", f"callback POST failed for {call_id}: {e}")
-        # remember VoiceLink's own duration/status (more accurate than agent's clock)
-        if payload.get("duration"):
-            with _call_results_lock:
-                e = CALL_RESULTS.setdefault(call_id, _new_call_result())
-                e["duration_secs"] = payload["duration"]
+    # inbound / unknown calls arrive with call_id="placeholder" - not a Pravah call
+    if not re.fullmatch(r"[0-9a-f]{24}", call_id or ""):
+        return jsonify({"received": True})
 
-    elif event == "call.completed":
-        # Recording is ready. Store the URL, then send to Pravaah if the
-        # transcript from agent.py has already arrived (else it goes out as
-        # soon as the transcript lands - see /api/internal/call-result).
+    hangup_cause = str(payload.get("hangupCause") or "")
+    call_status = str(payload.get("callStatus") or "").upper()
+    answered = bool(payload.get("answeredAt")) or event == "call.answered" or call_status == "ANSWERED"
+    duration = payload.get("duration") or payload.get("durationSec") or 0
+
+    if event in ("call.initiated", "call.ringing"):
+        return jsonify({"received": True})
+
+    if event == "call.answered":
+        with _call_results_lock:
+            e = CALL_RESULTS.setdefault(call_id, _new_call_result())
+            e["answered"] = True
+        return jsonify({"received": True})
+
+    if event == "call.completed":
+        # Recording is ready. Store the URL, send to Pravah once the transcript is in too.
         with _call_results_lock:
             e = CALL_RESULTS.setdefault(call_id, _new_call_result())
             _rec = (
@@ -2986,13 +3019,51 @@ def voicelink_webhook(call_id):
             )
             e["recording_url"] = _rec if isinstance(_rec, str) else ""
             e["recording_done"] = True
-            if payload.get("duration"):
-                e["duration_secs"] = payload["duration"]
+            e["answered"] = True
+            if hangup_cause:
+                e["hangup_cause"] = hangup_cause
+            if duration:
+                e["duration_secs"] = duration
         _arm_finalize_timer(call_id)
         _finalize_call(call_id)
+        return jsonify({"received": True})
 
+    if event in ("call.ended", "call.failed"):
+        with _call_results_lock:
+            e = CALL_RESULTS.get(call_id)
+            if e is not None:
+                if answered:
+                    e["answered"] = True
+                if hangup_cause:
+                    e["hangup_cause"] = hangup_cause
+                if duration:
+                    e["duration_secs"] = duration
+
+        bridge = VOICELINK_BRIDGES.get(call_id)
+        if bridge:
+            bridge.close()
+            VOICELINK_BRIDGES.pop(call_id, None)
+            return jsonify({"received": True})
+
+        # Websocket never connected (no answer / rejected / busy / failed) -> report to Pravah now
+        with _pending_calls_lock:
+            cfg = PENDING_CALLS.pop(call_id, None)
+        if cfg and cfg.get("callback_url"):
+            info = {
+                "answered": answered, "hangup_cause": hangup_cause,
+                "hangup_reason": "", "duration_secs": 0,
+                "extra": {"call_mode": cfg.get("call_mode", "ai")},
+            }
+            result = _classify_call_result(info, [])
+            _post_call_result(cfg["callback_url"], {
+                "call_id": call_id, "status": "no_response",
+                "hangup_reason": payload.get("hangupReason") or call_status or event,
+                "hangup_cause": hangup_cause, "answered": answered,
+                "call_result": result, "call_mode": cfg.get("call_mode", "ai"),
+                "duration_secs": 0, "transcript": [],
+                "recording_url": payload.get("recordingUrl") or "",
+            })
     return jsonify({"received": True})
-
 
 @app.route("/api/internal/call-result/<call_id>", methods=["POST"])
 def api_internal_call_result(call_id):
@@ -3313,6 +3384,7 @@ class VoiceLinkIVRSession:
             e["transcript"] = self.transcript
             e["status"] = "completed" if self.answered else "no_response"
             e["hangup_reason"] = self.hangup_reason
+            e["answered"] = bool(e.get("answered")) or self.started.is_set()
             if not e["duration_secs"]:
                 e["duration_secs"] = self.duration
             e["extra"] = {
