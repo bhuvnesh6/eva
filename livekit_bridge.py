@@ -96,11 +96,22 @@ def _submit(coro):
 
 
 
+# ---------------- inbound-call tuning ----------------
+PREBUF_MAX_SECS = 15              # max caller audio kept while the agent is still warming up
+PREBUF_SPEECH_RMS = 250           # below this = silence / line noise
+PREBUF_PRE_ROLL_MS = 300          # keep this much audio before the first spoken word
+INBOUND_LIVE_FALLBACK_SECS = 10   # go live anyway if the agent never reports subscribing
+GREETING_LEAD_SECS = 0.3          # send greeting audio this far ahead of real time
+HANGUP_TAIL_SECS = 0.8            # let the last agent words play before cutting the call
+
+
 class VoiceLinkBridge:
-    """One instance per VoiceLink call."""
+    """One instance per VoiceLink call (outbound OR inbound)."""
 
     def __init__(self, call_id: str, ws, agent_cfg: dict, lead: dict,
-                 meeting: dict, callback_url: str):
+                 meeting: dict, callback_url: str,
+                 inbound: bool = False, greeting_audio: bytes = None,
+                 greeting_text: str = "", call_sid: str = None):
         self.call_id = call_id
         self.ws = ws                      # the flask-sock VoiceLink websocket
         self.ws_lock = threading.Lock()
@@ -108,7 +119,12 @@ class VoiceLinkBridge:
         self.lead = lead
         self.meeting = meeting
         self.callback_url = callback_url
+        self.inbound = inbound
+        self.greeting_audio = greeting_audio   # A-law bytes that Eva itself plays (inbound only)
+        self.greeting_text = greeting_text
+        self.call_sid = call_sid
         self.room_name = f"voicelink-{call_id}-{uuid.uuid4().hex[:8]}"
+        self._trunk_identity = f"voicelink-trunk-{call_id}"
 
         self.room = None
         self.source = None
@@ -116,17 +132,32 @@ class VoiceLinkBridge:
         self._closed = threading.Event()
 
         # outbound audio (agent -> phone): filled by the LiveKit loop thread,
-        # drained by a gevent greenlet that owns the websocket
+        # drained by a thread that owns the websocket
         self._out = deque()
         self.started = threading.Event()   # set when VoiceLink's "start" event arrives
         self.stream_sid = None
         self._sent_frames = 0
         self._in_frames = 0
 
+        # inbound audio (phone -> room). Everything below is touched ONLY on the
+        # LiveKit loop thread, so no locks are needed and frame order is guaranteed.
+        self._live = False
+        self._prebuf = bytearray()
+        self._in_q = None
+
+        # Eva plays the greeting itself; agent audio waits until it is done
+        self.greeting_done = threading.Event()
+        if not (inbound and greeting_audio):
+            self.greeting_done.set()
+
+        self._agent_joined = False
+        self._hangup_flag = False
+        self._hangup_done = False
+
     # ---------------- lifecycle ----------------
     def start(self):
         """Creates the room, connects the trunk participant, publishes the
-        audio track, THEN dispatches Eva. Blocks until done."""
+        audio track, THEN dispatches the agent. Blocks until done."""
         _run(self._async_start(), timeout=40)
         _RealThread(target=self._sender_loop, daemon=True, name="VoiceLinkSender").start()
         _submit(self._heartbeat())
@@ -145,7 +176,7 @@ class VoiceLinkBridge:
 
         token = (
             api.AccessToken(LIVEKIT_API_KEY, LIVEKIT_API_SECRET)
-            .with_identity(f"voicelink-trunk-{self.call_id}")
+            .with_identity(self._trunk_identity)
             .with_name("VoiceLink Trunk")
             .with_grants(api.VideoGrants(room_join=True, room=self.room_name))
             .to_jwt()
@@ -153,10 +184,9 @@ class VoiceLinkBridge:
 
         self.room = rtc.Room()
         self.room.on("track_subscribed", self._on_track_subscribed)
-        self.room.on("participant_connected",
-                     lambda p: print(f"[VOICELINK-BRIDGE] participant joined: {p.identity} kind={p.kind}", flush=True))
-        self.room.on("participant_disconnected",
-                     lambda p: print(f"[VOICELINK-BRIDGE] participant left: {p.identity}", flush=True))
+        self.room.on("participant_connected", self._on_participant_connected)
+        self.room.on("participant_disconnected", self._on_participant_disconnected)
+        self.room.on("local_track_subscribed", self._on_local_track_subscribed)
 
         print(f"[VOICELINK-BRIDGE] connecting trunk to {self.room_name}...", flush=True)
         await self.room.connect(LIVEKIT_URL, token, options=rtc.RoomOptions(auto_subscribe=True))
@@ -169,23 +199,29 @@ class VoiceLinkBridge:
         )
         print(f"[VOICELINK-BRIDGE] audio track published for {self.room_name}", flush=True)
 
-        # Dispatch Eva only now, so she joins a room that already has the caller's mic.
+        # ordered pump: caller audio -> room
+        self._in_q = asyncio.Queue()
+        asyncio.ensure_future(self._pump_inbound())
+        if self.inbound:
+            # inbound: keep buffering the caller until the agent has actually subscribed
+            asyncio.ensure_future(self._live_fallback())
+        else:
+            # outbound: the agent greets first, so go live right away (old behaviour)
+            self._loop_go_live()
+
+        # Dispatch the agent only now, so it joins a room that already has the caller's mic.
         metadata = json.dumps({
             "agent": self.agent_cfg,
             "lead": self.lead,
             "meeting": self.meeting,
             "call_id": self.call_id,
             "callback_url": self.callback_url,
+            "inbound": self.inbound,
+            "greeting_played": bool(self.greeting_audio),   # Eva already plays it -> agent must not repeat it
+            "greeting_text": self.greeting_text or "",
         })
-        # Full agent/lead/meeting exactly as received from Pravaah, right
-        # before it's handed to LiveKit's dispatch — confirms the bridge
-        # itself didn't drop or mangle anything from app.py.
-        print(f"[VOICELINK-BRIDGE] agent_cfg from Pravaah for call_id={self.call_id}: "
+        print(f"[VOICELINK-BRIDGE] agent_cfg from Pravah for call_id={self.call_id}: "
               f"{json.dumps(self.agent_cfg, default=str)}", flush=True)
-        print(f"[VOICELINK-BRIDGE] lead from Pravaah for call_id={self.call_id}: "
-              f"{json.dumps(self.lead, default=str)}", flush=True)
-        print(f"[VOICELINK-BRIDGE] meeting from Pravaah for call_id={self.call_id}: "
-              f"{json.dumps(self.meeting, default=str)}", flush=True)
         print(f"[VOICELINK-BRIDGE] full dispatch metadata for call_id={self.call_id}: {metadata}", flush=True)
         lkapi = self._lk_api()
         try:
@@ -219,8 +255,6 @@ class VoiceLinkBridge:
         except Exception as e:
             print(f"[VOICELINK-BRIDGE] diagnose failed: {type(e).__name__}: {e!r}", flush=True)
 
-    # ---------------- inbound: VoiceLink -> LiveKit room ----------------
-    
     async def _heartbeat(self):
         """Proves the LiveKit loop thread is alive and shows what it sees."""
         for n in range(1, 8):
@@ -229,23 +263,133 @@ class VoiceLinkBridge:
                 return
             who = [p.identity for p in self.room.remote_participants.values()] if self.room else []
             print(f"[VOICELINK-BRIDGE] loop alive t={n*2}s in_frames={self._in_frames} "
-                  f"out_queue={len(self._out)} sent={self._sent_frames} remote={who}", flush=True)
-    
+                  f"out_queue={len(self._out)} sent={self._sent_frames} live={self._live} remote={who}", flush=True)
+
+    # ---------------- room events (run on the LiveKit loop thread) ----------------
+    def _on_participant_connected(self, p):
+        print(f"[VOICELINK-BRIDGE] participant joined: {p.identity} kind={p.kind}", flush=True)
+        if p.identity != self._trunk_identity:
+            self._agent_joined = True
+
+    def _on_participant_disconnected(self, p):
+        print(f"[VOICELINK-BRIDGE] participant left: {p.identity}", flush=True)
+        if p.identity != self._trunk_identity and self._agent_joined and not self._closed.is_set():
+            # the agent ended the session (caller said bye / max duration / crash) -> cut the phone call
+            print("[VOICELINK-BRIDGE] agent left the room -> hanging up the caller", flush=True)
+            self._hangup_flag = True
+
+    def _on_local_track_subscribed(self, *args):
+        # the agent is now listening to the caller's mic -> flush what the caller said while it warmed up
+        print("[VOICELINK-BRIDGE] agent subscribed to caller audio -> going live", flush=True)
+        self._loop_go_live()
+
+    async def _live_fallback(self):
+        await asyncio.sleep(INBOUND_LIVE_FALLBACK_SECS)
+        if not self._live:
+            print("[VOICELINK-BRIDGE] agent subscription not seen in time -> going live anyway", flush=True)
+            self._loop_go_live()
+
+    # ---------------- inbound: VoiceLink -> LiveKit room ----------------
     def feed_alaw(self, alaw_bytes: bytes):
-        """Call from the VoiceLink websocket thread for every inbound
-        'media' frame. Decodes A-law -> linear16 and pushes it into the
-        room. Fire-and-forget so the websocket read loop never blocks."""
-        if self._closed.is_set() or self.source is None:
+        """Call from the VoiceLink websocket thread for every inbound 'media'
+        frame. Decodes A-law -> linear16 and hands it to the loop thread, which
+        either buffers it (agent still warming up) or pushes it into the room."""
+        if self._closed.is_set():
             return
         self._in_frames += 1
         if self._in_frames == 1:
             print(f"[VOICELINK-BRIDGE] first inbound audio frame ({len(alaw_bytes)} bytes)", flush=True)
         pcm16 = audioop.alaw2lin(alaw_bytes, 2)
-        frame = rtc.AudioFrame(
+        _bridge_loop.loop.call_soon_threadsafe(self._loop_ingest, pcm16)
+
+    def _loop_ingest(self, pcm16: bytes):
+        if self._closed.is_set():
+            return
+        if not self._live:
+            self._prebuf.extend(pcm16)
+            cap = ROOM_AUDIO_RATE * 2 * PREBUF_MAX_SECS
+            if len(self._prebuf) > cap:
+                del self._prebuf[:len(self._prebuf) - cap]
+            return
+        self._put_frame(pcm16)
+
+    def _put_frame(self, pcm16: bytes):
+        if self._in_q is None:
+            return
+        if len(pcm16) % 2:
+            pcm16 = pcm16[:-1]
+        if len(pcm16) < 2:
+            return
+        self._in_q.put_nowait(rtc.AudioFrame(
             data=pcm16, sample_rate=ROOM_AUDIO_RATE, num_channels=1,
             samples_per_channel=len(pcm16) // 2,
-        )
-        _submit(self.source.capture_frame(frame))
+        ))
+
+    def _trim_prebuf(self, pcm: bytes) -> bytes:
+        """Drops the silent lead-in so the agent isn't fed seconds of nothing, but keeps a
+        short pre-roll before the first spoken word. If the caller said nothing yet,
+        only a short tail is kept."""
+        win = int(ROOM_AUDIO_RATE * 0.1) * 2                      # 100 ms of pcm16
+        pre_roll = int(PREBUF_PRE_ROLL_MS / 100) * win // 1       # 300 ms
+        if len(pcm) % 2:
+            pcm = pcm[:-1]
+        first_loud = None
+        for i in range(0, len(pcm), win):
+            seg = pcm[i:i + win]
+            if len(seg) >= 2 and audioop.rms(seg, 2) >= PREBUF_SPEECH_RMS:
+                first_loud = i
+                break
+        if first_loud is None:
+            return pcm[-pre_roll:] if pre_roll else b""
+        return pcm[max(0, first_loud - pre_roll):]
+
+    def _loop_go_live(self):
+        """Loop thread only. Flushes the buffered caller audio, then streams live."""
+        if self._live or self._in_q is None:
+            return
+        buffered = bytes(self._prebuf)
+        self._prebuf = bytearray()
+        trimmed = self._trim_prebuf(buffered) if buffered else b""
+        step = int(ROOM_AUDIO_RATE * 0.02) * 2                    # 20 ms frames
+        for i in range(0, len(trimmed), step):
+            self._put_frame(trimmed[i:i + step])
+        self._live = True
+        print(f"[VOICELINK-BRIDGE] live: flushed {len(trimmed)/(ROOM_AUDIO_RATE*2):.2f}s of buffered caller audio "
+              f"(buffered {len(buffered)/(ROOM_AUDIO_RATE*2):.2f}s)", flush=True)
+
+    async def _pump_inbound(self):
+        while True:
+            frame = await self._in_q.get()
+            if frame is None or self._closed.is_set():
+                break
+            try:
+                await self.source.capture_frame(frame)
+            except Exception as e:
+                print(f"[VOICELINK-BRIDGE] capture_frame failed: {type(e).__name__}: {e!r}", flush=True)
+
+    # ---------------- greeting (inbound, played by Eva itself) ----------------
+    def play_greeting(self):
+        """Plays Eva's own greeting recording straight to the caller, paced at real time,
+        while the LiveKit room / STT / LLM / TTS warm up. Agent audio is held back
+        until this finishes (greeting_done)."""
+        audio = self.greeting_audio
+        try:
+            if not audio:
+                return
+            chunk_bytes = max(160, int(ROOM_AUDIO_RATE * 0.1))     # 100 ms per chunk (1 byte/sample)
+            t0 = time.time()
+            print(f"[VOICELINK-BRIDGE] playing greeting ({len(audio)/ROOM_AUDIO_RATE:.1f}s) for {self.call_id}", flush=True)
+            for i in range(0, len(audio), chunk_bytes):
+                if self._closed.is_set():
+                    return
+                wait = (t0 + (i / ROOM_AUDIO_RATE) - GREETING_LEAD_SECS) - time.time()
+                if wait > 0:
+                    time.sleep(wait)
+                self._send_media_chunk(audio[i:i + chunk_bytes])
+        except Exception as e:
+            print(f"[VOICELINK-BRIDGE] greeting playback failed: {type(e).__name__}: {e!r}", flush=True)
+        finally:
+            self.greeting_done.set()
 
     # ---------------- outbound: LiveKit room -> VoiceLink ----------------
     def _on_track_subscribed(self, track, publication, participant):
@@ -271,11 +415,22 @@ class VoiceLinkBridge:
                 self._out.append(buf[:160])
                 buf = buf[160:]
 
+    def _send_media_chunk(self, chunk: bytes):
+        with self.ws_lock:
+            self.ws.send(json.dumps({
+                "event": "media",
+                "stream_sid": self.stream_sid,
+                "media": {"payload": base64.b64encode(chunk).decode("ascii")},
+            }))
+
     def _sender_loop(self):
-        """Plain OS thread: the only place that writes agent audio to the
-        VoiceLink websocket. Waits for VoiceLink's 'start' event first."""
+        """Plain OS thread: the only place that writes agent audio to the VoiceLink
+        websocket. Waits for VoiceLink's 'start' event and for the greeting to finish."""
         while not self._closed.is_set():
-            if not self.started.is_set() or not self._out:
+            if self._hangup_flag:
+                self._do_hangup()
+                return
+            if (not self.started.is_set() or not self.greeting_done.is_set() or not self._out):
                 time.sleep(0.005)
                 continue
             try:
@@ -283,18 +438,44 @@ class VoiceLinkBridge:
             except IndexError:
                 continue
             try:
-                with self.ws_lock:
-                    self.ws.send(json.dumps({
-                        "event": "media",
-                        "stream_sid": self.stream_sid,
-                        "media": {"payload": base64.b64encode(chunk).decode("ascii")},
-                    }))
+                self._send_media_chunk(chunk)
                 self._sent_frames += 1
                 if self._sent_frames == 1:
                     print("[VOICELINK-BRIDGE] first audio frame SENT to VoiceLink", flush=True)
             except Exception as e:
                 print(f"[VOICELINK-BRIDGE] ws send failed: {type(e).__name__}: {e!r}", flush=True)
                 time.sleep(0.05)
+
+    # ---------------- hang up (agent said goodbye / left the room) ----------------
+    def request_hangup(self):
+        self._hangup_flag = True
+
+    def _do_hangup(self):
+        """Flushes the last agent words, then cuts the call with VoiceLink's `stop`
+        event (same event the IVR uses) and closes the socket."""
+        if self._hangup_done:
+            return
+        self._hangup_done = True
+        try:
+            t0 = time.time()
+            while self._out and time.time() - t0 < 4:
+                try:
+                    self._send_media_chunk(self._out.popleft())
+                except IndexError:
+                    break
+            time.sleep(HANGUP_TAIL_SECS)
+            if self.call_sid:
+                with self.ws_lock:
+                    self.ws.send(json.dumps({"event": "stop", "stop": {"callSid": self.call_sid}}))
+                print(f"[VOICELINK-BRIDGE] stop event sent (call_sid={self.call_sid})", flush=True)
+                time.sleep(0.3)
+        except Exception as e:
+            print(f"[VOICELINK-BRIDGE] hangup error: {type(e).__name__}: {e!r}", flush=True)
+        finally:
+            try:
+                self.ws.close()
+            except Exception:
+                pass
 
     def clear_playback(self):
         """Best-effort barge-in flush signal to VoiceLink."""
@@ -310,5 +491,11 @@ class VoiceLinkBridge:
         if self._closed.is_set():
             return
         self._closed.set()
+        self.greeting_done.set()
+        if self._in_q is not None:
+            try:
+                _bridge_loop.loop.call_soon_threadsafe(self._in_q.put_nowait, None)
+            except Exception:
+                pass
         if self.room:
             _submit(self.room.disconnect())

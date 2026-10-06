@@ -2991,9 +2991,15 @@ def voicelink_webhook(call_id):
     log("VOICELINK", f"webhook call_id={call_id} event={event} recordingUrl={payload.get('recordingUrl')!r}")
     log("VOICELINK", f"webhook FULL payload: {json.dumps(payload, default=str)[:2000]}")
 
-    # inbound / unknown calls arrive with call_id="placeholder" - not a Pravah call
+    # Calls we placed carry a real 24-hex call_id in the URL. Calls where the customer
+    # dialed our DID arrive as call_id="placeholder" -> map them back to the Pravah call
+    # record that the websocket handler created for that call.
     if not re.fullmatch(r"[0-9a-f]{24}", call_id or ""):
-        return jsonify({"received": True})
+        mapped = _lookup_inbound_call(payload)
+        if not mapped:
+            return jsonify({"received": True})   # e.g. call.initiated - websocket not connected yet
+        log("VOICELINK", f"inbound webhook mapped via id/number -> call_id={mapped}")
+        call_id = mapped
 
     hangup_cause = str(payload.get("hangupCause") or "")
     call_status = str(payload.get("callStatus") or "").upper()
@@ -3397,11 +3403,13 @@ class VoiceLinkIVRSession:
         _finalize_call(self.call_id)
 
 
-def _run_voicelink_ivr(ws, call_id, cfg):
+def _run_voicelink_ivr(ws, call_id, cfg, start_data=None):
     session = VoiceLinkIVRSession(ws, call_id, cfg)
     VOICELINK_BRIDGES[call_id] = session      # so the call.ended webhook can close it
     session.start()
-    log("VOICELINK", f"Outbound call {call_id}: IVR mode, audio={session.audio_url}")
+    if start_data:                            # inbound: the start event was already consumed
+        session.on_start(start_data)
+    log("VOICELINK", f"call {call_id}: IVR mode, audio={session.audio_url}")
 
     try:
         while True:
@@ -3442,6 +3450,234 @@ def _run_voicelink_ivr(ws, call_id, cfg):
             PENDING_CALLS.pop(call_id, None)
         log("VOICELINK", f"IVR call {call_id} disconnected.")
 
+
+# ============================================================
+# VoiceLink INBOUND  (customer dials our DID)
+# ============================================================
+INBOUND_CALL_MAP = {}            # "sid:<call_sid>" / "pair:<from10>:<to10>" -> {"call_id", "ts"}
+_inbound_map_lock = threading.Lock()
+INBOUND_MAP_TTL_SECS = 3 * 3600
+
+
+def _last10(num) -> str:
+    return re.sub(r"\D", "", str(num or ""))[-10:]
+
+
+def _register_inbound_call(call_id, call_sid, from_number, to_number):
+    """Remembers which Pravah call_id belongs to a VoiceLink inbound call, so the
+    'placeholder' webhooks (call.completed -> recording url) can find it later."""
+    now = time.time()
+    with _inbound_map_lock:
+        for k in [k for k, v in INBOUND_CALL_MAP.items() if now - v["ts"] > INBOUND_MAP_TTL_SECS]:
+            INBOUND_CALL_MAP.pop(k, None)
+        entry = {"call_id": call_id, "ts": now}
+        if call_sid:
+            INBOUND_CALL_MAP[f"sid:{call_sid}"] = entry
+        INBOUND_CALL_MAP[f"pair:{_last10(from_number)}:{_last10(to_number)}"] = entry
+    log("VOICELINK", f"inbound registered call_id={call_id} call_sid={call_sid} from={from_number} to={to_number}")
+
+
+def _lookup_inbound_call(payload):
+    with _inbound_map_lock:
+        for key in (payload.get("id"), payload.get("callSid"), payload.get("call_sid")):
+            if key:
+                e = INBOUND_CALL_MAP.get(f"sid:{key}")
+                if e:
+                    return e["call_id"]
+        e = INBOUND_CALL_MAP.get(f"pair:{_last10(payload.get('from'))}:{_last10(payload.get('to'))}")
+        return e["call_id"] if e else None
+
+
+def fetch_inbound_call_context(did_number, from_number, provider_call_ref=""):
+    """Asks Pravah which agent owns this DID; Pravah also creates the lead + call record."""
+    if not PRAVAAH_API_BASE_URL or not EVA_API_SECRET:
+        return None, "Eva is not configured to talk to PravaahAI"
+    try:
+        resp = requests.post(
+            f"{PRAVAAH_API_BASE_URL}/api/eva-webhook/inbound-call",
+            headers={"X-Eva-Secret": EVA_API_SECRET, "Content-Type": "application/json"},
+            json={"did_number": did_number, "from_number": from_number,
+                  "provider": "voicelink", "provider_call_ref": provider_call_ref},
+            timeout=8,
+        )
+        data = resp.json()
+        if resp.status_code >= 400:
+            return None, data.get("error", f"HTTP {resp.status_code}")
+        return data, None
+    except Exception as e:
+        return None, str(e)
+
+
+def _prepare_inbound_greeting(agent: dict):
+    """Returns (alaw_bytes | None, text). Prefers the agent's pre-recorded opening audio
+    (instant, cached after the first call); falls back to one quick Sarvam TTS call."""
+    line = re.sub(r"\{\{[^}]*\}\}", "", agent.get("opening_line") or "")
+    line = re.sub(r'[“”„«»"]', "", line)
+    line = re.sub(r"\s+([,.!?।])", r"\1", line)
+    line = re.sub(r"\s{2,}", " ", line).strip(" ,")
+
+    url = (agent.get("opening_audio_url") or "").strip()
+    text = (agent.get("opening_audio_text") or "").strip() or line
+    if url:
+        try:
+            return load_ivr_audio(url), text
+        except Exception as e:
+            log("INBOUND", f"could not load greeting recording: {e}")
+
+    if line and SPEAKABLE_RE.search(line) and SARVAM_API_KEY:
+        try:
+            lang = agent.get("language") if agent.get("language") in SUPPORTED_LANGUAGES else "hi"
+            voice = VOICE_MALE if agent.get("gender") == "male" else VOICE_FEMALE
+            pcm, sr = sarvam_tts_synthesize(line, lang, voice, VOICELINK_RATE)
+            if sr != VOICELINK_RATE:
+                pcm, _ = audioop.ratecv(pcm, 2, 1, sr, VOICELINK_RATE, None)
+            return _ivr_encode(pcm), line
+        except Exception as e:
+            log("INBOUND", f"greeting TTS fallback failed: {e}")
+    return None, ""
+
+
+def _voicelink_hangup(ws, call_sid):
+    """Cuts the call from our side: VoiceLink `stop` event with callSid, then close the socket."""
+    try:
+        if call_sid:
+            ws.send(json.dumps({"event": "stop", "stop": {"callSid": call_sid}}))
+            time.sleep(0.3)
+    except Exception:
+        pass
+    try:
+        ws.close()
+    except Exception:
+        pass
+
+
+def _run_voicelink_inbound(ws, placeholder_id):
+    """Customer dialed one of our VoiceLink DIDs.
+      1) wait for VoiceLink's `start` event (has from / to / call_sid)
+      2) ask Pravah which agent owns that DID (+ lead + call record)
+      3) IVR agent -> same IVR flow as outbound
+         AI agent  -> play the greeting recording right away while LiveKit room /
+                      STT / LLM / TTS warm up in the background. Caller audio is
+                      buffered meanwhile, so nothing they say is lost."""
+    start_data = None
+    try:
+        while True:
+            msg = ws.receive()
+            if msg is None:
+                return
+            if isinstance(msg, (bytes, bytearray)):
+                continue
+            try:
+                data = json.loads(msg)
+            except Exception:
+                continue
+            ev = data.get("event")
+            if ev == "connected":
+                log("VOICELINK", "inbound: connected")
+            elif ev == "start":
+                start_data = data
+                break
+            elif ev == "stop":
+                return
+    except Exception as e:
+        log("VOICELINK", f"inbound: ws error before start: {e}")
+        return
+
+    start_obj = start_data.get("start") or {}
+    stream_sid = (start_obj.get("stream_sid") or start_obj.get("streamSid")
+                  or start_data.get("stream_sid") or start_data.get("streamSid"))
+    call_sid = (start_obj.get("call_sid") or start_obj.get("callSid")
+                or start_data.get("call_sid") or start_data.get("callSid"))
+    from_number = str(start_obj.get("from") or "")
+    to_number = str(start_obj.get("to") or "")
+    log("VOICELINK", f"inbound start: from={from_number} to={to_number} call_sid={call_sid} payload={str(start_data)[:600]}")
+
+    ctx, err = fetch_inbound_call_context(to_number, from_number, call_sid or "")
+    if not ctx:
+        log("VOICELINK", f"inbound call to {to_number} rejected: {err}")
+        _voicelink_hangup(ws, call_sid)
+        return
+
+    call_id = ctx["call_id"]
+    _register_inbound_call(call_id, call_sid, from_number, to_number)
+    cfg = {
+        "agent": ctx.get("agent") or {}, "lead": ctx.get("lead") or {},
+        "meeting": ctx.get("meeting"), "callback_url": ctx.get("callback_url"),
+        "call_mode": ctx.get("call_mode", "ai"), "ivr": ctx.get("ivr") or {},
+    }
+
+    # ---------- IVR on this agent: play recording -> wait -> STT -> hang up ----------
+    if cfg["call_mode"] == "ivr":
+        _run_voicelink_ivr(ws, call_id, cfg, start_data=start_data)
+        return
+
+    # ---------- AI agent ----------
+    greeting_audio, greeting_text = _prepare_inbound_greeting(cfg["agent"])
+    bridge = livekit_bridge.VoiceLinkBridge(
+        call_id=call_id, ws=ws, agent_cfg=cfg["agent"], lead=cfg["lead"],
+        meeting=cfg.get("meeting"), callback_url=cfg.get("callback_url"),
+        inbound=True, greeting_audio=greeting_audio, greeting_text=greeting_text,
+        call_sid=call_sid,
+    )
+    bridge.stream_sid = stream_sid
+    bridge.started.set()
+    VOICELINK_BRIDGES[call_id] = bridge
+
+    # 1) caller hears the greeting immediately
+    if greeting_audio:
+        threading.Thread(target=bridge.play_greeting, daemon=True, name=f"VLGreeting-{call_id}").start()
+
+    # 2) LiveKit room + agent (STT/LLM/TTS) warm up in the background
+    def _warmup():
+        try:
+            bridge.start()
+            log("VOICELINK", f"inbound {call_id}: LiveKit room {bridge.room_name} ready")
+        except Exception as e:
+            log("VOICELINK", f"inbound {call_id}: bridge failed to start: {type(e).__name__}: {e!r}")
+            bridge.close()
+            _voicelink_hangup(ws, call_sid)
+
+    threading.Thread(target=_warmup, daemon=True, name=f"VLWarmup-{call_id}").start()
+    log("VOICELINK", f"Inbound call {call_id}: greeting={'recording/TTS' if greeting_audio else 'by agent'}, "
+                     f"warming up room {bridge.room_name}")
+
+    try:
+        while True:
+            msg = ws.receive()
+            if msg is None:
+                break
+            if isinstance(msg, (bytes, bytearray)):
+                continue
+            try:
+                data = json.loads(msg)
+            except Exception:
+                continue
+            event = data.get("event")
+            if event == "media":
+                media = data.get("media", {}) or {}
+                if media.get("track", "inbound") != "inbound":
+                    continue
+                payload_b64 = media.get("payload")
+                if payload_b64:
+                    try:
+                        bridge.feed_alaw(base64.b64decode(payload_b64))
+                    except Exception:
+                        continue
+            elif event == "stop":
+                log("VOICELINK", f"inbound call {call_id}: stop event")
+                break
+    except Exception as e:
+        log("VOICELINK", f"inbound ws loop error: {e}")
+    finally:
+        bridge.close()
+        VOICELINK_BRIDGES.pop(call_id, None)
+        with _call_results_lock:
+            _e = CALL_RESULTS.setdefault(call_id, _new_call_result())
+            _e["callback_url"] = _e["callback_url"] or cfg.get("callback_url")
+            _e["answered"] = True
+        _arm_finalize_timer(call_id)
+        log("VOICELINK", f"Inbound call {call_id} disconnected.")
+
 #did update
 
 @sock.route("/ws/voicelink/<call_id>")
@@ -3452,7 +3688,11 @@ def voicelink_ws(ws, call_id):
     with _pending_calls_lock:
         cfg = PENDING_CALLS.get(call_id)
     if not cfg:
-        log("VOICELINK", f"No pending config for call_id={call_id}, closing.")
+        if re.fullmatch(r"[0-9a-f]{24}", call_id or ""):
+            log("VOICELINK", f"No pending config for outbound call_id={call_id} (expired?), closing.")
+            return
+        # not one of our outbound call ids -> the customer dialed our DID
+        _run_voicelink_inbound(ws, call_id)
         return
 
     # IVR calls: play recording -> wait -> STT -> hang up (no LiveKit)
@@ -3496,6 +3736,8 @@ def voicelink_ws(ws, call_id):
                 start_obj = data.get("start") or {}
                 bridge.stream_sid = (start_obj.get("stream_sid") or start_obj.get("streamSid")
                                      or data.get("stream_sid") or data.get("streamSid"))
+                bridge.call_sid = (start_obj.get("call_sid") or start_obj.get("callSid")
+                                   or data.get("call_sid") or data.get("callSid"))
                 bridge.started.set()      # sender greenlet may now push audio
                 log("VOICELINK", f"call {call_id}: start event payload={str(data)[:1500]}")
             elif event == "media":

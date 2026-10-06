@@ -83,6 +83,8 @@ TTS_SPEED = max(0.8, min(1.4, float(os.environ.get("EVA_TTS_SPEED", "1.4"))))
 SENTENCE_END_RE = re.compile(r"([.!?।\n])")
 HINDI_RE = re.compile(r"[\u0900-\u097F]")
 BOOK_MEETING_RE = re.compile(r"BOOK_MEETING:\s*(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2})")
+END_CALL_RE = re.compile(r"\[?\s*END_CALL\s*\]?")
+END_CALL_GRACE_SECS = float(os.environ.get("EVA_END_CALL_GRACE_SECS", "0.5"))
 LANGUAGES = {
     "en":  {"name": "English",    "tts": "en-IN", "script": None},
     "hi":  {"name": "Hindi",      "tts": "hi-IN", "script": None},   # Hinglish (Roman) - unchanged behaviour
@@ -297,8 +299,12 @@ class EvaAgent(Agent):
                  meeting: dict, lead: dict, call_id: str, opening_line: str = "",
                  forced_lang: str = None, persona_name: str = "",
                  opening_audio_task=None, opening_audio_text: str = "",
-                 opening_audio_rate: int = 22050):
+                 opening_audio_rate: int = 22050,
+                 greeting_played: bool = False, greeting_text: str = ""):
         super().__init__(instructions=instructions)
+        self._greeting_played = greeting_played     # inbound: Eva already played the greeting on the line
+        self._greeting_text = greeting_text
+        self._end_call_requested = False
         self._global_tts = global_tts
         self._meeting = meeting or {}
         self._lead = lead or {}
@@ -309,6 +315,28 @@ class EvaAgent(Agent):
         self._opening_audio_task = opening_audio_task
         self._opening_audio_text = opening_audio_text
         self._opening_audio_rate = opening_audio_rate
+
+    async def _remember_played_greeting(self) -> None:
+        """Inbound: Eva already played the greeting to the caller. Don't speak it again,
+        just add it to the chat context so the LLM knows it was said."""
+        text = self._greeting_text or self._opening_audio_text or self._opening_line
+        logger.info("greeting already played by Eva for call_id=%r (%r)", self._call_id, text)
+        if not text:
+            return
+        try:
+            chat_ctx = self.chat_ctx.copy()
+            chat_ctx.add_message(role="assistant", content=text)
+            await self.update_chat_ctx(chat_ctx)
+        except Exception:
+            logger.exception("could not add the played greeting to chat context")
+
+    def _strip_end_call(self, text: str) -> str:
+        """Removes the END_CALL token (never spoken) and remembers that the caller is hanging up."""
+        if END_CALL_RE.search(text):
+            self._end_call_requested = True
+            text = END_CALL_RE.sub("", text).strip()
+        return text
+
 
     async def _play_prerecorded_opening(self) -> bool:
         """Plays the pre-generated opening audio instantly. Interruptible like any
@@ -340,6 +368,9 @@ class EvaAgent(Agent):
         logger.info("on_enter: call_id=%r persona_name=%r greeting=%r",
                     self._call_id, self._persona_name, self._opening_line)
         try:
+            if self._greeting_played:
+                await self._remember_played_greeting()
+                return
             if await self._play_prerecorded_opening():
                 return
             if self._opening_line:
@@ -375,50 +406,57 @@ class EvaAgent(Agent):
         buffer = ""
         spoken_chars = 0
         capped = False
+        finished = False
 
-        async for chunk in text:
-            buffer += chunk
-            parts = SENTENCE_END_RE.split(buffer)
-            complete, i = "", 0
-            while i + 1 < len(parts):
-                complete += parts[i] + parts[i + 1]
-                i += 2
-            buffer = parts[i] if i < len(parts) else ""
+        try:
+            async for chunk in text:
+                buffer += chunk
+                parts = SENTENCE_END_RE.split(buffer)
+                complete, i = "", 0
+                while i + 1 < len(parts):
+                    complete += parts[i] + parts[i + 1]
+                    i += 2
+                buffer = parts[i] if i < len(parts) else ""
 
-            sentence = complete.strip()
+                sentence = complete.strip()
 
-            # Early flush: for the FIRST chunk of a reply only, don't wait for a
-            # full sentence - cut at the first comma once we have enough text.
-            # Shorter first chunk = LLM finishes it sooner AND Sarvam TTS
-            # synthesizes it faster, so the caller hears Eva ~0.5-1s earlier.
-            if not sentence and spoken_chars == 0:
-                for m in FIRST_CLAUSE_RE.finditer(buffer):
-                    if m.end() >= MIN_FIRST_CHUNK_CHARS:
-                        sentence = buffer[:m.end()].strip()
-                        buffer = buffer[m.end():]
-                        break
+                # Early flush: for the FIRST chunk of a reply only, don't wait for a
+                # full sentence - cut at the first comma once we have enough text.
+                if not sentence and spoken_chars == 0:
+                    for m in FIRST_CLAUSE_RE.finditer(buffer):
+                        if m.end() >= MIN_FIRST_CHUNK_CHARS:
+                            sentence = buffer[:m.end()].strip()
+                            buffer = buffer[m.end():]
+                            break
 
-            if not sentence:
-                continue
-            has_tag = bool(BOOK_MEETING_RE.search(sentence))
-            sentence = await self._handle_booking_tag(sentence)
-            # skip empty / punctuation-only text (Sarvam 400s on it), and drop
-            # anything past the cap - except a booking confirmation.
-            if not sentence or not SPEAKABLE_RE.search(sentence) or (capped and not has_tag):
-                continue
-            async for frame in self._speak(sentence):
-                yield frame
-            spoken_chars += len(sentence)
-            if spoken_chars >= MAX_SPOKEN_CHARS:
-                capped = True
-
-        tail = buffer.strip()
-        if tail:
-            has_tag = bool(BOOK_MEETING_RE.search(tail))
-            tail = await self._handle_booking_tag(tail)
-            if tail and SPEAKABLE_RE.search(tail) and (not capped or has_tag):
-                async for frame in self._speak(tail):
+                if not sentence:
+                    continue
+                has_tag = bool(BOOK_MEETING_RE.search(sentence))
+                sentence = await self._handle_booking_tag(sentence)
+                sentence = self._strip_end_call(sentence)
+                # skip empty / punctuation-only text (Sarvam 400s on it), and drop
+                # anything past the cap - except a booking confirmation.
+                if not sentence or not SPEAKABLE_RE.search(sentence) or (capped and not has_tag):
+                    continue
+                async for frame in self._speak(sentence):
                     yield frame
+                spoken_chars += len(sentence)
+                if spoken_chars >= MAX_SPOKEN_CHARS:
+                    capped = True
+
+            tail = buffer.strip()
+            if tail:
+                has_tag = bool(BOOK_MEETING_RE.search(tail))
+                tail = await self._handle_booking_tag(tail)
+                tail = self._strip_end_call(tail)
+                if tail and SPEAKABLE_RE.search(tail) and (not capped or has_tag):
+                    async for frame in self._speak(tail):
+                        yield frame
+            finished = True
+        finally:
+            if not finished:
+                # reply was interrupted by the caller -> don't hang up on them
+                self._end_call_requested = False
 
     async def _handle_booking_tag(self, sentence: str) -> str:
         """Strips a BOOK_MEETING: tag out of the spoken text and fires the
@@ -449,7 +487,7 @@ class EvaAgent(Agent):
 
 
 
-def _build_instructions(agent_cfg: dict, lead: dict, meeting: dict):
+def _build_instructions(agent_cfg: dict, lead: dict, meeting: dict, inbound: bool = False):
     """Mirrors app.py's EvaSession.__init__ prompt-building. Returns
     (instructions, forced_lang, persona_name) - the caller needs forced_lang
     separately to drive TTS language selection, and persona_name so the
@@ -472,7 +510,17 @@ def _build_instructions(agent_cfg: dict, lead: dict, meeting: dict):
             f"\n\nYour name is {persona_name}. If the caller asks your name, "
             f"tell them your name is {persona_name} - never any other name."
         )
-    if lead:
+    if lead and inbound:
+        _nm = (lead.get("name") or "").strip()
+        if _nm and not re.fullmatch(r"[+\d\s\-()]+", _nm):     # a bare phone number is not a name
+            base += (
+                f"\n\nThe caller is {_nm}"
+                + (f" from {lead.get('business_name')}" if lead.get("business_name") else "")
+                + ". Use their name naturally, don't overuse it."
+            )
+        else:
+            base += "\n\nThe caller's name is not known yet - if it comes up naturally, politely ask for it."
+    elif lead:
         base += (
             f"\n\nYou are speaking with {lead.get('name', 'the lead')} from "
             f"{lead.get('business_name', 'their business')}. Use their name naturally, don't overuse it."
@@ -540,6 +588,19 @@ def _build_instructions(agent_cfg: dict, lead: dict, meeting: dict):
         "and everyday words, keep a warm relaxed tone, and avoid stiff, scripted, "
         "or overly formal phrasing. Don't sound robotic."
     )
+    if inbound:
+        base += (
+            "\n\nINBOUND CALL: the person phoned the business - you did NOT call them. Never say you are "
+            "calling them and never ask 'do you have a minute'. The greeting was already said at the start "
+            "of the call, so do NOT greet again or re-introduce yourself; just respond to what they say and help them."
+        )
+    base += (
+        "\n\nENDING THE CALL: when the caller clearly wants to finish the conversation (for example 'ok bye', "
+        "'bye', 'thank you bye', 'that's all', 'theek hai bye', 'rakhta hoon', 'phone rakhti hoon', 'dhanyavaad bye'), "
+        "reply with ONE short polite goodbye sentence and add the exact token END_CALL at the very end of that same reply. "
+        "Never say END_CALL out loud or explain it. A plain 'okay', 'hmm', 'haan' or 'theek hai' on its own is NOT a "
+        "goodbye - only use END_CALL when the caller is really ending the call."
+    )
     if meeting:
         base += (
             "\n\nYou can book a meeting for this lead. Meetings are "
@@ -579,6 +640,9 @@ async def entrypoint(ctx: JobContext) -> None:
     meeting = call_ctx.get("meeting") or {}
     call_id = call_ctx.get("call_id")
     callback_url = call_ctx.get("callback_url")
+    inbound = bool(call_ctx.get("inbound"))
+    greeting_played = bool(call_ctx.get("greeting_played"))     # Eva already played it on the line
+    greeting_text = (call_ctx.get("greeting_text") or "").strip()
 
     # DEBUG: confirms exactly what agent config this call actually received.
     # If agent_name here isn't the one you configured in the Pravaah
@@ -624,6 +688,8 @@ async def entrypoint(ctx: JobContext) -> None:
     # Pre-recorded opening line: start downloading NOW (in parallel with session
     # setup) so it's ready the instant on_enter runs.
     opening_audio_url = (agent_cfg.get("opening_audio_url") or "").strip()
+    if greeting_played:
+        opening_audio_url = ""
     opening_audio_text = (agent_cfg.get("opening_audio_text") or "").strip()
     opening_audio_rate = int(getattr(global_tts, "sample_rate", 22050) or 22050)
     opening_audio_task = (
@@ -724,6 +790,7 @@ async def entrypoint(ctx: JobContext) -> None:
             return
         role = "lead" if getattr(item, "role", "") == "user" else "agent"
         text = getattr(item, "text_content", None) or str(item)
+        text = END_CALL_RE.sub("", text).strip()
         transcript.append({"role": role, "text": text, "ts": time.time()})
 
     session.on("conversation_item_added", _on_item_added)
@@ -771,7 +838,7 @@ async def entrypoint(ctx: JobContext) -> None:
 
     ctx.add_shutdown_callback(_finish_and_callback)
 
-    instructions, forced_lang, persona_name = _build_instructions(agent_cfg, lead, meeting)
+    instructions, forced_lang, persona_name = _build_instructions(agent_cfg, lead, meeting, inbound=inbound)
     opening_line = render_call_vars(agent_cfg.get("opening_line") or "", lead)
     opening_line = re.sub(r'[“”„«»"]', "", opening_line).strip()   # drop curly/straight double quotes
     logger.info("resolved persona_name=%r opening_line=%r (empty opening_line falls back to LLM greeting)",
@@ -794,7 +861,26 @@ async def entrypoint(ctx: JobContext) -> None:
         opening_audio_task=opening_audio_task,
         opening_audio_text=opening_audio_text,
         opening_audio_rate=opening_audio_rate,
+        greeting_played=greeting_played,
+        greeting_text=greeting_text,
     )
+
+    # Caller said bye -> the LLM added END_CALL -> once the goodbye has finished playing,
+    # leave the room. The bridge sees the agent leave and cuts the VoiceLink call.
+    _hangup_state = {"started": False}
+
+    async def _end_call_after_goodbye():
+        await asyncio.sleep(END_CALL_GRACE_SECS)
+        logger.info("caller said goodbye -> ending call_id=%r", call_id)
+        ctx.shutdown(reason="caller_goodbye")
+
+    def _on_state_for_hangup(ev):
+        if (str(ev.new_state) == "listening" and agent._end_call_requested
+                and not _hangup_state["started"]):
+            _hangup_state["started"] = True
+            asyncio.create_task(_end_call_after_goodbye())
+
+    session.on("agent_state_changed", _on_state_for_hangup)
 
     await session.start(
         agent=agent,
