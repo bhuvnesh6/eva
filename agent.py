@@ -85,6 +85,14 @@ HINDI_RE = re.compile(r"[\u0900-\u097F]")
 BOOK_MEETING_RE = re.compile(r"BOOK_MEETING:\s*(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2})")
 END_CALL_RE = re.compile(r"\[?\s*END_CALL\s*\]?")
 END_CALL_GRACE_SECS = float(os.environ.get("EVA_END_CALL_GRACE_SECS", "0.5"))
+# Safety net: if the caller clearly says goodbye in a SHORT sentence, hang up after the agent's
+# reply even when the LLM forgot to add END_CALL. ("tata" is left out on purpose - it's also a company.)
+BYE_RE = re.compile(
+    r"(?<![a-z])(bye|good ?bye|bye ?bye|alvida|that'?s all|that is all|phone rakh\w*)(?![a-z])"
+    r"|बाय|अलविदा|रखता हूँ|रखती हूँ|रखता हूं|रखती हूं",
+    re.I,
+)
+BYE_MAX_WORDS = 8
 LANGUAGES = {
     "en":  {"name": "English",    "tts": "en-IN", "script": None},
     "hi":  {"name": "Hindi",      "tts": "hi-IN", "script": None},   # Hinglish (Roman) - unchanged behaviour
@@ -770,6 +778,8 @@ async def entrypoint(ctx: JobContext) -> None:
         # ttfb (TTS first byte). Whichever is biggest is what to fix next.
         try:
             m = ev.metrics
+            if type(m).__name__ == "VADMetrics":
+                return          # one every second - just noise
             logger.info("LATENCY %s %s", type(m).__name__, m)
             print(f"[EVA-LATENCY] {type(m).__name__} {m}", flush=True)
         except Exception:
@@ -881,6 +891,31 @@ async def entrypoint(ctx: JobContext) -> None:
             asyncio.create_task(_end_call_after_goodbye())
 
     session.on("agent_state_changed", _on_state_for_hangup)
+
+    async def _bye_fallback():
+        # let the turn start, wait for the agent's goodbye reply to finish, then leave
+        await asyncio.sleep(0.8)
+        t0 = time.time()
+        while time.time() - t0 < 8 and str(session.agent_state) not in ("thinking", "speaking"):
+            await asyncio.sleep(0.1)
+        while time.time() - t0 < 25 and str(session.agent_state) in ("thinking", "speaking"):
+            await asyncio.sleep(0.15)
+        if _hangup_state["started"]:
+            return                      # the normal END_CALL path already handled it
+        _hangup_state["started"] = True
+        await asyncio.sleep(END_CALL_GRACE_SECS)
+        logger.info("goodbye detected in caller transcript -> ending call_id=%r", call_id)
+        ctx.shutdown(reason="caller_goodbye_fallback")
+
+    def _on_user_bye(ev):
+        if not ev.is_final or _hangup_state["started"]:
+            return
+        text = (ev.transcript or "").strip()
+        if text and len(text.split()) <= BYE_MAX_WORDS and BYE_RE.search(text):
+            logger.info("goodbye phrase heard: %r", text)
+            asyncio.create_task(_bye_fallback())
+
+    session.on("user_input_transcribed", _on_user_bye)
 
     await session.start(
         agent=agent,

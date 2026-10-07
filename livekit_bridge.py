@@ -111,7 +111,8 @@ class VoiceLinkBridge:
     def __init__(self, call_id: str, ws, agent_cfg: dict, lead: dict,
                  meeting: dict, callback_url: str,
                  inbound: bool = False, greeting_audio: bytes = None,
-                 greeting_text: str = "", call_sid: str = None):
+                 greeting_text: str = "", call_sid: str = None,
+                 codec: str = "alaw"):
         self.call_id = call_id
         self.ws = ws                      # the flask-sock VoiceLink websocket
         self.ws_lock = threading.Lock()
@@ -123,6 +124,7 @@ class VoiceLinkBridge:
         self.greeting_audio = greeting_audio   # A-law bytes that Eva itself plays (inbound only)
         self.greeting_text = greeting_text
         self.call_sid = call_sid
+        self.codec = "ulaw" if str(codec or "").lower() in ("ulaw", "mulaw") else "alaw"
         self.room_name = f"voicelink-{call_id}-{uuid.uuid4().hex[:8]}"
         self._trunk_identity = f"voicelink-trunk-{call_id}"
 
@@ -290,6 +292,24 @@ class VoiceLinkBridge:
             self._loop_go_live()
 
     # ---------------- inbound: VoiceLink -> LiveKit room ----------------
+    def set_codec_from_start(self, start_data):
+        """Reads media_format.encoding from VoiceLink's `start` event (can be audio/ulaw
+        or audio/alaw regardless of what the docs say)."""
+        sd = start_data or {}
+        mf = (sd.get("start") or {}).get("media_format") or sd.get("media_format") or {}
+        enc = str(mf.get("encoding") or "").lower()
+        if "ulaw" in enc or "mulaw" in enc or "pcmu" in enc:
+            self.codec = "ulaw"
+        elif "alaw" in enc or "pcma" in enc:
+            self.codec = "alaw"
+        print(f"[VOICELINK-BRIDGE] line codec={self.codec} (start event said {enc!r})", flush=True)
+
+    def _decode(self, b: bytes) -> bytes:
+        return audioop.ulaw2lin(b, 2) if self.codec == "ulaw" else audioop.alaw2lin(b, 2)
+
+    def _encode(self, pcm: bytes) -> bytes:
+        return audioop.lin2ulaw(pcm, 2) if self.codec == "ulaw" else audioop.lin2alaw(pcm, 2)
+
     def feed_alaw(self, alaw_bytes: bytes):
         """Call from the VoiceLink websocket thread for every inbound 'media'
         frame. Decodes A-law -> linear16 and hands it to the loop thread, which
@@ -299,7 +319,7 @@ class VoiceLinkBridge:
         self._in_frames += 1
         if self._in_frames == 1:
             print(f"[VOICELINK-BRIDGE] first inbound audio frame ({len(alaw_bytes)} bytes)", flush=True)
-        pcm16 = audioop.alaw2lin(alaw_bytes, 2)
+        pcm16 = self._decode(alaw_bytes)
         _bridge_loop.loop.call_soon_threadsafe(self._loop_ingest, pcm16)
 
     def _loop_ingest(self, pcm16: bytes):
@@ -410,7 +430,7 @@ class VoiceLinkBridge:
             if first:
                 first = False
                 print("[VOICELINK-BRIDGE] first agent audio frame received from LiveKit", flush=True)
-            buf += audioop.lin2alaw(bytes(event.frame.data), 2)
+            buf += self._encode(bytes(event.frame.data))
             while len(buf) >= 160:
                 self._out.append(buf[:160])
                 buf = buf[160:]

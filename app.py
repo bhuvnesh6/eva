@@ -3097,46 +3097,60 @@ def api_internal_call_result(call_id):
 # VoiceLink IVR — plays a fixed recording, waits, STT, hangs up
 # (completely separate from the LiveKit bridge)
 # ============================================================
-def _ivr_decode(b: bytes) -> bytes:
+def _norm_codec(c) -> str:
+    c = str(c or "").lower()
+    return "ulaw" if ("ulaw" in c or "mulaw" in c or "pcmu" in c) else "alaw"
+
+
+def _codec_from_start(start_data) -> str:
+    """The line codec VoiceLink announces in its `start` event (media_format.encoding).
+    The docs say A-law, but real inbound calls arrive as audio/ulaw - so never assume."""
+    sd = start_data or {}
+    mf = (sd.get("start") or {}).get("media_format") or sd.get("media_format") or {}
+    enc = str(mf.get("encoding") or "")
+    return _norm_codec(enc) if enc else _norm_codec(VOICELINK_CODEC)
+
+
+def _ivr_decode(b: bytes, codec: str = None) -> bytes:
     """Phone codec -> linear16."""
-    if VOICELINK_CODEC in ("mulaw", "ulaw"):
+    if _norm_codec(codec or VOICELINK_CODEC) == "ulaw":
         return audioop.ulaw2lin(b, 2)
     return audioop.alaw2lin(b, 2)
 
 
-def _ivr_encode(pcm: bytes) -> bytes:
+def _ivr_encode(pcm: bytes, codec: str = None) -> bytes:
     """linear16 -> phone codec."""
-    if VOICELINK_CODEC in ("mulaw", "ulaw"):
+    if _norm_codec(codec or VOICELINK_CODEC) == "ulaw":
         return audioop.lin2ulaw(pcm, 2)
     return audioop.lin2alaw(pcm, 2)
 
 
-def load_ivr_audio(url: str) -> bytes:
-    """Downloads the IVR WAV from Cloudinary and converts it to
-    8kHz mono in the VoiceLink codec. Cached per URL (URL changes on regenerate)."""
-    with _ivr_cache_lock:
-        cached = _IVR_AUDIO_CACHE.get(url)
-    if cached:
-        return cached
+_IVR_PCM_CACHE = {}   # url -> linear16 8kHz mono (codec-independent, encoded per call)
 
-    resp = requests.get(url, timeout=25)
-    resp.raise_for_status()
-    with wave.open(io.BytesIO(resp.content), "rb") as wf:
-        channels, width, rate = wf.getnchannels(), wf.getsampwidth(), wf.getframerate()
-        frames = wf.readframes(wf.getnframes())
-    if width != 2:
-        frames = audioop.lin2lin(frames, width, 2)
-    if channels > 1:
-        frames = audioop.tomono(frames, 2, 0.5, 0.5)
-    if rate != VOICELINK_RATE:
-        frames, _ = audioop.ratecv(frames, 2, 1, rate, VOICELINK_RATE, None)
-    encoded = _ivr_encode(frames)
 
+def load_ivr_audio(url: str, codec: str = None) -> bytes:
+    """Downloads the WAV once, converts it to 8kHz mono linear16 (cached per URL),
+    then encodes it in the codec this call's line actually uses."""
     with _ivr_cache_lock:
-        if len(_IVR_AUDIO_CACHE) > 50:
-            _IVR_AUDIO_CACHE.clear()
-        _IVR_AUDIO_CACHE[url] = encoded
-    return encoded
+        pcm = _IVR_PCM_CACHE.get(url)
+    if pcm is None:
+        resp = requests.get(url, timeout=25)
+        resp.raise_for_status()
+        with wave.open(io.BytesIO(resp.content), "rb") as wf:
+            channels, width, rate = wf.getnchannels(), wf.getsampwidth(), wf.getframerate()
+            frames = wf.readframes(wf.getnframes())
+        if width != 2:
+            frames = audioop.lin2lin(frames, width, 2)
+        if channels > 1:
+            frames = audioop.tomono(frames, 2, 0.5, 0.5)
+        if rate != VOICELINK_RATE:
+            frames, _ = audioop.ratecv(frames, 2, 1, rate, VOICELINK_RATE, None)
+        pcm = frames
+        with _ivr_cache_lock:
+            if len(_IVR_PCM_CACHE) > 50:
+                _IVR_PCM_CACHE.clear()
+            _IVR_PCM_CACHE[url] = pcm
+    return _ivr_encode(pcm, codec)
 
 
 def deepgram_transcribe_pcm(pcm16: bytes, rate: int) -> str:
@@ -3220,6 +3234,7 @@ class VoiceLinkIVRSession:
 
         self.stream_sid = None
         self.call_started_at = None
+        self.codec = _norm_codec(VOICELINK_CODEC)   # overwritten from the start event
         self.duration = 0
         self.transcript = []
         self.reply_text = ""
@@ -3241,14 +3256,15 @@ class VoiceLinkIVRSession:
         self.call_sid = (start_obj.get("call_sid") or start_obj.get("callSid")
                          or data.get("call_sid") or data.get("callSid"))
         self.call_started_at = time.time()
+        self.codec = _codec_from_start(data)
         self.started.set()
-        log("IVR", f"call {self.call_id}: start event received (call_sid={self.call_sid})")
+        log("IVR", f"call {self.call_id}: start event received (call_sid={self.call_sid}, codec={self.codec})")
 
     def feed_alaw(self, audio: bytes):
         if not audio or not self.listening.is_set():
             return
         try:
-            pcm = _ivr_decode(audio)
+            pcm = _ivr_decode(audio, self.codec)
             self.last_rms = audioop.rms(pcm, 2)
         except Exception:
             return
@@ -3326,7 +3342,7 @@ class VoiceLinkIVRSession:
     def _run(self):
         try:
             try:
-                alaw = load_ivr_audio(self.audio_url)
+                load_ivr_audio(self.audio_url)      # warm the download/cache while we wait for 'start'
             except Exception as e:
                 log("IVR", f"call {self.call_id}: could not load IVR audio: {e}")
                 self.hangup_reason = "ivr_audio_error"
@@ -3335,6 +3351,8 @@ class VoiceLinkIVRSession:
             if not self.started.wait(timeout=20):
                 self.hangup_reason = "no_start_event"
                 return
+
+            alaw = load_ivr_audio(self.audio_url, self.codec)   # encode in the codec the line really uses
 
             if not self._play(alaw):
                 self.hangup_reason = "hangup_during_playback"
@@ -3508,9 +3526,10 @@ def fetch_inbound_call_context(did_number, from_number, provider_call_ref=""):
         return None, str(e)
 
 
-def _prepare_inbound_greeting(agent: dict):
-    """Returns (alaw_bytes | None, text). Prefers the agent's pre-recorded opening audio
-    (instant, cached after the first call); falls back to one quick Sarvam TTS call."""
+def _prepare_inbound_greeting(agent: dict, codec: str = None):
+    """Returns (audio_bytes | None, text) already encoded in the line's codec. Prefers the
+    agent's pre-recorded opening audio (instant, cached after the first call); falls back
+    to one quick Sarvam TTS call."""
     line = re.sub(r"\{\{[^}]*\}\}", "", agent.get("opening_line") or "")
     line = re.sub(r'[“”„«»"]', "", line)
     line = re.sub(r"\s+([,.!?।])", r"\1", line)
@@ -3520,7 +3539,7 @@ def _prepare_inbound_greeting(agent: dict):
     text = (agent.get("opening_audio_text") or "").strip() or line
     if url:
         try:
-            return load_ivr_audio(url), text
+            return load_ivr_audio(url, codec), text
         except Exception as e:
             log("INBOUND", f"could not load greeting recording: {e}")
 
@@ -3531,7 +3550,7 @@ def _prepare_inbound_greeting(agent: dict):
             pcm, sr = sarvam_tts_synthesize(line, lang, voice, VOICELINK_RATE)
             if sr != VOICELINK_RATE:
                 pcm, _ = audioop.ratecv(pcm, 2, 1, sr, VOICELINK_RATE, None)
-            return _ivr_encode(pcm), line
+            return _ivr_encode(pcm, codec), line
         except Exception as e:
             log("INBOUND", f"greeting TTS fallback failed: {e}")
     return None, ""
@@ -3612,12 +3631,14 @@ def _run_voicelink_inbound(ws, placeholder_id):
         return
 
     # ---------- AI agent ----------
-    greeting_audio, greeting_text = _prepare_inbound_greeting(cfg["agent"])
+    codec = _codec_from_start(start_data)
+    log("VOICELINK", f"inbound {call_id}: line codec={codec}")
+    greeting_audio, greeting_text = _prepare_inbound_greeting(cfg["agent"], codec)
     bridge = livekit_bridge.VoiceLinkBridge(
         call_id=call_id, ws=ws, agent_cfg=cfg["agent"], lead=cfg["lead"],
         meeting=cfg.get("meeting"), callback_url=cfg.get("callback_url"),
         inbound=True, greeting_audio=greeting_audio, greeting_text=greeting_text,
-        call_sid=call_sid,
+        call_sid=call_sid, codec=codec,
     )
     bridge.stream_sid = stream_sid
     bridge.started.set()
@@ -3738,6 +3759,7 @@ def voicelink_ws(ws, call_id):
                                      or data.get("stream_sid") or data.get("streamSid"))
                 bridge.call_sid = (start_obj.get("call_sid") or start_obj.get("callSid")
                                    or data.get("call_sid") or data.get("callSid"))
+                bridge.set_codec_from_start(data)
                 bridge.started.set()      # sender greenlet may now push audio
                 log("VOICELINK", f"call {call_id}: start event payload={str(data)[:1500]}")
             elif event == "media":
