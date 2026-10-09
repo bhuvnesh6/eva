@@ -415,7 +415,7 @@ def _classify_call_result(e, transcript):
         return "answered"
     if reason == "hangup_during_playback":
         return "cut_by_user"
-    if (e.get("extra") or {}).get("call_mode") != "ivr" and dur < 10:
+    if (e.get("extra") or {}).get("call_mode") not in ("ivr", "manual") and dur < 10:
         return "cut_by_user"          # picked up and hung up straight away
     return "answered_no_reply"        # picked up but stayed silent
 
@@ -2934,7 +2934,10 @@ def api_place_call_voicelink():
     lead = data.get("lead", {}) or {}
     meeting = data.get("meeting") or {}
     callback_url = data.get("callback_url")
-    call_mode = "ivr" if data.get("call_mode") == "ivr" else "ai"
+    if call_mode == "ivr" and not ivr.get("audio_url"):
+        return jsonify({"ok": False, "error": "IVR call requires ivr.audio_url"}), 400
+    if call_mode == "manual" and not browser_token:
+        return jsonify({"ok": False, "error": "Manual call requires browser_token"}), 400
     ivr = data.get("ivr") or {}
 
     log("MAIN", f"[VoiceLink] /api/calls/voicelink call_id={call_id} mode={call_mode} -> "
@@ -2957,6 +2960,7 @@ def api_place_call_voicelink():
             "agent": agent, "lead": lead, "callback_url": callback_url,
             "created_at": time.time(), "meeting": meeting,
             "call_mode": call_mode, "ivr": ivr,
+            "browser_token": browser_token,
         }
 
     ws_scheme_base = PUBLIC_BASE_URL.replace("https://", "wss://").replace("http://", "ws://")
@@ -3007,12 +3011,18 @@ def voicelink_webhook(call_id):
     duration = payload.get("duration") or payload.get("durationSec") or 0
 
     if event in ("call.initiated", "call.ringing"):
+        _mb = MANUAL_BRIDGES.get(call_id)
+        if _mb:
+            _mb.send_status("ringing" if event == "call.ringing" else "dialing")
         return jsonify({"received": True})
 
     if event == "call.answered":
         with _call_results_lock:
             e = CALL_RESULTS.setdefault(call_id, _new_call_result())
             e["answered"] = True
+        _mb = MANUAL_BRIDGES.get(call_id)
+        if _mb:
+            _mb.send_status("answered")
         return jsonify({"received": True})
 
     if event == "call.completed":
@@ -3044,6 +3054,10 @@ def voicelink_webhook(call_id):
                     e["hangup_cause"] = hangup_cause
                 if duration:
                     e["duration_secs"] = duration
+
+        _mb = MANUAL_BRIDGES.get(call_id)
+        if _mb:
+            _mb.send_status("ended", reason=(payload.get("hangupReason") or call_status or event))
 
         bridge = VOICELINK_BRIDGES.get(call_id)
         if bridge:
@@ -3699,6 +3713,340 @@ def _run_voicelink_inbound(ws, placeholder_id):
         _arm_finalize_timer(call_id)
         log("VOICELINK", f"Inbound call {call_id} disconnected.")
 
+
+# ============================================================
+# MANUAL DIALER — a person on the dashboard talks through the browser mic,
+# VoiceLink carries the call to the lead. No AI involved.
+#
+#   browser ws  /ws/dialer/<call_id>?token=...   <->  ManualDialerBridge  <->  VoiceLink ws /ws/voicelink/<call_id>
+#
+# browser -> Eva : PCM16 mono at the browser's own rate (sent in a "hello" message)
+# Eva -> browser : PCM16 mono at MANUAL_BROWSER_RATE (phone audio upsampled 8k -> 16k)
+# ============================================================
+MANUAL_BRIDGES = {}                 # call_id -> ManualDialerBridge
+_manual_lock = threading.Lock()
+MANUAL_BROWSER_RATE = 16000
+MANUAL_RING_TIMEOUT_SECS = int(os.environ.get("EVA_MANUAL_RING_TIMEOUT_SECS", 75))
+MANUAL_BRIDGE_KEEP_SECS = 300       # keep a finished bridge around so a late VoiceLink socket can still be hung up
+
+
+class ManualDialerBridge:
+    def __init__(self, call_id, cfg):
+        self.call_id = call_id
+        self.callback_url = (cfg or {}).get("callback_url")
+
+        self.browser_ws = None
+        self.browser_lock = threading.Lock()
+        self.browser_rate = MIC_RATE
+
+        self.vl_ws = None
+        self.vl_lock = threading.Lock()
+        self.codec = _norm_codec(VOICELINK_CODEC)
+        self.stream_sid = None
+        self.call_sid = None
+        self.vl_started = threading.Event()
+
+        self.closed = threading.Event()
+        self._finish_lock = threading.Lock()
+        self._report_lock = threading.Lock()
+        self._reported = False
+
+        self._down_state = None      # browser -> phone resample state
+        self._up_state = None        # phone -> browser resample state
+        self._out_buf = b""          # re-chunk outgoing audio into 20 ms frames
+
+        self._last_status = "dialing"
+        self.call_started_at = None
+        self.answered = False
+        self.hangup_reason = "completed"
+
+    # ---------- browser side ----------
+    def _send_browser_json(self, obj):
+        ws = self.browser_ws
+        if not ws:
+            return
+        with self.browser_lock:
+            try:
+                ws.send(json.dumps(obj))
+            except Exception:
+                pass
+
+    def attach_browser(self, ws):
+        self.browser_ws = ws
+        self._send_browser_json({"type": "ready", "play_rate": MANUAL_BROWSER_RATE})
+        self._send_browser_json({"type": "status", "state": self._last_status})
+
+    def set_browser_rate(self, rate):
+        if 8000 <= rate <= 96000 and rate != self.browser_rate:
+            self.browser_rate = rate
+            self._down_state = None
+
+    def send_status(self, state, **extra):
+        self._last_status = state
+        msg = {"type": "status", "state": state}
+        msg.update(extra)
+        self._send_browser_json(msg)
+
+    def start_ring_watchdog(self):
+        def _check():
+            if not self.vl_started.is_set() and not self.closed.is_set():
+                log("DIALER", f"call {self.call_id}: nobody answered in {MANUAL_RING_TIMEOUT_SECS}s")
+                self.finish("no_answer_timeout")
+        t = threading.Timer(MANUAL_RING_TIMEOUT_SECS, _check)
+        t.daemon = True
+        t.start()
+
+    # ---------- VoiceLink side ----------
+    def attach_voicelink(self, ws):
+        self.vl_ws = ws
+
+    def on_voicelink_start(self, data):
+        start_obj = data.get("start") or {}
+        self.stream_sid = (start_obj.get("stream_sid") or start_obj.get("streamSid")
+                           or data.get("stream_sid") or data.get("streamSid"))
+        self.call_sid = (start_obj.get("call_sid") or start_obj.get("callSid")
+                         or data.get("call_sid") or data.get("callSid"))
+        self.codec = _codec_from_start(data)
+        self.answered = True
+        self.call_started_at = time.time()
+        self.vl_started.set()
+        log("DIALER", f"call {self.call_id}: VoiceLink audio started (call_sid={self.call_sid}, codec={self.codec})")
+        if self.closed.is_set():          # the user already hung up while it was ringing
+            self._hangup_vl()
+            return
+        self.send_status("connected")
+
+    def _send_vl_media(self, chunk: bytes):
+        ws = self.vl_ws
+        if not ws:
+            return
+        with self.vl_lock:
+            try:
+                ws.send(json.dumps({
+                    "event": "media",
+                    "stream_sid": self.stream_sid,
+                    "media": {"payload": base64.b64encode(chunk).decode("ascii")},
+                }))
+            except Exception:
+                pass
+
+    def feed_browser_audio(self, pcm: bytes):
+        """browser mic -> phone"""
+        if self.closed.is_set() or not self.vl_started.is_set():
+            return
+        if len(pcm) % 2:
+            pcm = pcm[:-1]
+        if not pcm:
+            return
+        try:
+            if self.browser_rate != VOICELINK_RATE:
+                pcm, self._down_state = audioop.ratecv(pcm, 2, 1, self.browser_rate, VOICELINK_RATE, self._down_state)
+            self._out_buf += _ivr_encode(pcm, self.codec)
+        except Exception as e:
+            log("DIALER", f"call {self.call_id}: browser audio error {e}")
+            return
+        while len(self._out_buf) >= 160:
+            chunk, self._out_buf = self._out_buf[:160], self._out_buf[160:]
+            self._send_vl_media(chunk)
+
+    def feed_phone_audio(self, raw: bytes):
+        """phone -> browser speaker"""
+        ws = self.browser_ws
+        if not ws or self.closed.is_set():
+            return
+        try:
+            pcm = _ivr_decode(raw, self.codec)
+            pcm, self._up_state = audioop.ratecv(pcm, 2, 1, VOICELINK_RATE, MANUAL_BROWSER_RATE, self._up_state)
+        except Exception:
+            return
+        with self.browser_lock:
+            try:
+                ws.send(pcm)
+            except Exception:
+                pass
+
+    def _hangup_vl(self):
+        ws, sid = self.vl_ws, self.call_sid
+        if not ws:
+            return
+        with self.vl_lock:
+            try:
+                if sid:
+                    ws.send(json.dumps({"event": "stop", "stop": {"callSid": sid}}))
+            except Exception:
+                return
+        time.sleep(0.3)
+        try:
+            ws.close()
+        except Exception:
+            pass
+
+    # ---------- lifecycle ----------
+    def finish(self, reason="completed"):
+        """Idempotent: tells the browser the call is over, hangs up VoiceLink, closes the browser socket."""
+        with self._finish_lock:
+            if self.closed.is_set():
+                return
+            self.closed.set()
+            self.hangup_reason = reason
+        log("DIALER", f"call {self.call_id}: finished ({reason})")
+        self._send_browser_json({"type": "status", "state": "ended", "reason": reason})
+        self._hangup_vl()
+
+        def _close_browser():
+            ws = self.browser_ws
+            if ws:
+                try:
+                    ws.close()
+                except Exception:
+                    pass
+        t = threading.Timer(0.6, _close_browser)
+        t.daemon = True
+        t.start()
+
+        def _forget():
+            with _manual_lock:
+                MANUAL_BRIDGES.pop(self.call_id, None)
+        t2 = threading.Timer(MANUAL_BRIDGE_KEEP_SECS, _forget)
+        t2.daemon = True
+        t2.start()
+
+    def close(self):
+        """Called by the VoiceLink call.ended webhook (via VOICELINK_BRIDGES)."""
+        self.finish("call_ended")
+
+    def report(self):
+        """Hands the result to the same finalize flow used by IVR/AI calls
+        (waits for the recording URL from call.completed, then POSTs ONE callback to Pravah)."""
+        with self._report_lock:
+            if self._reported:
+                return
+            self._reported = True
+        duration = round(time.time() - self.call_started_at, 1) if self.call_started_at else 0
+        with _call_results_lock:
+            e = CALL_RESULTS.setdefault(self.call_id, _new_call_result())
+            e["callback_url"] = e["callback_url"] or self.callback_url
+            e["transcript"] = []
+            e["status"] = "completed" if self.answered else "no_response"
+            e["hangup_reason"] = self.hangup_reason
+            e["answered"] = bool(e.get("answered")) or self.answered
+            if not e["duration_secs"]:
+                e["duration_secs"] = duration
+            e["extra"] = {"call_mode": "manual"}
+        _arm_finalize_timer(self.call_id)
+        _finalize_call(self.call_id)
+
+
+def _get_manual_bridge(call_id, cfg):
+    with _manual_lock:
+        b = MANUAL_BRIDGES.get(call_id)
+        if b is None:
+            b = ManualDialerBridge(call_id, cfg)
+            MANUAL_BRIDGES[call_id] = b
+        return b
+
+
+def _run_voicelink_manual(ws, call_id, cfg):
+    """VoiceLink side of a manual call (the lead picked up)."""
+    bridge = _get_manual_bridge(call_id, cfg)
+    VOICELINK_BRIDGES[call_id] = bridge          # so call.ended webhook can close it
+    bridge.attach_voicelink(ws)
+    log("VOICELINK", f"call {call_id}: manual dialer mode")
+    try:
+        while True:
+            msg = ws.receive()
+            if msg is None:
+                break
+            if isinstance(msg, (bytes, bytearray)):
+                continue
+            try:
+                data = json.loads(msg)
+            except Exception:
+                continue
+            event = data.get("event")
+            if event == "start":
+                bridge.on_voicelink_start(data)
+            elif event == "media":
+                media = data.get("media", {}) or {}
+                if media.get("track", "inbound") != "inbound":
+                    continue
+                payload_b64 = media.get("payload")
+                if payload_b64:
+                    try:
+                        bridge.feed_phone_audio(base64.b64decode(payload_b64))
+                    except Exception:
+                        continue
+            elif event == "stop":
+                log("VOICELINK", f"call {call_id}: stop event")
+                break
+    except Exception as e:
+        log("VOICELINK", f"manual ws loop error: {e}")
+    finally:
+        bridge.finish("customer_hangup")         # no-op if the browser already ended it
+        bridge.report()
+        VOICELINK_BRIDGES.pop(call_id, None)
+        with _pending_calls_lock:
+            PENDING_CALLS.pop(call_id, None)
+        log("VOICELINK", f"Manual call {call_id} disconnected.")
+
+
+@sock.route("/ws/dialer/<call_id>")
+def dialer_browser_ws(ws, call_id):
+    """The dashboard browser connects here (token comes from Pravah's /api/dialer/start)."""
+    import hmac as _hmac
+    token = (request.args.get("token") or "").strip()
+    with _pending_calls_lock:
+        cfg = PENDING_CALLS.get(call_id)
+    expected = ((cfg or {}).get("browser_token") or "")
+    if (not cfg or cfg.get("call_mode") != "manual" or not token
+            or not _hmac.compare_digest(token.encode(), expected.encode())):
+        try:
+            ws.send(json.dumps({"type": "error", "message": "Call not found or not authorised"}))
+        except Exception:
+            pass
+        return
+
+    bridge = _get_manual_bridge(call_id, cfg)
+    if bridge.browser_ws is not None or bridge.closed.is_set():
+        try:
+            ws.send(json.dumps({"type": "error", "message": "This call is already connected elsewhere or has ended"}))
+        except Exception:
+            pass
+        return
+
+    bridge.attach_browser(ws)
+    bridge.start_ring_watchdog()
+    log("DIALER", f"browser connected for call {call_id}")
+
+    try:
+        while True:
+            msg = ws.receive()
+            if msg is None:
+                break
+            if isinstance(msg, (bytes, bytearray)):
+                bridge.feed_browser_audio(bytes(msg))
+                continue
+            try:
+                payload = json.loads(msg)
+            except Exception:
+                continue
+            mtype = payload.get("type")
+            if mtype == "hello":
+                try:
+                    bridge.set_browser_rate(int(payload.get("sample_rate") or 0))
+                except (TypeError, ValueError):
+                    pass
+            elif mtype == "hangup":
+                bridge.finish("browser_hangup")
+                break
+            elif mtype == "ping":
+                bridge._send_browser_json({"type": "pong"})
+    except Exception as e:
+        log("DIALER", f"browser ws loop error: {e}")
+    finally:
+        bridge.finish("browser_disconnected")    # no-op if already finished
+        log("DIALER", f"browser disconnected for call {call_id}")
+
 #did update
 
 @sock.route("/ws/voicelink/<call_id>")
@@ -3719,6 +4067,11 @@ def voicelink_ws(ws, call_id):
     # IVR calls: play recording -> wait -> STT -> hang up (no LiveKit)
     if cfg.get("call_mode") == "ivr":
         _run_voicelink_ivr(ws, call_id, cfg)
+        return
+
+    # Manual dialer calls: bridge VoiceLink audio <-> the user's browser (no AI)
+    if cfg.get("call_mode") == "manual":
+        _run_voicelink_manual(ws, call_id, cfg)
         return
 
     bridge = livekit_bridge.VoiceLinkBridge(
