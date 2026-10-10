@@ -2934,11 +2934,13 @@ def api_place_call_voicelink():
     lead = data.get("lead", {}) or {}
     meeting = data.get("meeting") or {}
     callback_url = data.get("callback_url")
+    call_mode = (data.get("call_mode") or "ai").strip().lower()
+    browser_token = data.get("browser_token") or ""
+    ivr = data.get("ivr") or {}
     if call_mode == "ivr" and not ivr.get("audio_url"):
         return jsonify({"ok": False, "error": "IVR call requires ivr.audio_url"}), 400
     if call_mode == "manual" and not browser_token:
         return jsonify({"ok": False, "error": "Manual call requires browser_token"}), 400
-    ivr = data.get("ivr") or {}
 
     log("MAIN", f"[VoiceLink] /api/calls/voicelink call_id={call_id} mode={call_mode} -> "
                 f"customer_number={customer_number} did_number={did_number}")
@@ -3184,6 +3186,39 @@ def deepgram_transcribe_pcm(pcm16: bytes, rate: int) -> str:
     resp.raise_for_status()
     alt = resp.json()["results"]["channels"][0]["alternatives"][0]
     return (alt.get("transcript") or "").strip()
+
+
+def deepgram_transcribe_segments(pcm16: bytes, rate: int):
+    """Pre-recorded Deepgram STT that returns [(start_secs, text), ...] so two
+    sides of a manual call can be merged back into one conversation."""
+    if len(pcm16) < int(rate * 2 * 0.5):
+        return []
+    win = int(rate * 0.1) * 2
+    if not any(audioop.rms(pcm16[i:i + win], 2) >= 150 for i in range(0, len(pcm16), win)):
+        return []   # silence only - don't pay for STT
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(rate)
+        wf.writeframes(pcm16)
+    resp = requests.post(
+        "https://api.deepgram.com/v1/listen",
+        params={"model": "nova-3", "language": IVR_STT_LANGUAGE, "smart_format": "true",
+                "punctuate": "true", "utterances": "true"},
+        headers={"Authorization": f"Token {DEEPGRAM_API_KEY}", "Content-Type": "audio/wav"},
+        data=buf.getvalue(), timeout=120,
+    )
+    resp.raise_for_status()
+    res = resp.json()["results"]
+    utts = res.get("utterances") or []
+    out = [(float(u.get("start", 0) or 0), (u.get("transcript") or "").strip()) for u in utts]
+    out = [(s, t) for s, t in out if t]
+    if out:
+        return out
+    alt = res["channels"][0]["alternatives"][0]
+    txt = (alt.get("transcript") or "").strip()
+    return [(0.0, txt)] if txt else []
 
 
 SARVAM_STT_URL = "https://api.sarvam.ai/speech-to-text"
@@ -3756,6 +3791,9 @@ class ManualDialerBridge:
         self._out_buf = b""          # re-chunk outgoing audio into 20 ms frames
 
         self._last_status = "dialing"
+        self.rec_phone = bytearray()     # lead's voice, linear16 @ 8 kHz (for transcription)
+        self.rec_browser = bytearray()   # dashboard user's voice, linear16 @ 8 kHz
+        self.REC_MAX_BYTES = 8000 * 2 * 60 * 45   # cap: 45 min per side
         self.call_started_at = None
         self.answered = False
         self.hangup_reason = "completed"
@@ -3841,6 +3879,8 @@ class ManualDialerBridge:
         try:
             if self.browser_rate != VOICELINK_RATE:
                 pcm, self._down_state = audioop.ratecv(pcm, 2, 1, self.browser_rate, VOICELINK_RATE, self._down_state)
+            if len(self.rec_browser) < self.REC_MAX_BYTES:
+                self.rec_browser.extend(pcm)
             self._out_buf += _ivr_encode(pcm, self.codec)
         except Exception as e:
             log("DIALER", f"call {self.call_id}: browser audio error {e}")
@@ -3852,10 +3892,14 @@ class ManualDialerBridge:
     def feed_phone_audio(self, raw: bytes):
         """phone -> browser speaker"""
         ws = self.browser_ws
-        if not ws or self.closed.is_set():
+        if self.closed.is_set():
             return
         try:
             pcm = _ivr_decode(raw, self.codec)
+            if len(self.rec_phone) < self.REC_MAX_BYTES:
+                self.rec_phone.extend(pcm)
+            if not ws:
+                return
             pcm, self._up_state = audioop.ratecv(pcm, 2, 1, VOICELINK_RATE, MANUAL_BROWSER_RATE, self._up_state)
         except Exception:
             return
@@ -3916,8 +3960,8 @@ class ManualDialerBridge:
         self.finish("call_ended")
 
     def report(self):
-        """Hands the result to the same finalize flow used by IVR/AI calls
-        (waits for the recording URL from call.completed, then POSTs ONE callback to Pravah)."""
+        """Transcribes both sides (you = 'agent', lead = 'lead'), then hands the
+        result to the same finalize flow (waits for recording URL -> ONE callback)."""
         with self._report_lock:
             if self._reported:
                 return
@@ -3926,7 +3970,6 @@ class ManualDialerBridge:
         with _call_results_lock:
             e = CALL_RESULTS.setdefault(self.call_id, _new_call_result())
             e["callback_url"] = e["callback_url"] or self.callback_url
-            e["transcript"] = []
             e["status"] = "completed" if self.answered else "no_response"
             e["hangup_reason"] = self.hangup_reason
             e["answered"] = bool(e.get("answered")) or self.answered
@@ -3934,7 +3977,30 @@ class ManualDialerBridge:
                 e["duration_secs"] = duration
             e["extra"] = {"call_mode": "manual"}
         _arm_finalize_timer(self.call_id)
-        _finalize_call(self.call_id)
+        threading.Thread(target=self._transcribe_and_finalize, daemon=True,
+                         name=f"ManualSTT-{self.call_id}").start()
+
+    def _transcribe_and_finalize(self):
+        transcript = []
+        try:
+            if self.answered:
+                items = []
+                for role, buf in (("agent", bytes(self.rec_browser)), ("lead", bytes(self.rec_phone))):
+                    try:
+                        for start, text in deepgram_transcribe_segments(buf, VOICELINK_RATE):
+                            items.append((start, role, text))
+                    except Exception as ex:
+                        log("DIALER", f"call {self.call_id}: STT failed for {role}: {ex}")
+                items.sort(key=lambda x: x[0])
+                base = self.call_started_at or time.time()
+                transcript = [{"role": r, "text": t, "ts": base + s} for s, r, t in items]
+        finally:
+            self.rec_browser = bytearray()
+            self.rec_phone = bytearray()
+            with _call_results_lock:
+                e = CALL_RESULTS.setdefault(self.call_id, _new_call_result())
+                e["transcript"] = transcript
+            _finalize_call(self.call_id)
 
 
 def _get_manual_bridge(call_id, cfg):
