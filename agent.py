@@ -40,7 +40,7 @@ from livekit.agents import (
     cli,
     inference,
 )
-from livekit.plugins import deepgram, groq, openai, sarvam, silero
+from livekit.plugins import groq, openai, sarvam, silero
 from livekit.plugins.turn_detector.multilingual import MultilingualModel
 
 load_dotenv()
@@ -123,13 +123,8 @@ SCRIPT_LANG_RES = [
     (re.compile(r"[\u0C80-\u0CFF]"), "kn"),
     (re.compile(r"[\u0D00-\u0D7F]"), "ml"),
 ]
-SARVAM_STT_MODEL = os.environ.get("SARVAM_STT_MODEL", "saarika:v2.5")
-# "deepgram" (default) = auto-language calls use Deepgram multi. "sarvam" = auto calls use Sarvam
-# language auto-detect, which understands all Indian languages.
-AUTO_STT = os.environ.get("EVA_AUTO_STT", "deepgram").strip().lower()
-# "1" = English/Hindi agents also use Sarvam STT with language auto-detect, so they can follow
-# a caller who asks to switch to Tamil/Gujarati/etc. mid-call.
-ALLOW_SWITCH_STT = os.environ.get("EVA_ALLOW_LANG_SWITCH_STT", "0") == "1"
+SARVAM_STT_MODEL = os.environ.get("SARVAM_STT_MODEL", "saaras:v3")
+SARVAM_STT_MODE = os.environ.get("SARVAM_STT_MODE", "transcribe")   # transcribe | codemix | verbatim | translit | translate
 # Hard ceiling on spoken chars per reply (~15 chars/sec of audio => 200 chars ~ 13s)
 MAX_SPOKEN_CHARS = int(os.environ.get("EVA_MAX_SPOKEN_CHARS", "200"))
 
@@ -188,20 +183,17 @@ def _reply_language_rule(lang: str) -> str:
 
 
 def _build_stt(language):
-    """Regional languages -> Sarvam STT (understands Indian languages). English/Hindi/auto -> Deepgram
-    as before. If Sarvam STT can't be created, falls back to Deepgram so calls never fail."""
+    """Sarvam saaras:v3 for every call. English / Hindi / auto agents use auto-detect ('unknown') so the
+    caller can mix Hindi/English or switch language mid-call; regional agents use their own language code.
+    No Deepgram fallback."""
     lang = language if language in SUPPORTED_LANGUAGES else None
     regional = lang is not None and lang not in ("en", "hi")
-    auto_like = lang is None or lang in ("en", "hi")
-    if SARVAM_API_KEY and (regional or (auto_like and (AUTO_STT == "sarvam" or ALLOW_SWITCH_STT))):
-        code = LANGUAGES[lang]["tts"] if regional else "unknown"
-        try:
-            logger.info("STT: using Sarvam (%s, model=%s)", code, SARVAM_STT_MODEL)
-            return sarvam.STT(language=code, model=SARVAM_STT_MODEL)
-        except Exception:
-            logger.exception("sarvam.STT failed to initialise - falling back to Deepgram")
-    return deepgram.STT(model="nova-3", language="multi")
-
+    code = LANGUAGES[lang]["tts"] if regional else "unknown"
+    kwargs = dict(language=code, model=SARVAM_STT_MODEL, mode=SARVAM_STT_MODE)
+    valid = set(inspect.signature(sarvam.STT.__init__).parameters)
+    kwargs = {k: v for k, v in kwargs.items() if k in valid}
+    logger.info("STT: Sarvam %s (language=%s, mode=%s)", SARVAM_STT_MODEL, code, kwargs.get("mode", "n/a"))
+    return sarvam.STT(**kwargs)
 
 # ---------------- Pre-recorded opening line ----------------
 _OPENING_AUDIO_CACHE = {}   # (url, rate) -> mono PCM16 bytes

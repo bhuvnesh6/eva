@@ -287,7 +287,7 @@ CLOUDFLARE_CHAT_URL = (
 
 def check_missing_keys():
     checks = [
-        ("DEEPGRAM_API_KEY", DEEPGRAM_API_KEY),
+ #       ("DEEPGRAM_API_KEY", DEEPGRAM_API_KEY),
         ("LIVEKIT_URL", LIVEKIT_URL),
         ("LIVEKIT_API_KEY", LIVEKIT_API_KEY),
         ("LIVEKIT_API_SECRET", LIVEKIT_API_SECRET),
@@ -3222,7 +3222,47 @@ def deepgram_transcribe_segments(pcm16: bytes, rate: int):
 
 
 SARVAM_STT_URL = "https://api.sarvam.ai/speech-to-text"
-SARVAM_STT_MODEL = os.environ.get("SARVAM_STT_MODEL", "saarika:v2.5")
+SARVAM_STT_MODEL = os.environ.get("SARVAM_STT_MODEL", "saaras:v3")
+SARVAM_STT_MODE = os.environ.get("SARVAM_STT_MODE", "transcribe")   # saaras:v3: transcribe | codemix | verbatim | translit | translate
+
+
+def sarvam_transcribe_pcm(pcm16: bytes, rate: int, language_code: str = "unknown") -> str:
+    """One-shot Sarvam STT (saaras:v3). language_code: 'unknown' = auto-detect, or hi-IN / en-IN / ta-IN ..."""
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(rate)
+        wf.writeframes(pcm16)
+    form = {"model": SARVAM_STT_MODEL, "language_code": language_code}
+    if SARVAM_STT_MODEL.startswith("saaras"):
+        form["mode"] = SARVAM_STT_MODE
+    last_err = None
+    for _ in range(2):
+        try:
+            resp = requests.post(
+                SARVAM_STT_URL,
+                headers={"api-subscription-key": SARVAM_API_KEY},
+                files={"file": ("reply.wav", buf.getvalue(), "audio/wav")},
+                data=form, timeout=25,
+            )
+            resp.raise_for_status()
+            return (resp.json().get("transcript") or "").strip()
+        except Exception as e:
+            last_err = e
+            time.sleep(0.3)
+    raise last_err
+
+
+def transcribe_ivr_pcm(pcm16: bytes, rate: int, language: str = "") -> str:
+    """IVR reply -> text, Sarvam only. English / Hindi / auto -> 'unknown' (auto-detect, so a Hindi reply
+    to an English IVR still works). Regional IVR languages -> that language's code."""
+    if not SARVAM_API_KEY:
+        raise RuntimeError("SARVAM_API_KEY is not set")
+    cfg = LANGUAGES.get(language or "")
+    code = cfg["tts"] if (cfg and language not in ("en", "hi")) else "unknown"
+    return sarvam_transcribe_pcm(pcm16, rate, code)
+
 
 
 def sarvam_transcribe_pcm(pcm16: bytes, rate: int, language_code: str) -> str:
@@ -3853,6 +3893,14 @@ class ManualDialerBridge:
             self._hangup_vl()
             return
         self.send_status("connected")
+        if self.browser_ws is None:
+            def _no_browser():
+                if self.browser_ws is None and not self.closed.is_set():
+                    log("DIALER", f"call {self.call_id}: nobody connected the audio websocket, dropping the call")
+                    self.finish("browser_not_connected")
+            _t = threading.Timer(float(os.environ.get("EVA_MANUAL_BROWSER_GRACE_SECS", 20)), _no_browser)
+            _t.daemon = True
+            _t.start()
 
     def _send_vl_media(self, chunk: bytes):
         ws = self.vl_ws
