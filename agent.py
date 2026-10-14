@@ -43,6 +43,13 @@ from livekit.agents import (
 from livekit.plugins import groq, openai, sarvam, silero
 from livekit.plugins.turn_detector.multilingual import MultilingualModel
 
+import base64
+import collections
+import websockets                                  # pip install -U websockets
+from sarvamai import AsyncSarvamAI, RealtimeAudioInput, RealtimeEnd   # pip install -U sarvamai
+from livekit.agents import stt, tts, utils, APIConnectionError, APIConnectOptions, DEFAULT_API_CONNECT_OPTIONS
+from livekit.agents.types import NOT_GIVEN, NotGivenOr
+
 load_dotenv()
 
 logging.basicConfig(level=logging.INFO)
@@ -128,6 +135,22 @@ SARVAM_STT_MODE = os.environ.get("SARVAM_STT_MODE", "transcribe")   # transcribe
 # Hard ceiling on spoken chars per reply (~15 chars/sec of audio => 200 chars ~ 13s)
 MAX_SPOKEN_CHARS = int(os.environ.get("EVA_MAX_SPOKEN_CHARS", "200"))
 
+# ---------------- Sarvam REALTIME (websocket) STT / TTS ----------------
+SARVAM_STT_RT_MODEL = os.environ.get("SARVAM_STT_RT_MODEL", "saaras:v3-realtime")
+SARVAM_STT_STREAM_TYPE = os.environ.get("SARVAM_STT_STREAM_TYPE", "balanced")
+# "" = auto (hi-IN for en/hi/auto agents, own code for regional agents). Set e.g. "unknown" to force auto-detect.
+SARVAM_STT_LANGUAGE_OVERRIDE = os.environ.get("SARVAM_STT_LANGUAGE", "").strip()
+SARVAM_STT_CHUNK_MS = int(os.environ.get("SARVAM_STT_CHUNK_MS", "50"))
+SARVAM_TTS_WS_URL = "wss://api.sarvam.ai/text-to-speech/ws?model={model}&send_completion_event=true"
+SARVAM_TTS_SAMPLE_RATE = int(os.environ.get("SARVAM_TTS_SAMPLE_RATE", "16000"))
+
+# ---------------- background-noise / side-talk protection ----------------
+VAD_ACTIVATION_THRESHOLD = float(os.environ.get("EVA_VAD_ACTIVATION", "0.6"))     # silero default 0.5
+VAD_MIN_SPEECH_SECS = float(os.environ.get("EVA_VAD_MIN_SPEECH", "0.15"))
+MIN_INTERRUPTION_SECS = float(os.environ.get("EVA_MIN_INTERRUPTION_SECS", "0.6"))
+MIN_INTERRUPTION_WORDS = int(os.environ.get("EVA_MIN_INTERRUPTION_WORDS", "2"))
+IGNORE_RE = re.compile(r"\[IGNORE\]")       # LLM emits this when the "caller" text is just side-talk
+
 # ---------------- Latency tuning ----------------
 # How long the agent waits after the caller stops before replying, worst case.
 # Was hard-coded 3.0 -> this was the biggest source of the 4-7s delay.
@@ -182,18 +205,354 @@ def _reply_language_rule(lang: str) -> str:
     return rule
 
 
+# ======================================================================
+#  Sarvam REALTIME streaming STT  (saaras:v3-realtime, websocket)
+# ======================================================================
+_FILLER_WORDS = {
+    "hmm", "hm", "hmmm", "mm", "mmm", "um", "umm", "uh", "uhh", "ah", "aah", "oh", "huh",
+    "हम", "हम्म", "हूँ", "हूं", "उं", "उम", "ऊं", "आह", "अं", "अह",
+}
+
+
+def _allowed_script_keys(lang):
+    """Scripts we accept in a transcript (Latin is always accepted). 'hi' == Devanagari."""
+    if lang in (None, "en", "hi", "hr", "raj", "bho", "mr"):
+        return {"hi"}
+    return {lang}
+
+
+def _clean_stt_text(text: str, allowed_keys: set) -> str:
+    """Kills hallucinations: removes characters from scripts this call can never use
+    (Telugu/Bengali/Gujarati garbage from noise), and drops filler-only utterances."""
+    t = (text or "").strip()
+    if not t:
+        return ""
+    for rx, key in SCRIPT_LANG_RES:
+        if key not in allowed_keys:
+            t = rx.sub("", t)
+    t = re.sub(r"\s{2,}", " ", t).strip()
+    if not t or not SPEAKABLE_RE.search(t):
+        return ""
+    words = [w for w in re.split(r"[\s,.!?।]+", t.lower()) if w]
+    if words and len(words) <= 2 and all(w in _FILLER_WORDS for w in words):
+        return ""
+    return t
+
+
+class SarvamRealtimeSTT(stt.STT):
+    def __init__(self, *, language_code: str, agent_language: str = None):
+        super().__init__(capabilities=stt.STTCapabilities(streaming=True, interim_results=True))
+        self._language_code = language_code
+        self._allowed = _allowed_script_keys(agent_language)
+        self._client = AsyncSarvamAI(api_subscription_key=SARVAM_API_KEY)
+
+    @property
+    def model(self) -> str:
+        return SARVAM_STT_RT_MODEL
+
+    @property
+    def provider(self) -> str:
+        return "Sarvam"
+
+    async def _recognize_impl(self, buffer, *, language: NotGivenOr[str] = NOT_GIVEN,
+                              conn_options: APIConnectOptions = DEFAULT_API_CONNECT_OPTIONS):
+        raise NotImplementedError("SarvamRealtimeSTT is streaming-only")
+
+    def stream(self, *, language: NotGivenOr[str] = NOT_GIVEN,
+               conn_options: APIConnectOptions = DEFAULT_API_CONNECT_OPTIONS) -> "SarvamRealtimeStream":
+        return SarvamRealtimeStream(stt_obj=self, conn_options=conn_options)
+
+
+class SarvamRealtimeStream(stt.RecognizeStream):
+    def __init__(self, *, stt_obj: SarvamRealtimeSTT, conn_options: APIConnectOptions):
+        super().__init__(stt=stt_obj, conn_options=conn_options, sample_rate=16000)
+        self._speaking = False
+        self._ended = False
+        self._chunk_bytes = max(640, int(16000 * 2 * SARVAM_STT_CHUNK_MS / 1000))
+        # last ~400ms of audio, replayed if the server closes the socket and we have to reconnect
+        self._preroll = collections.deque(maxlen=max(2, 400 // max(SARVAM_STT_CHUNK_MS, 10)))
+
+    # ---------- events out ----------
+    def _emit(self, ev_type, text: str = "", lang: str = "hi"):
+        alts = [stt.SpeechData(language=lang, text=text)] if text else []
+        self._event_ch.send_nowait(stt.SpeechEvent(type=ev_type, alternatives=alts))
+
+    def _handle_text(self, message, final: bool):
+        raw = getattr(message, "text", "") or ""
+        text = _clean_stt_text(raw, self._stt._allowed)
+        if raw.strip() and not text:
+            logger.info("STT dropped noise/hallucination (final=%s): %r", final, raw)
+        if not text:
+            if final and self._speaking:
+                self._speaking = False
+                self._emit(stt.SpeechEventType.END_OF_SPEECH)
+            return
+        lang = (getattr(message, "language_code", None) or self._stt._language_code or "hi")
+        lang = "hi" if lang == "unknown" else lang.split("-")[0]
+        if not self._speaking:
+            self._speaking = True
+            self._emit(stt.SpeechEventType.START_OF_SPEECH)
+        if final:
+            self._emit(stt.SpeechEventType.FINAL_TRANSCRIPT, text, lang)
+            self._speaking = False
+            self._emit(stt.SpeechEventType.END_OF_SPEECH)
+        else:
+            self._emit(stt.SpeechEventType.INTERIM_TRANSCRIPT, text, lang)
+
+    # ---------- websocket loops ----------
+    async def _send_chunk(self, ws, chunk: bytes):
+        await ws.send_realtime_audio_input(
+            RealtimeAudioInput(audio=base64.b64encode(chunk).decode("utf-8"))
+        )
+
+    async def _send_loop(self, ws):
+        for c in list(self._preroll):          # after a reconnect: replay the last ~400ms
+            await self._send_chunk(ws, c)
+        buf = bytearray()
+        async for data in self._input_ch:
+            if isinstance(data, self._FlushSentinel):
+                if buf:
+                    chunk = bytes(buf); buf.clear()
+                    self._preroll.append(chunk)
+                    await self._send_chunk(ws, chunk)
+                continue
+            buf.extend(bytes(data.data))
+            if len(buf) >= self._chunk_bytes:
+                chunk = bytes(buf); buf.clear()
+                self._preroll.append(chunk)
+                await self._send_chunk(ws, chunk)
+        if buf:
+            await self._send_chunk(ws, bytes(buf))
+        self._ended = True
+        await ws.send_realtime_end(RealtimeEnd())
+
+    async def _recv_loop(self, ws):
+        async for message in ws:
+            ev = getattr(message, "event", "")
+            if ev == "transcript.partial":
+                self._handle_text(message, final=False)
+            elif ev == "transcript.final":
+                self._handle_text(message, final=True)
+            elif ev == "error":
+                code = getattr(message, "code", None)
+                msg = getattr(message, "message", "")
+                logger.error("Sarvam STT error (%s): %s", code, msg)
+                if getattr(message, "is_fatal", False):
+                    raise APIConnectionError(f"Sarvam STT fatal error {code}: {msg}")
+            else:
+                logger.info("Sarvam STT other event: %s", ev)    # tells us the real VAD/event names if any
+
+    async def _run(self) -> None:
+        o = self._stt
+        quick_fail = 0
+        while not self._ended:
+            t0 = time.time()
+            try:
+                async with o._client.speech_to_text_realtime_streaming.connect(
+                    language_code=o._language_code,
+                    model=SARVAM_STT_RT_MODEL,
+                    mode=SARVAM_STT_MODE,
+                    stream_type=SARVAM_STT_STREAM_TYPE,
+                ) as ws:
+                    logger.info("Sarvam STT connected (%s, %s, lang=%s)",
+                                SARVAM_STT_RT_MODEL, SARVAM_STT_STREAM_TYPE, o._language_code)
+                    send = asyncio.create_task(self._send_loop(ws))
+                    recv = asyncio.create_task(self._recv_loop(ws))
+                    try:
+                        done, _ = await asyncio.wait({send, recv}, return_when=asyncio.FIRST_COMPLETED)
+                        for t in done:
+                            t.result()                      # surface errors
+                        if send in done and not recv.done():
+                            try:                            # input finished: let the last final arrive
+                                await asyncio.wait_for(asyncio.shield(recv), 2.0)
+                            except Exception:
+                                pass
+                    finally:
+                        await utils.aio.gracefully_cancel(*[t for t in (send, recv) if not t.done()])
+            except (APIConnectionError, asyncio.CancelledError):
+                raise
+            except Exception as e:
+                raise APIConnectionError(f"Sarvam STT connection failed: {e!r}") from e
+
+            if self._ended:
+                break
+            # server closed the socket while the call is still going -> reconnect
+            if time.time() - t0 < 1.0:
+                quick_fail += 1
+                if quick_fail >= 5:
+                    raise APIConnectionError("Sarvam STT socket keeps closing immediately")
+                await asyncio.sleep(0.2)
+            else:
+                quick_fail = 0
+            logger.info("Sarvam STT socket closed by server - reconnecting")
+
+
+# ======================================================================
+#  Sarvam streaming TTS over a persistent websocket
+# ======================================================================
+class SarvamWSTTS(tts.TTS):
+    def __init__(self, *, api_key: str, model: str, speaker: str, language_code: str = "hi-IN",
+                 pace: float = 1.0, temperature: float = 0.6, sample_rate: int = 16000):
+        super().__init__(capabilities=tts.TTSCapabilities(streaming=False),
+                         sample_rate=sample_rate, num_channels=1)
+        self._api_key = api_key
+        self._model = model
+        self._speaker = speaker
+        self._language_code = language_code
+        self._pace = pace
+        self._temperature = temperature
+        self._sr = sample_rate
+        self._ws = None
+        self._ws_key = None
+        self.lock = asyncio.Lock()      # one sentence on the socket at a time (FIFO => spoken order kept)
+
+    @property
+    def model(self) -> str:
+        return self._model
+
+    @property
+    def provider(self) -> str:
+        return "Sarvam"
+
+    def update_options(self, *, target_language_code: str = None, pace: float = None,
+                       speaker: str = None, **_ignored):
+        if target_language_code:
+            self._language_code = target_language_code
+        if pace:
+            self._pace = pace
+        if speaker:
+            self._speaker = speaker
+
+    def prewarm(self):
+        async def _warm():
+            try:
+                async with self.lock:
+                    await self.get_ws(self._language_code, self._pace)
+            except Exception as e:
+                logger.warning("Sarvam TTS prewarm failed: %r", e)
+        asyncio.ensure_future(_warm())
+
+    def drop_ws(self):
+        ws, self._ws, self._ws_key = self._ws, None, None
+        if ws is not None:
+            try:
+                asyncio.ensure_future(ws.close())
+            except Exception:
+                pass
+
+    async def get_ws(self, language: str, pace: float):
+        key = (language, round(float(pace), 2), self._speaker)
+        ws = self._ws
+        if ws is not None and self._ws_key == key and getattr(ws, "close_code", None) is None:
+            return ws
+        self.drop_ws()
+        ws = await websockets.connect(
+            SARVAM_TTS_WS_URL.format(model=self._model),
+            additional_headers={"Api-Subscription-Key": self._api_key},
+            max_size=None, open_timeout=6, ping_interval=20, ping_timeout=20,
+        )
+        await ws.send(json.dumps({"type": "config", "data": {
+            "model": self._model,
+            "target_language_code": language,
+            "speaker": self._speaker,
+            "pace": pace,
+            "temperature": self._temperature,
+            "speech_sample_rate": str(self._sr),
+            "output_audio_codec": "linear16",       # raw PCM, no mp3 decoding needed
+            "enable_preprocessing": True,
+            # if Sarvam ever 400s on a config key, delete that key here
+        }}))
+        self._ws, self._ws_key = ws, key
+        return ws
+
+    def synthesize(self, text: str, *, conn_options: APIConnectOptions = DEFAULT_API_CONNECT_OPTIONS,
+                   language_code: str = None, pace: float = None) -> "_SarvamChunkedStream":
+        return _SarvamChunkedStream(
+            tts_obj=self, input_text=text, conn_options=conn_options,
+            language_code=language_code or self._language_code, pace=pace or self._pace,
+        )
+
+    async def aclose(self) -> None:
+        self.drop_ws()
+        await super().aclose()
+
+
+class _SarvamChunkedStream(tts.ChunkedStream):
+    def __init__(self, *, tts_obj: SarvamWSTTS, input_text: str, conn_options: APIConnectOptions,
+                 language_code: str, pace: float):
+        super().__init__(tts=tts_obj, input_text=input_text, conn_options=conn_options)
+        self._language_code = language_code
+        self._pace = pace
+
+    async def _run(self, output_emitter: tts.AudioEmitter) -> None:
+        t = self._tts
+        text = (self._input_text or "").strip()
+        output_emitter.initialize(request_id=utils.shortuuid(), sample_rate=t.sample_rate,
+                                  num_channels=1, mime_type="audio/pcm")
+        if not text:
+            return
+        got_audio = False
+        async with t.lock:
+            for attempt in (1, 2):
+                carry, first = b"", True
+                try:
+                    ws = await t.get_ws(self._language_code, self._pace)
+                    await ws.send(json.dumps({"type": "text", "data": {"text": text}}))
+                    await ws.send(json.dumps({"type": "flush"}))
+                    while True:
+                        raw = await asyncio.wait_for(ws.recv(), timeout=15)
+                        msg = json.loads(raw)
+                        mtype = msg.get("type")
+                        if mtype == "audio":
+                            b = base64.b64decode(msg["data"]["audio"])
+                            if first:
+                                first = False
+                                if b[:4] == b"RIFF":
+                                    b = b[44:]               # strip WAV header if Sarvam sends one
+                            b = carry + b
+                            if len(b) % 2:
+                                carry, b = b[-1:], b[:-1]
+                            else:
+                                carry = b""
+                            if b:
+                                output_emitter.push(b)
+                                got_audio = True
+                        elif mtype == "event":
+                            if (msg.get("data") or {}).get("event_type") == "final":
+                                break
+                        elif mtype == "error":
+                            raise RuntimeError((msg.get("data") or {}).get("message", "Sarvam TTS error"))
+                    output_emitter.flush()
+                    return
+                except asyncio.CancelledError:
+                    t.drop_ws()          # barge-in: leftover audio on the socket would leak into the next sentence
+                    raise
+                except Exception as e:
+                    t.drop_ws()
+                    if got_audio:
+                        logger.warning("Sarvam TTS broke mid-sentence: %r", e)
+                        output_emitter.flush()
+                        return
+                    if attempt == 2:
+                        raise APIConnectionError(f"Sarvam TTS failed: {e!r}") from e
+                    logger.warning("Sarvam TTS ws error (%r) - reconnecting once", e)
+
+
 def _build_stt(language):
-    """Sarvam saaras:v3 for every call. English / Hindi / auto agents use auto-detect ('unknown') so the
-    caller can mix Hindi/English or switch language mid-call; regional agents use their own language code.
-    No Deepgram fallback."""
+    """Sarvam saaras:v3-realtime over websocket. en / hi / auto agents are LOCKED to hi-IN (handles
+    Hindi + English code-mix) because 'unknown' auto-detect was what produced the Telugu/Bengali/
+    Gujarati hallucinations on background noise. Regional agents use their own language code."""
     lang = language if language in SUPPORTED_LANGUAGES else None
     regional = lang is not None and lang not in ("en", "hi")
-    code = LANGUAGES[lang]["tts"] if regional else "unknown"
-    kwargs = dict(language=code, model=SARVAM_STT_MODEL, mode=SARVAM_STT_MODE)
-    valid = set(inspect.signature(sarvam.STT.__init__).parameters)
-    kwargs = {k: v for k, v in kwargs.items() if k in valid}
-    logger.info("STT: Sarvam %s (language=%s, mode=%s)", SARVAM_STT_MODEL, code, kwargs.get("mode", "n/a"))
-    return sarvam.STT(**kwargs)
+    if SARVAM_STT_LANGUAGE_OVERRIDE:
+        code = SARVAM_STT_LANGUAGE_OVERRIDE
+    elif regional:
+        code = LANGUAGES[lang]["tts"]
+    else:
+        code = "hi-IN"
+    logger.info("STT: Sarvam realtime %s (language=%s, mode=%s, stream_type=%s)",
+                SARVAM_STT_RT_MODEL, code, SARVAM_STT_MODE, SARVAM_STT_STREAM_TYPE)
+    return SarvamRealtimeSTT(language_code=code, agent_language=lang)
 
 # ---------------- Pre-recorded opening line ----------------
 _OPENING_AUDIO_CACHE = {}   # (url, rate) -> mono PCM16 bytes
@@ -403,58 +762,99 @@ class EvaAgent(Agent):
             logger.exception("on_enter failed for call_id=%r - greeting was not spoken", self._call_id)
 
     async def tts_node(self, text: AsyncIterable[str], model_settings: ModelSettings):
-        buffer = ""
-        spoken_chars = 0
-        capped = False
-        finished = False
+        # Each sentence is synthesized in its own task (the TTS socket lock keeps them in order),
+        # so sentence N+1 is already being generated while sentence N is still playing.
+        order_q: asyncio.Queue = asyncio.Queue()
+        synth_tasks = []
+        state = {"finished": False}
 
+        def _launch(sentence: str):
+            frames_q: asyncio.Queue = asyncio.Queue()
+
+            async def _synth():
+                try:
+                    async for frame in self._speak(sentence):
+                        frames_q.put_nowait(frame)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    logger.exception("TTS failed for %r", sentence[:40])
+                finally:
+                    frames_q.put_nowait(None)
+
+            synth_tasks.append(asyncio.create_task(_synth()))
+            order_q.put_nowait(frames_q)
+
+        async def _clean(sentence: str):
+            sentence = await self._handle_booking_tag(sentence)
+            sentence = self._strip_end_call(sentence)
+            return IGNORE_RE.sub("", sentence).strip()      # [IGNORE] is never spoken
+
+        async def _produce():
+            buffer = ""
+            spoken_chars = 0
+            capped = False
+            try:
+                async for chunk in text:
+                    buffer += chunk
+                    parts = SENTENCE_END_RE.split(buffer)
+                    complete, i = "", 0
+                    while i + 1 < len(parts):
+                        complete += parts[i] + parts[i + 1]
+                        i += 2
+                    buffer = parts[i] if i < len(parts) else ""
+
+                    sentence = complete.strip()
+
+                    # Early flush: first chunk of a reply is cut at the first comma
+                    if not sentence and spoken_chars == 0:
+                        for m in FIRST_CLAUSE_RE.finditer(buffer):
+                            if m.end() >= MIN_FIRST_CHUNK_CHARS:
+                                sentence = buffer[:m.end()].strip()
+                                buffer = buffer[m.end():]
+                                break
+
+                    if not sentence:
+                        continue
+                    has_tag = bool(BOOK_MEETING_RE.search(sentence))
+                    sentence = await _clean(sentence)
+                    if not sentence or not SPEAKABLE_RE.search(sentence) or (capped and not has_tag):
+                        continue
+                    _launch(sentence)
+                    spoken_chars += len(sentence)
+                    if spoken_chars >= MAX_SPOKEN_CHARS:
+                        capped = True
+
+                tail = buffer.strip()
+                if tail:
+                    has_tag = bool(BOOK_MEETING_RE.search(tail))
+                    tail = await _clean(tail)
+                    if tail and SPEAKABLE_RE.search(tail) and (not capped or has_tag):
+                        _launch(tail)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("tts_node producer failed")
+            finally:
+                order_q.put_nowait(None)
+
+        producer = asyncio.create_task(_produce())
         try:
-            async for chunk in text:
-                buffer += chunk
-                parts = SENTENCE_END_RE.split(buffer)
-                complete, i = "", 0
-                while i + 1 < len(parts):
-                    complete += parts[i] + parts[i + 1]
-                    i += 2
-                buffer = parts[i] if i < len(parts) else ""
-
-                sentence = complete.strip()
-
-                # Early flush: for the FIRST chunk of a reply only, don't wait for a
-                # full sentence - cut at the first comma once we have enough text.
-                if not sentence and spoken_chars == 0:
-                    for m in FIRST_CLAUSE_RE.finditer(buffer):
-                        if m.end() >= MIN_FIRST_CHUNK_CHARS:
-                            sentence = buffer[:m.end()].strip()
-                            buffer = buffer[m.end():]
-                            break
-
-                if not sentence:
-                    continue
-                has_tag = bool(BOOK_MEETING_RE.search(sentence))
-                sentence = await self._handle_booking_tag(sentence)
-                sentence = self._strip_end_call(sentence)
-                # skip empty / punctuation-only text (Sarvam 400s on it), and drop
-                # anything past the cap - except a booking confirmation.
-                if not sentence or not SPEAKABLE_RE.search(sentence) or (capped and not has_tag):
-                    continue
-                async for frame in self._speak(sentence):
+            while True:
+                frames_q = await order_q.get()
+                if frames_q is None:
+                    break
+                while True:
+                    frame = await frames_q.get()
+                    if frame is None:
+                        break
                     yield frame
-                spoken_chars += len(sentence)
-                if spoken_chars >= MAX_SPOKEN_CHARS:
-                    capped = True
-
-            tail = buffer.strip()
-            if tail:
-                has_tag = bool(BOOK_MEETING_RE.search(tail))
-                tail = await self._handle_booking_tag(tail)
-                tail = self._strip_end_call(tail)
-                if tail and SPEAKABLE_RE.search(tail) and (not capped or has_tag):
-                    async for frame in self._speak(tail):
-                        yield frame
-            finished = True
+            state["finished"] = True
         finally:
-            if not finished:
+            producer.cancel()
+            for t in synth_tasks:
+                t.cancel()
+            if not state["finished"]:
                 # reply was interrupted by the caller -> don't hang up on them
                 self._end_call_requested = False
 
@@ -465,24 +865,20 @@ class EvaAgent(Agent):
         if not bm:
             return sentence
         requested_iso = f"{bm.group(1)}T{bm.group(2)}:00"
-        confirmed, message = book_meeting_via_pravaah(self._meeting, self._lead, self._call_id, requested_iso)
+        confirmed, message = await asyncio.to_thread(
+            book_meeting_via_pravaah, self._meeting, self._lead, self._call_id, requested_iso
+        )
         logger.info(f"[{self._call_id or 'test'}] booking requested={requested_iso} confirmed={confirmed}")
         remainder = BOOK_MEETING_RE.sub("", sentence).strip()
         # Speak the booking result instead of the raw tag.
         return (remainder + " " + message).strip() if remainder else message
 
     async def _speak(self, sentence: str):
-        # Prefer the call's configured language over script-detection: once
-        # Hindi replies are written in Hinglish (Roman script) there's no
-        # Devanagari left for _detect_lang to key off, so it would silently
-        # fall back to "en" every time and use the wrong voice/pronunciation.
         lang = _pick_tts_lang(sentence, self._forced_lang)
-        try:
-            self._global_tts.update_options(target_language_code=_sarvam_lang_code(lang), pace=TTS_SPEED)
-        except Exception:
-            logger.warning("sarvam TTS update_options failed for %r, using TTS defaults", sentence[:30])
         logger.info("speaking [%s]: %s", LANG_NAMES.get(lang, lang), sentence[:60])
-        async for audio in self._global_tts.synthesize(sentence):
+        async for audio in self._global_tts.synthesize(
+            sentence, language_code=_sarvam_lang_code(lang), pace=TTS_SPEED
+        ):
             yield audio.frame
 
 
@@ -578,10 +974,25 @@ def _build_instructions(agent_cfg: dict, lead: dict, meeting: dict, inbound: boo
         "\n\nSPEAKING LENGTH RULE (always follow, no exceptions): this is a live "
         "phone call. Each reply is ONE short sentence, at most two. Target 100-150 "
         "characters, never above 200. Never read the example lines in the script word "
-        "for word - compress them to the shortest natural version. Acknowledge in 2-3 "
-        "words, then ask ONE question. Never say 'Sir/Ma'am' out loud as a pair: use the "
-        "caller's name with 'ji' (e.g. 'Bhuvi ji'), or just 'ji'. Keep any closing "
-        "summary to one sentence."
+        "for word - compress them to the shortest natural version. Never say 'Sir/Ma'am' "
+        "out loud as a pair: use the caller's name with 'ji' (e.g. 'Bhuvi ji'), or just 'ji'. "
+        "Keep any closing summary to one sentence."
+    )
+    base += (
+        "\n\nNATURAL ACKNOWLEDGEMENT (always follow): start every reply with a 2-4 word "
+        "acknowledgement that echoes the SPECIFIC detail the caller just gave, then ask ONE next "
+        "question. Example: caller says 'South Delhi mein dekh raha hoon' -> 'South Delhi, achha ji. "
+        "Budget kitna soch rakha hai?'. Vary the openers (Achha, Theek hai, Samajh gaya, Got it, "
+        "Bilkul) and never use the same one twice in a row. Never ask something the caller has "
+        "already told you earlier in the call."
+    )
+    base += (
+        "\n\nBACKGROUND VOICES: the line may pick up other people talking nearby. If the caller's "
+        "latest message is UNMISTAKABLY a conversation between other people about something unrelated "
+        "to this call (cars, family chatter, directions) and contains no answer or question for you, "
+        "output exactly [IGNORE] and nothing else. If a message is only half-heard or unclear, do not "
+        "guess - say a very short 'Ji, dobara bolenge?' in the call's language. If the message is "
+        "even partly an answer to you, answer it normally. Never mention noise or background voices."
     )
     base += (
         "\n\nSpeak the way a real person talks on a phone call - use contractions "
@@ -614,7 +1025,15 @@ def _build_instructions(agent_cfg: dict, lead: dict, meeting: dict, inbound: boo
     return base, forced_lang, persona_name
 
 def prewarm(proc: JobProcess) -> None:
-    proc.userdata["vad"] = silero.VAD.load(min_silence_duration=0.35)
+    # Higher activation threshold + longer min speech = faint background voices and mic bumps
+    # no longer count as "the caller is speaking".
+    _vad_kwargs = dict(
+        min_silence_duration=0.35,
+        min_speech_duration=VAD_MIN_SPEECH_SECS,
+        activation_threshold=VAD_ACTIVATION_THRESHOLD,
+    )
+    _vad_valid = set(inspect.signature(silero.VAD.load).parameters)
+    proc.userdata["vad"] = silero.VAD.load(**{k: v for k, v in _vad_kwargs.items() if k in _vad_valid})
 
 
 server = AgentServer()
@@ -673,17 +1092,17 @@ async def entrypoint(ctx: JobContext) -> None:
     print(f"[EVA-DEBUG] FULL meeting for call_id={call_id}: {json.dumps(meeting, default=str)}", flush=True)
 
     voice = VOICE_MALE if agent_cfg.get("gender") == "male" else VOICE_FEMALE
-    global_tts = sarvam.TTS(
-        target_language_code="en-IN",   # overridden per-sentence in EvaAgent._speak()/on_enter()
-        speaker=voice,
+    _lang0 = agent_cfg.get("language") if agent_cfg.get("language") in SUPPORTED_LANGUAGES else "hi"
+    global_tts = SarvamWSTTS(
+        api_key=SARVAM_API_KEY,
         model=SARVAM_TTS_MODEL,
+        speaker=voice,
+        language_code=_sarvam_lang_code(_lang0),   # same language the opening line will use -> no reconnect
         pace=TTS_SPEED,
         temperature=SARVAM_TTS_TEMPERATURE,
+        sample_rate=SARVAM_TTS_SAMPLE_RATE,
     )
-    try:
-        global_tts.prewarm()   # open the Sarvam WebSocket now, not on the first sentence
-    except Exception:
-        pass
+    global_tts.prewarm()   # opens the Sarvam TTS websocket now, not on the first sentence
 
     # Pre-recorded opening line: start downloading NOW (in parallel with session
     # setup) so it's ready the instant on_enter runs.
@@ -737,15 +1156,21 @@ async def entrypoint(ctx: JobContext) -> None:
         stt=_build_stt(agent_cfg.get("language")),
         llm=llm,
         tts=global_tts,
-        turn_detection=("vad" if TURN_DETECTION_MODE == "vad" else MultilingualModel()),
+        turn_detection=("vad" if TURN_DETECTION_MODE == "vad" else
+                        "stt" if TURN_DETECTION_MODE == "stt" else MultilingualModel()),
         allow_interruptions=True,
-        min_interruption_duration=0.4,
+        min_interruption_duration=MIN_INTERRUPTION_SECS,
+        min_interruption_words=MIN_INTERRUPTION_WORDS,   # barge-in needs real words, not a noise burst
         min_endpointing_delay=MIN_ENDPOINTING_DELAY,
         max_endpointing_delay=MAX_ENDPOINTING_DELAY,
         preemptive_generation=True,       # start generating before the user's turn is fully finalized
         resume_false_interruption=True,   # resume speaking if a "barge-in" turns out to be noise
         false_interruption_timeout=1.5,
     )
+    try:
+        llm.prewarm()      # opens the HTTPS connection to Sarvam LLM now (saves the TLS handshake on turn 1)
+    except Exception:
+        pass
     _valid_params = set(inspect.signature(AgentSession.__init__).parameters)
     _session_kwargs = {k: v for k, v in _session_kwargs.items() if k in _valid_params}
     session = AgentSession(**_session_kwargs)
@@ -793,6 +1218,9 @@ async def entrypoint(ctx: JobContext) -> None:
         role = "lead" if getattr(item, "role", "") == "user" else "agent"
         text = getattr(item, "text_content", None) or str(item)
         text = END_CALL_RE.sub("", text).strip()
+        text = IGNORE_RE.sub("", text).strip()
+        if role == "agent" and not text:
+            return
         transcript.append({"role": role, "text": text, "ts": time.time()})
 
     session.on("conversation_item_added", _on_item_added)

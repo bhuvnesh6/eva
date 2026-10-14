@@ -8,9 +8,12 @@ FIRST PASS: the audio path works end-to-end on paper, but frame sizing,
 resampling, and interrupt-clear timing have not been tuned against a real
 VoiceLink call yet. Expect to adjust after a live test.
 """
+import array
 import audioop
 import asyncio
 import base64
+import math
+import os
 import json
 import threading
 import time
@@ -104,6 +107,71 @@ INBOUND_LIVE_FALLBACK_SECS = 10   # go live anyway if the agent never reports su
 GREETING_LEAD_SECS = 0.3          # send greeting audio this far ahead of real time
 HANGUP_TAIL_SECS = 0.8            # let the last agent words play before cutting the call
 
+# ---------------- caller-audio noise gate (kills background voices / rumble) ----------------
+GATE_ENABLED = os.environ.get("EVA_NOISE_GATE", "1") != "0"
+GATE_HPF_HZ = float(os.environ.get("EVA_GATE_HPF_HZ", "250"))          # removes low-frequency rumble
+GATE_MIN_RMS = float(os.environ.get("EVA_GATE_MIN_RMS", "200"))        # absolute floor (16-bit RMS)
+GATE_NOISE_MULT = float(os.environ.get("EVA_GATE_NOISE_MULT", "3.0"))  # must be 3x the measured noise floor
+GATE_REL_RATIO = float(os.environ.get("EVA_GATE_REL_RATIO", "0.35"))   # must be >= 35% of the caller's usual level
+GATE_HANG_SECS = float(os.environ.get("EVA_GATE_HANG_SECS", "0.35"))   # keep gate open this long after speech
+
+
+class _CallerAudioFilter:
+    """Per-call. 1) high-pass filter (rumble, wind, engine). 2) adaptive gate: learns how loud the
+    real caller is (their mouth is on the handset) and replaces anything much quieter - other people
+    talking in the background, distant noise - with silence. Silence (not dropped frames) is sent so
+    timing stays intact for VAD/STT. Used only on the LiveKit loop thread, so no locking."""
+
+    def __init__(self, rate: int):
+        rc = 1.0 / (2.0 * math.pi * GATE_HPF_HZ)
+        self._a = rc / (rc + 1.0 / rate)
+        self._rate = rate
+        self._px = 0.0
+        self._py = 0.0
+        self.noise = 80.0       # running noise floor (RMS)
+        self.ref = 0.0          # running level of the caller's voice (RMS)
+        self._hang = 0          # samples left until the gate closes
+        self._frames = 0
+        self._passed = 0
+
+    def process(self, pcm: bytes) -> bytes:
+        n = len(pcm) // 2
+        if n == 0:
+            return pcm
+        xs = array.array("h")
+        xs.frombytes(pcm[:n * 2])
+        out = array.array("h", bytes(n * 2))
+        a, px, py = self._a, self._px, self._py
+        for i in range(n):
+            x = xs[i]
+            y = a * (py + x - px)
+            px, py = x, y
+            out[i] = 32767 if y > 32767 else (-32768 if y < -32768 else int(y))
+        self._px, self._py = px, py
+        filtered = out.tobytes()
+        rms = audioop.rms(filtered, 2)
+
+        self._frames += 1
+        thr = max(GATE_MIN_RMS, self.noise * GATE_NOISE_MULT, self.ref * GATE_REL_RATIO)
+        self.ref *= 0.9997                                   # slow decay, so a quieter caller isn't muted forever
+        if rms >= thr:
+            self.ref = float(rms) if self.ref < 1.0 else self.ref + 0.03 * (rms - self.ref)
+            self._hang = int(self._rate * GATE_HANG_SECS)
+            self._passed += 1
+            result = filtered
+        elif self._hang > 0:
+            self._hang -= n
+            self._passed += 1
+            result = filtered
+        else:
+            self.noise = min(600.0, max(40.0, 0.97 * self.noise + 0.03 * rms))
+            result = bytes(n * 2)                            # gated -> digital silence
+
+        if self._frames % 500 == 0:                          # ~every 10s: handy for tuning
+            print(f"[VOICELINK-BRIDGE] gate stats: noise={self.noise:.0f} caller_level={self.ref:.0f} "
+                  f"threshold={thr:.0f} open={100 * self._passed / self._frames:.0f}%", flush=True)
+        return result
+
 
 class VoiceLinkBridge:
     """One instance per VoiceLink call (outbound OR inbound)."""
@@ -155,6 +223,7 @@ class VoiceLinkBridge:
         self._agent_joined = False
         self._hangup_flag = False
         self._hangup_done = False
+        self._filter = _CallerAudioFilter(ROOM_AUDIO_RATE) if GATE_ENABLED else None
 
     # ---------------- lifecycle ----------------
     def start(self):
@@ -325,6 +394,8 @@ class VoiceLinkBridge:
     def _loop_ingest(self, pcm16: bytes):
         if self._closed.is_set():
             return
+        if self._filter is not None:
+            pcm16 = self._filter.process(pcm16)
         if not self._live:
             self._prebuf.extend(pcm16)
             cap = ROOM_AUDIO_RATE * 2 * PREBUF_MAX_SECS
