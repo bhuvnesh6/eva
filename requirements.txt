@@ -12,6 +12,9 @@ sounddevice>=0.5
 deepgram-sdk>=3.7,<4
 twilio==9.10.9
 websocket-client>=1.8
+sarvamai
+websockets
+
 
 # LiveKit
 livekit-agents>=1.0
