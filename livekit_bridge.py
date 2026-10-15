@@ -37,6 +37,7 @@ import gevent.monkey as _gevent_monkey
 # running OS thread with no gevent thread-pool lifecycle assumptions
 # attached to it.
 _RealThread = _gevent_monkey.get_original("threading", "Thread")
+_real_sleep = _gevent_monkey.get_original("time", "sleep")   # precise sleep for the paced audio sender thread
 
 LIVEKIT_URL = None
 LIVEKIT_API_KEY = None
@@ -106,6 +107,7 @@ PREBUF_PRE_ROLL_MS = 300          # keep this much audio before the first spoken
 INBOUND_LIVE_FALLBACK_SECS = 10   # go live anyway if the agent never reports subscribing
 GREETING_LEAD_SECS = 0.3          # send greeting audio this far ahead of real time
 HANGUP_TAIL_SECS = 0.8            # let the last agent words play before cutting the call
+PLAY_PREBUFFER_MS = int(os.environ.get("EVA_PLAY_PREBUFFER_MS", "100"))   # audio collected before each burst of speech starts playing
 
 # ---------------- caller-audio noise gate (kills background voices / rumble) ----------------
 GATE_ENABLED = os.environ.get("EVA_NOISE_GATE", "1") != "0"
@@ -515,18 +517,49 @@ class VoiceLinkBridge:
             }))
 
     def _sender_loop(self):
-        """Plain OS thread: the only place that writes agent audio to the VoiceLink
-        websocket. Waits for VoiceLink's 'start' event and for the greeting to finish."""
+        """Plain OS thread: the only place that writes agent audio to the VoiceLink websocket.
+
+        Jitter buffer + steady clock: before each burst of speech we wait until PLAY_PREBUFFER_MS of
+        audio has collected, then send exactly one 20 ms chunk every 20 ms on an absolute clock.
+        Small delays in the LiveKit path are absorbed by the buffer instead of becoming audible
+        stutter on the phone. If the buffer ever runs dry we simply re-buffer a little and continue."""
+        FRAME_SECS = 0.02
+        prebuf_frames = max(1, PLAY_PREBUFFER_MS // 20)
+        playing = False
+        wait_since = None
+        next_t = 0.0
         while not self._closed.is_set():
             if self._hangup_flag:
                 self._do_hangup()
                 return
-            if (not self.started.is_set() or not self.greeting_done.is_set() or not self._out):
-                time.sleep(0.005)
+            if not self.started.is_set() or not self.greeting_done.is_set():
+                _real_sleep(0.005)
+                continue
+
+            if not playing:
+                n = len(self._out)
+                if n == 0:
+                    wait_since = None
+                    _real_sleep(0.004)
+                    continue
+                if wait_since is None:
+                    wait_since = time.monotonic()
+                # start when enough audio is buffered, or when a short sound (e.g. "ji") has waited long enough
+                if n < prebuf_frames and (time.monotonic() - wait_since) < (PLAY_PREBUFFER_MS / 1000.0) * 2:
+                    _real_sleep(0.004)
+                    continue
+                playing = True
+                wait_since = None
+                next_t = time.monotonic()
+
+            now = time.monotonic()
+            if now < next_t:
+                _real_sleep(min(next_t - now, 0.004))
                 continue
             try:
                 chunk = self._out.popleft()
             except IndexError:
+                playing = False            # buffer ran dry -> re-buffer instead of trickling out choppy audio
                 continue
             try:
                 self._send_media_chunk(chunk)
@@ -535,7 +568,10 @@ class VoiceLinkBridge:
                     print("[VOICELINK-BRIDGE] first audio frame SENT to VoiceLink", flush=True)
             except Exception as e:
                 print(f"[VOICELINK-BRIDGE] ws send failed: {type(e).__name__}: {e!r}", flush=True)
-                time.sleep(0.05)
+                _real_sleep(0.05)
+            next_t += FRAME_SECS
+            if now - next_t > 0.3:         # stalled for >300 ms (GIL / GC): resync instead of a huge burst
+                next_t = now
 
     # ---------------- hang up (agent said goodbye / left the room) ----------------
     def request_hangup(self):

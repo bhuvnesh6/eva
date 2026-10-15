@@ -85,9 +85,12 @@ PRAVAAH_API_BASE_URL = os.environ.get("PRAVAAH_API_BASE_URL", "").rstrip("/")
 GLOBAL_TTS_MODEL = os.environ.get("GLOBAL_TTS_MODEL", "inworld/inworld-tts-2")
 VOICE_MALE = os.environ.get("EVA_VOICE_MALE", "shubh")
 VOICE_FEMALE = os.environ.get("EVA_VOICE_FEMALE", "priya")
-TTS_SPEED = max(0.8, min(1.4, float(os.environ.get("EVA_TTS_SPEED", "1.4"))))
+# 1.4 (old default) makes bulbul sound rushed/robotic. 1.0-1.1 sounds like a relaxed phone call.
+TTS_SPEED = max(0.8, min(1.4, float(os.environ.get("EVA_TTS_SPEED", "1.05"))))
 
-SENTENCE_END_RE = re.compile(r"([.!?।\n])")
+# Sentence end = . ! ? । or newline, but NOT the dot inside numbers ("1.5 crore", "2.5 BHK"),
+# which used to cut speech in the middle of a number and caused an audible break.
+SENTENCE_END_RE = re.compile(r"([!?।\n]|\.(?!\d)|(?<!\d)\.)")
 HINDI_RE = re.compile(r"[\u0900-\u097F]")
 BOOK_MEETING_RE = re.compile(r"BOOK_MEETING:\s*(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2})")
 END_CALL_RE = re.compile(r"\[?\s*END_CALL\s*\]?")
@@ -154,15 +157,15 @@ IGNORE_RE = re.compile(r"\[IGNORE\]")       # LLM emits this when the "caller" t
 # ---------------- Latency tuning ----------------
 # How long the agent waits after the caller stops before replying, worst case.
 # Was hard-coded 3.0 -> this was the biggest source of the 4-7s delay.
-MIN_ENDPOINTING_DELAY = float(os.environ.get("EVA_MIN_ENDPOINTING_DELAY", "0.2"))
+MIN_ENDPOINTING_DELAY = float(os.environ.get("EVA_MIN_ENDPOINTING_DELAY", "0.15"))
 MAX_ENDPOINTING_DELAY = float(os.environ.get("EVA_MAX_ENDPOINTING_DELAY", "1.2"))
 # "multilingual" = smart turn-detector model (default). "vad" = plain silence-based,
 # fastest, but may cut in on slow talkers. Try "vad" if still too slow.
-TURN_DETECTION_MODE = os.environ.get("EVA_TURN_DETECTION", "multilingual").strip().lower()
+TURN_DETECTION_MODE = os.environ.get("EVA_TURN_DETECTION", "stt").strip().lower()
 # First spoken chunk may be flushed at a comma once it has this many chars,
 # so TTS starts before the LLM finishes the whole first sentence.
 FIRST_CLAUSE_RE = re.compile(r"[,;](?=\s)")
-MIN_FIRST_CHUNK_CHARS = int(os.environ.get("EVA_MIN_FIRST_CHUNK_CHARS", "18"))
+MIN_FIRST_CHUNK_CHARS = int(os.environ.get("EVA_MIN_FIRST_CHUNK_CHARS", "14"))
 
 # Where this worker can reach Eva's Flask app (app.py) to hand over the final
 # transcript. Same container -> http://127.0.0.1:8420 ; otherwise PUBLIC_BASE_URL.
@@ -472,9 +475,168 @@ class SarvamWSTTS(tts.TTS):
             language_code=language_code or self._language_code, pace=pace or self._pace,
         )
 
+    def open_reply(self, out_q: "asyncio.Queue") -> "_SarvamReply":
+        """One whole agent reply = one _SarvamReply (see below)."""
+        return _SarvamReply(self, out_q)
+
     async def aclose(self) -> None:
         self.drop_ws()
         await super().aclose()
+
+
+class _SarvamReply:
+    """ONE whole agent reply on the persistent Sarvam TTS socket.
+
+    Old flow: send sentence 1, wait for ALL its audio, only then send sentence 2, wait for its first
+    byte -> an audible gap at every sentence boundary.
+    New flow: every sentence is sent the moment the LLM finishes it, and every audio chunk is pushed
+    straight into out_q as 40 ms frames, so the reply plays as one continuous stream."""
+
+    def __init__(self, tts_obj, out_q):
+        self._t = tts_obj
+        self._q = out_q
+        self._ws = None
+        self._lock_obj = None
+        self._have_lock = False
+        self._reader = None
+        self._language = "hi-IN"
+        self._pace = 1.0
+        self._sent = 0          # sentences sent (each followed by a flush)
+        self._finals = 0        # "final" events received
+        self._input_done = False
+        self._aborted = False
+        self._failed = False
+        self._ended = False
+        self.started = False
+        self.got_audio = False
+
+    # ---------- lock / lifecycle ----------
+    def _release(self):
+        if self._have_lock:
+            self._have_lock = False
+            try:
+                self._lock_obj.release()
+            except Exception:
+                pass
+
+    def _finish(self):
+        if self._ended:
+            return
+        self._ended = True
+        dirty = self._aborted or self._failed
+        if dirty:
+            self._t.drop_ws()          # unfinished audio left on the socket must not leak into the next reply
+        self._release()
+        self._q.put_nowait(None)       # tells tts_node the stream is over
+        if dirty:
+            try:
+                self._t.prewarm()      # reconnect in the background so the next reply skips the handshake
+            except Exception:
+                pass
+
+    async def start(self, language: str, pace: float):
+        t = self._t
+        self._language, self._pace = language, pace
+        try:
+            self._lock_obj = t.lock
+            try:
+                await asyncio.wait_for(self._lock_obj.acquire(), timeout=10)
+            except asyncio.TimeoutError:
+                logger.warning("Sarvam TTS lock stuck for 10s - resetting it")
+                t.drop_ws()
+                t.lock = asyncio.Lock()
+                self._lock_obj = t.lock
+                await self._lock_obj.acquire()
+            self._have_lock = True
+            try:
+                self._ws = await t.get_ws(language, pace)
+            except Exception as e:
+                logger.warning("Sarvam TTS connect failed (%r) - retrying once", e)
+                t.drop_ws()
+                self._ws = await t.get_ws(language, pace)
+        except BaseException:
+            self._release()
+            raise
+        self.started = True
+        self._reader = asyncio.create_task(self._read())
+
+    async def send(self, text: str):
+        await self._ws.send(json.dumps({"type": "text", "data": {"text": text}}))
+        await self._ws.send(json.dumps({"type": "flush"}))
+        self._sent += 1
+
+    def end_input(self):
+        """No more sentences are coming."""
+        self._input_done = True
+        if self._reader is None:
+            self._finish()
+        elif self._finals >= self._sent and not self._reader.done():
+            self._reader.cancel()      # everything already finished, nothing left to wait for
+
+    def abort(self):
+        """Caller barged in / reply cancelled."""
+        if self._ended:
+            return
+        self._aborted = True
+        if self._reader is not None and not self._reader.done():
+            self._reader.cancel()
+        else:
+            self._finish()
+
+    # ---------- audio in ----------
+    async def _read(self):
+        t = self._t
+        carry = b""
+        frame_bytes = max(2, int(t.sample_rate * 0.04) * 2)       # 40 ms frames
+        try:
+            while True:
+                if self._finals >= self._sent and not self._input_done:
+                    timeout = 120          # idle: LLM is still thinking, nothing pending on the socket
+                elif self._input_done and self.got_audio:
+                    timeout = 4            # tail: all text sent, don't hold the socket if a final goes missing
+                else:
+                    timeout = 15
+                try:
+                    raw = await asyncio.wait_for(self._ws.recv(), timeout=timeout)
+                except asyncio.TimeoutError:
+                    if self._input_done and self.got_audio:
+                        logger.warning("Sarvam TTS: no 'final' event after last audio - closing reply")
+                        self._failed = True
+                        break
+                    raise
+                msg = json.loads(raw)
+                mtype = msg.get("type")
+                if mtype == "audio":
+                    b = base64.b64decode(msg["data"]["audio"])
+                    if b[:4] == b"RIFF":
+                        b = b[44:]                                 # WAV header on any chunk
+                    b = carry + b
+                    if len(b) % 2:
+                        carry, b = b[-1:], b[:-1]
+                    else:
+                        carry = b""
+                    for i in range(0, len(b), frame_bytes):
+                        piece = b[i:i + frame_bytes]
+                        self._q.put_nowait(rtc.AudioFrame(
+                            data=piece, sample_rate=t.sample_rate, num_channels=1,
+                            samples_per_channel=len(piece) // 2,
+                        ))
+                    if b:
+                        self.got_audio = True
+                elif mtype == "event":
+                    if (msg.get("data") or {}).get("event_type") == "final":
+                        self._finals += 1
+                        if self._input_done and self._finals >= self._sent:
+                            break
+                elif mtype == "error":
+                    raise RuntimeError((msg.get("data") or {}).get("message", "Sarvam TTS error"))
+        except asyncio.CancelledError:
+            pass                       # end_input() / abort() cancelled us on purpose
+        except Exception as e:
+            self._failed = True
+            logger.warning("Sarvam TTS reply stream broke: %r", e)
+        finally:
+            self._finish()
 
 
 class _SarvamChunkedStream(tts.ChunkedStream):
@@ -762,33 +924,25 @@ class EvaAgent(Agent):
             logger.exception("on_enter failed for call_id=%r - greeting was not spoken", self._call_id)
 
     async def tts_node(self, text: AsyncIterable[str], model_settings: ModelSettings):
-        # Each sentence is synthesized in its own task (the TTS socket lock keeps them in order),
-        # so sentence N+1 is already being generated while sentence N is still playing.
-        order_q: asyncio.Queue = asyncio.Queue()
-        synth_tasks = []
+        # One continuous stream per reply: each sentence goes to Sarvam the moment it is complete
+        # (no waiting for the previous sentence's audio) and audio frames flow straight back out.
+        out_q: asyncio.Queue = asyncio.Queue()
+        reply = self._global_tts.open_reply(out_q)
         state = {"finished": False}
 
-        def _launch(sentence: str):
-            frames_q: asyncio.Queue = asyncio.Queue()
-
-            async def _synth():
-                try:
-                    async for frame in self._speak(sentence):
-                        frames_q.put_nowait(frame)
-                except asyncio.CancelledError:
-                    raise
-                except Exception:
-                    logger.exception("TTS failed for %r", sentence[:40])
-                finally:
-                    frames_q.put_nowait(None)
-
-            synth_tasks.append(asyncio.create_task(_synth()))
-            order_q.put_nowait(frames_q)
-
-        async def _clean(sentence: str):
+        async def _clean(sentence: str) -> str:
             sentence = await self._handle_booking_tag(sentence)
             sentence = self._strip_end_call(sentence)
             return IGNORE_RE.sub("", sentence).strip()      # [IGNORE] is never spoken
+
+        async def _say(sentence: str):
+            if not reply.started:
+                lang = _pick_tts_lang(sentence, self._forced_lang)
+                logger.info("speaking [%s]: %s", LANG_NAMES.get(lang, lang), sentence[:60])
+                await reply.start(_sarvam_lang_code(lang), TTS_SPEED)
+            else:
+                logger.info("speaking (cont.): %s", sentence[:60])
+            await reply.send(sentence)
 
         async def _produce():
             buffer = ""
@@ -806,7 +960,7 @@ class EvaAgent(Agent):
 
                     sentence = complete.strip()
 
-                    # Early flush: first chunk of a reply is cut at the first comma
+                    # Early flush: first chunk of a reply is cut at the first comma so audio starts sooner
                     if not sentence and spoken_chars == 0:
                         for m in FIRST_CLAUSE_RE.finditer(buffer):
                             if m.end() >= MIN_FIRST_CHUNK_CHARS:
@@ -820,7 +974,7 @@ class EvaAgent(Agent):
                     sentence = await _clean(sentence)
                     if not sentence or not SPEAKABLE_RE.search(sentence) or (capped and not has_tag):
                         continue
-                    _launch(sentence)
+                    await _say(sentence)
                     spoken_chars += len(sentence)
                     if spoken_chars >= MAX_SPOKEN_CHARS:
                         capped = True
@@ -830,30 +984,25 @@ class EvaAgent(Agent):
                     has_tag = bool(BOOK_MEETING_RE.search(tail))
                     tail = await _clean(tail)
                     if tail and SPEAKABLE_RE.search(tail) and (not capped or has_tag):
-                        _launch(tail)
+                        await _say(tail)
             except asyncio.CancelledError:
                 raise
             except Exception:
                 logger.exception("tts_node producer failed")
             finally:
-                order_q.put_nowait(None)
+                reply.end_input()
 
         producer = asyncio.create_task(_produce())
         try:
             while True:
-                frames_q = await order_q.get()
-                if frames_q is None:
+                frame = await out_q.get()
+                if frame is None:
                     break
-                while True:
-                    frame = await frames_q.get()
-                    if frame is None:
-                        break
-                    yield frame
+                yield frame
             state["finished"] = True
         finally:
             producer.cancel()
-            for t in synth_tasks:
-                t.cancel()
+            reply.abort()                      # no-op if the reply already finished normally
             if not state["finished"]:
                 # reply was interrupted by the caller -> don't hang up on them
                 self._end_call_requested = False
@@ -1165,7 +1314,7 @@ async def entrypoint(ctx: JobContext) -> None:
         max_endpointing_delay=MAX_ENDPOINTING_DELAY,
         preemptive_generation=True,       # start generating before the user's turn is fully finalized
         resume_false_interruption=True,   # resume speaking if a "barge-in" turns out to be noise
-        false_interruption_timeout=1.5,
+        false_interruption_timeout=1.0,
     )
     try:
         llm.prewarm()      # opens the HTTPS connection to Sarvam LLM now (saves the TLS handshake on turn 1)
