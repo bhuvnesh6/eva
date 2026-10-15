@@ -219,7 +219,7 @@ class VoiceLinkBridge:
 
         # Eva plays the greeting itself; agent audio waits until it is done
         self.greeting_done = threading.Event()
-        if not (inbound and greeting_audio):
+        if not greeting_audio:
             self.greeting_done.set()
 
         self._agent_joined = False
@@ -275,8 +275,8 @@ class VoiceLinkBridge:
         # ordered pump: caller audio -> room
         self._in_q = asyncio.Queue()
         asyncio.ensure_future(self._pump_inbound())
-        if self.inbound:
-            # inbound: keep buffering the caller until the agent has actually subscribed
+        if self.inbound or self.greeting_audio:
+            # Eva plays the greeting itself: keep buffering the caller until the agent has actually subscribed
             asyncio.ensure_future(self._live_fallback())
         else:
             # outbound: the agent greets first, so go live right away (old behaviour)

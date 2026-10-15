@@ -166,6 +166,9 @@ TURN_DETECTION_MODE = os.environ.get("EVA_TURN_DETECTION", "stt").strip().lower(
 # so TTS starts before the LLM finishes the whole first sentence.
 FIRST_CLAUSE_RE = re.compile(r"[,;](?=\s)")
 MIN_FIRST_CHUNK_CHARS = int(os.environ.get("EVA_MIN_FIRST_CHUNK_CHARS", "14"))
+# Sentences are merged into ONE Sarvam TTS request until this many chars (0 = old sentence-by-sentence).
+# One request per reply = no gap between sentences + natural intonation across "Delhi, achha ji. Budget kitna?"
+TTS_BATCH_MIN_CHARS = int(os.environ.get("EVA_TTS_BATCH_MIN_CHARS", "70"))
 
 # Where this worker can reach Eva's Flask app (app.py) to hand over the final
 # transcript. Same container -> http://127.0.0.1:8420 ; otherwise PUBLIC_BASE_URL.
@@ -935,14 +938,28 @@ class EvaAgent(Agent):
             sentence = self._strip_end_call(sentence)
             return IGNORE_RE.sub("", sentence).strip()      # [IGNORE] is never spoken
 
-        async def _say(sentence: str):
+        batch = {"text": ""}
+
+        async def _send_batch():
+            t = batch["text"].strip()
+            batch["text"] = ""
+            if not t:
+                return
             if not reply.started:
-                lang = _pick_tts_lang(sentence, self._forced_lang)
-                logger.info("speaking [%s]: %s", LANG_NAMES.get(lang, lang), sentence[:60])
+                lang = _pick_tts_lang(t, self._forced_lang)
+                logger.info("speaking [%s]: %s", LANG_NAMES.get(lang, lang), t[:80])
                 await reply.start(_sarvam_lang_code(lang), TTS_SPEED)
             else:
-                logger.info("speaking (cont.): %s", sentence[:60])
-            await reply.send(sentence)
+                logger.info("speaking (cont.): %s", t[:80])
+            await reply.send(t)
+
+        async def _say(sentence: str):
+            batch["text"] = (batch["text"] + " " + sentence).strip()
+            if len(batch["text"]) >= TTS_BATCH_MIN_CHARS:
+                await _send_batch()
+
+        async def _flush():
+            await _send_batch()
 
         async def _produce():
             buffer = ""
@@ -985,6 +1002,7 @@ class EvaAgent(Agent):
                     tail = await _clean(tail)
                     if tail and SPEAKABLE_RE.search(tail) and (not capped or has_tag):
                         await _say(tail)
+                await _flush()      # send whatever is still batched
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -1006,6 +1024,29 @@ class EvaAgent(Agent):
             if not state["finished"]:
                 # reply was interrupted by the caller -> don't hang up on them
                 self._end_call_requested = False
+
+    async def llm_node(self, chat_ctx, tools, model_settings):
+        # Sarvam sometimes returns the END_CALL marker as a *tool call* even though we declare no tools.
+        # LiveKit then stores a function_call in the history and every later request fails with
+        # HTTP 400 "Tool messages found but no tools provided" -> Eva goes silent for the rest of the call.
+        # 1) never send tool messages back to the LLM  2) turn any stray tool call back into spoken text.
+        try:
+            chat_ctx = chat_ctx.copy(exclude_function_call=True)
+        except TypeError:
+            pass
+        async for chunk in Agent.default.llm_node(self, chat_ctx, tools, model_settings):
+            delta = getattr(chunk, "delta", None)
+            calls = getattr(delta, "tool_calls", None) if delta is not None else None
+            if not calls:
+                yield chunk
+                continue
+            if getattr(delta, "content", None):
+                yield delta.content
+            for c in calls:
+                txt = (getattr(c, "name", "") or "").strip()
+                logger.warning("LLM returned a tool call although no tools exist - speaking it as text: %r", txt[:80])
+                if txt:
+                    yield txt + "\n"
 
     async def _handle_booking_tag(self, sentence: str) -> str:
         """Strips a BOOK_MEETING: tag out of the spoken text and fires the
@@ -1157,7 +1198,7 @@ def _build_instructions(agent_cfg: dict, lead: dict, meeting: dict, inbound: boo
     base += (
         "\n\nENDING THE CALL: when the caller clearly wants to finish the conversation (for example 'ok bye', "
         "'bye', 'thank you bye', 'that's all', 'theek hai bye', 'rakhta hoon', 'phone rakhti hoon', 'dhanyavaad bye'), "
-        "reply with ONE short polite goodbye sentence and add the exact token END_CALL at the very end of that same reply. "
+        "reply with ONE short polite goodbye sentence and then write [END_CALL] right after it, on the same line, as the very last thing in that reply (never at the start, never on its own line, never twice). "
         "Never say END_CALL out loud or explain it. A plain 'okay', 'hmm', 'haan' or 'theek hai' on its own is NOT a "
         "goodbye - only use END_CALL when the caller is really ending the call."
     )
