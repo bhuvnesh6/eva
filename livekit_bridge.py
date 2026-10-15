@@ -107,7 +107,12 @@ PREBUF_PRE_ROLL_MS = 300          # keep this much audio before the first spoken
 INBOUND_LIVE_FALLBACK_SECS = 10   # go live anyway if the agent never reports subscribing
 GREETING_LEAD_SECS = 0.3          # send greeting audio this far ahead of real time
 HANGUP_TAIL_SECS = 0.8            # let the last agent words play before cutting the call
-PLAY_PREBUFFER_MS = int(os.environ.get("EVA_PLAY_PREBUFFER_MS", "100"))   # audio collected before each burst of speech starts playing
+PLAY_PREBUFFER_MS = int(os.environ.get("EVA_PLAY_PREBUFFER_MS", "60"))    # audio collected before each burst of speech starts playing
+# Agent audio from LiveKit arrives as a never-ending stream (silence while idle). If we queue that silence,
+# it builds a multi-second backlog and every reply is heard late. We drop silence and keep only real speech
+# (+ a short hangover so natural pauses inside a reply are kept).
+AGENT_SILENCE_RMS = int(os.environ.get("EVA_AGENT_SILENCE_RMS", "12"))        # 16-bit RMS below this = silence
+AGENT_SILENCE_HANG_MS = int(os.environ.get("EVA_AGENT_SILENCE_HANG_MS", "300"))
 
 # ---------------- caller-audio noise gate (kills background voices / rumble) ----------------
 GATE_ENABLED = os.environ.get("EVA_NOISE_GATE", "1") != "0"
@@ -493,17 +498,30 @@ class VoiceLinkBridge:
 
     async def _pump_agent_audio(self, track: rtc.Track):
         """Runs on the LiveKit loop thread. It must NOT touch the websocket,
-        so it only pushes 20ms A-law chunks (160 bytes) into a deque."""
+        so it only pushes 20ms codec chunks (160 bytes) into a deque.
+        Silent frames are dropped (after a short hangover) so the queue never
+        builds a backlog -> replies play with no extra delay."""
         stream = rtc.AudioStream(track, sample_rate=ROOM_AUDIO_RATE, num_channels=1)
         buf = b""
         first = True
+        hang_samples = int(ROOM_AUDIO_RATE * AGENT_SILENCE_HANG_MS / 1000)
+        quiet = hang_samples + 1          # start in "silent" state -> leading silence is dropped
         async for event in stream:
             if self._closed.is_set():
                 break
-            if first:
-                first = False
-                print("[VOICELINK-BRIDGE] first agent audio frame received from LiveKit", flush=True)
-            buf += self._encode(bytes(event.frame.data))
+            pcm = bytes(event.frame.data)
+            if len(pcm) < 2:
+                continue
+            if audioop.rms(pcm, 2) >= AGENT_SILENCE_RMS:
+                quiet = 0
+                if first:
+                    first = False
+                    print("[VOICELINK-BRIDGE] first agent SPEECH frame received from LiveKit", flush=True)
+            else:
+                quiet += len(pcm) // 2
+            if quiet > hang_samples:
+                continue                  # idle silence -> never queue it
+            buf += self._encode(pcm)
             while len(buf) >= 160:
                 self._out.append(buf[:160])
                 buf = buf[160:]

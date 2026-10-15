@@ -150,7 +150,7 @@ SARVAM_TTS_SAMPLE_RATE = int(os.environ.get("SARVAM_TTS_SAMPLE_RATE", "16000"))
 # ---------------- background-noise / side-talk protection ----------------
 VAD_ACTIVATION_THRESHOLD = float(os.environ.get("EVA_VAD_ACTIVATION", "0.6"))     # silero default 0.5
 VAD_MIN_SPEECH_SECS = float(os.environ.get("EVA_VAD_MIN_SPEECH", "0.15"))
-MIN_INTERRUPTION_SECS = float(os.environ.get("EVA_MIN_INTERRUPTION_SECS", "0.6"))
+MIN_INTERRUPTION_SECS = float(os.environ.get("EVA_MIN_INTERRUPTION_SECS", "0.45"))
 MIN_INTERRUPTION_WORDS = int(os.environ.get("EVA_MIN_INTERRUPTION_WORDS", "2"))
 IGNORE_RE = re.compile(r"\[IGNORE\]")       # LLM emits this when the "caller" text is just side-talk
 
