@@ -147,6 +147,11 @@ SARVAM_STT_CHUNK_MS = int(os.environ.get("SARVAM_STT_CHUNK_MS", "50"))
 SARVAM_TTS_WS_URL = "wss://api.sarvam.ai/text-to-speech/ws?model={model}&send_completion_event=true"
 SARVAM_TTS_SAMPLE_RATE = int(os.environ.get("SARVAM_TTS_SAMPLE_RATE", "16000"))
 
+# ---------------- Sarvam VOICE CLONE (websocket) ----------------
+SARVAM_CLONE_WS_URL = "wss://api.sarvam.ai/voices/clone/ws?send_completion_event=true"
+CLONE_TTS_CODEC = os.environ.get("EVA_CLONE_CODEC", "linear16")                  # raw PCM, no mp3 decoding
+CLONE_SEND_SAMPLE_RATE = os.environ.get("EVA_CLONE_SEND_RATE", "1") == "1"       # set 0 if Sarvam rejects speech_sample_rate
+
 # ---------------- background-noise / side-talk protection ----------------
 VAD_ACTIVATION_THRESHOLD = float(os.environ.get("EVA_VAD_ACTIVATION", "0.6"))     # silero default 0.5
 VAD_MIN_SPEECH_SECS = float(os.environ.get("EVA_VAD_MIN_SPEECH", "0.15"))
@@ -398,10 +403,12 @@ class SarvamRealtimeStream(stt.RecognizeStream):
 # ======================================================================
 class SarvamWSTTS(tts.TTS):
     def __init__(self, *, api_key: str, model: str, speaker: str, language_code: str = "hi-IN",
-                 pace: float = 1.0, temperature: float = 0.6, sample_rate: int = 16000):
+                 pace: float = 1.0, temperature: float = 0.6, sample_rate: int = 16000,
+                 voice_id: str = ""):
         super().__init__(capabilities=tts.TTSCapabilities(streaming=False),
                          sample_rate=sample_rate, num_channels=1)
         self._api_key = api_key
+        self._voice_id = (voice_id or "").strip()     # Sarvam cloned voice (svc-...) -> uses the clone websocket
         self._model = model
         self._speaker = speaker
         self._language_code = language_code
@@ -447,27 +454,45 @@ class SarvamWSTTS(tts.TTS):
                 pass
 
     async def get_ws(self, language: str, pace: float):
-        key = (language, round(float(pace), 2), self._speaker)
+        key = (language, round(float(pace), 2), self._speaker, self._voice_id)
         ws = self._ws
         if ws is not None and self._ws_key == key and getattr(ws, "close_code", None) is None:
             return ws
         self.drop_ws()
-        ws = await websockets.connect(
-            SARVAM_TTS_WS_URL.format(model=self._model),
-            additional_headers={"Api-Subscription-Key": self._api_key},
-            max_size=None, open_timeout=6, ping_interval=20, ping_timeout=20,
-        )
-        await ws.send(json.dumps({"type": "config", "data": {
-            "model": self._model,
-            "target_language_code": language,
-            "speaker": self._speaker,
-            "pace": pace,
-            "temperature": self._temperature,
-            "speech_sample_rate": str(self._sr),
-            "output_audio_codec": "linear16",       # raw PCM, no mp3 decoding needed
-            "enable_preprocessing": True,
-            # if Sarvam ever 400s on a config key, delete that key here
-        }}))
+        if self._voice_id:
+            # ---- cloned voice: /voices/clone/ws ----
+            ws = await websockets.connect(
+                SARVAM_CLONE_WS_URL,
+                additional_headers={"api-subscription-key": self._api_key},
+                subprotocols=[f"api-subscription-key.{self._api_key}"],
+                max_size=None, open_timeout=6, ping_interval=20, ping_timeout=20,
+            )
+            cfg = {
+                "target_language_code": language,
+                "voice_id": self._voice_id,
+                "output_audio_codec": CLONE_TTS_CODEC,
+            }
+            if CLONE_SEND_SAMPLE_RATE:
+                cfg["speech_sample_rate"] = str(self._sr)
+            await ws.send(json.dumps({"type": "config", "data": cfg}))
+        else:
+            # ---- default Sarvam voice (unchanged) ----
+            ws = await websockets.connect(
+                SARVAM_TTS_WS_URL.format(model=self._model),
+                additional_headers={"Api-Subscription-Key": self._api_key},
+                max_size=None, open_timeout=6, ping_interval=20, ping_timeout=20,
+            )
+            await ws.send(json.dumps({"type": "config", "data": {
+                "model": self._model,
+                "target_language_code": language,
+                "speaker": self._speaker,
+                "pace": pace,
+                "temperature": self._temperature,
+                "speech_sample_rate": str(self._sr),
+                "output_audio_codec": "linear16",       # raw PCM, no mp3 decoding needed
+                "enable_preprocessing": True,
+                # if Sarvam ever 400s on a config key, delete that key here
+            }}))
         self._ws, self._ws_key = ws, key
         return ws
 
@@ -1283,8 +1308,12 @@ async def entrypoint(ctx: JobContext) -> None:
 
     voice = VOICE_MALE if agent_cfg.get("gender") == "male" else VOICE_FEMALE
     _lang0 = agent_cfg.get("language") if agent_cfg.get("language") in SUPPORTED_LANGUAGES else "hi"
+    _clone_voice_id = (agent_cfg.get("cloned_voice_id") or "").strip()
+    if _clone_voice_id:
+        logger.info("call_id=%r using CLONED voice %s", call_id, _clone_voice_id)
     global_tts = SarvamWSTTS(
         api_key=SARVAM_API_KEY,
+        voice_id=_clone_voice_id,
         model=SARVAM_TTS_MODEL,
         speaker=voice,
         language_code=_sarvam_lang_code(_lang0),   # same language the opening line will use -> no reconnect

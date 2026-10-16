@@ -716,12 +716,74 @@ def sarvam_tts_synthesize(text: str, lang: str, voice: str, sample_rate: int):
     return pcm16, sr
 
 
+SARVAM_CLONE_WS_URL = "wss://api.sarvam.ai/voices/clone/ws?send_completion_event=true"
+CLONE_TTS_CODEC = os.environ.get("EVA_CLONE_CODEC", "linear16")
+CLONE_SEND_SAMPLE_RATE = os.environ.get("EVA_CLONE_SEND_RATE", "1") == "1"
+
+
+def _stream_clone_tts(text: str, lang: str, voice_id: str, sample_rate: int):
+    """Cloned-voice TTS over Sarvam's clone websocket (sync, gevent-friendly via
+    websocket-client). Yields (pcm16_bytes, sample_rate) like _stream_sarvam_tts."""
+    sr = min(SARVAM_SUPPORTED_RATES, key=lambda r: abs(r - sample_rate))
+    cfg = {
+        "target_language_code": SARVAM_LANG_CODES.get(lang, "en-IN"),
+        "voice_id": voice_id,
+        "output_audio_codec": CLONE_TTS_CODEC,
+    }
+    if CLONE_SEND_SAMPLE_RATE:
+        cfg["speech_sample_rate"] = str(sr)
+    ws = vanisetu_ws_lib.create_connection(
+        SARVAM_CLONE_WS_URL,
+        header=[f"api-subscription-key: {SARVAM_API_KEY}"],
+        subprotocols=[f"api-subscription-key.{SARVAM_API_KEY}"],
+        timeout=20,
+    )
+    try:
+        ws.send(json.dumps({"type": "config", "data": cfg}))
+        ws.send(json.dumps({"type": "text", "data": {"text": text}}))
+        ws.send(json.dumps({"type": "flush"}))
+        carry, first = b"", True
+        while True:
+            raw = ws.recv()
+            if not raw:
+                break
+            msg = json.loads(raw)
+            mtype = msg.get("type")
+            if mtype == "audio":
+                b = base64.b64decode(msg["data"]["audio"])
+                if first:
+                    first = False
+                    if b[:4] == b"RIFF":
+                        b = b[44:]
+                b = carry + b
+                if len(b) % 2:
+                    carry, b = b[-1:], b[:-1]
+                else:
+                    carry = b""
+                if b:
+                    yield b, sr
+            elif mtype == "event":
+                if (msg.get("data") or {}).get("event_type") == "final":
+                    break
+            elif mtype == "error":
+                raise RuntimeError((msg.get("data") or {}).get("message", "Sarvam clone TTS error"))
+    finally:
+        try:
+            ws.close()
+        except Exception:
+            pass
+
+
 def _stream_sarvam_tts(text: str, lang: str, voice: str, sample_rate: int, chunk_ms: int = 100):
     """Same (pcm_bytes, src_rate) generator contract _tts_loop already
     consumes (previously satisfied by _stream_livekit_tts). Sarvam gives us
     the whole sentence in one shot, so we chunk it ourselves afterward -
     keeps _tts_loop's interrupt_flag check responsive mid-sentence instead
-    of sending one giant blob."""
+    of sending one giant blob. A voice starting with 'svc-' is a cloned voice
+    and is streamed through the clone websocket instead."""
+    if str(voice).startswith("svc-"):
+        yield from _stream_clone_tts(text, lang, voice, sample_rate)
+        return
     pcm16, sr = sarvam_tts_synthesize(text, lang, voice, sample_rate)
     chunk_bytes = max(2, int(sr * (chunk_ms / 1000.0)) * 2)
     chunk_bytes -= chunk_bytes % 2
@@ -795,7 +857,8 @@ class EvaSession:
         # --- NEW ---
         agent_gender = agent.get("gender") if agent.get("gender") in ("male", "female") else "female"
         self.gender = agent_gender
-        self.voice_name = VOICE_MALE if agent_gender == "male" else VOICE_FEMALE
+        # cloned voice (svc-...) wins; otherwise the default voice for the gender
+        self.voice_name = (agent.get("cloned_voice_id") or "").strip() or (VOICE_MALE if agent_gender == "male" else VOICE_FEMALE)
 
         self.max_duration_secs = int(agent.get("max_duration_secs") or 0) or None
         self.min_duration_secs = int(agent.get("min_duration_secs") or 0) or None
@@ -3629,6 +3692,9 @@ def _prepare_inbound_greeting(agent: dict, codec: str = None):
     """Returns (audio_bytes | None, text) already encoded in the line's codec. Prefers the
     agent's pre-recorded opening audio (instant, cached after the first call); falls back
     to one quick Sarvam TTS call."""
+    if (agent.get("cloned_voice_id") or "").strip():
+        return None, ""     # cloned voice: the LiveKit agent says the opening line itself, in that voice
+
     line = re.sub(r"\{\{[^}]*\}\}", "", agent.get("opening_line") or "")
     line = re.sub(r'[“”„«»"]', "", line)
     line = re.sub(r"\s+([,.!?।])", r"\1", line)
@@ -4176,6 +4242,9 @@ def dialer_browser_ws(ws, call_id):
 def _prepare_outbound_greeting(agent: dict, lead: dict, codec: str = None):
     """(audio_bytes | None, text) already encoded in the line codec. Pre-recorded opening first
     (cached -> instant), else one quick Sarvam TTS call."""
+    if (agent.get("cloned_voice_id") or "").strip():
+        return None, ""     # cloned voice: the LiveKit agent says the opening line itself, in that voice
+
     line = render_call_vars(agent.get("opening_line") or "", lead)
     line = re.sub(r"\s+([,.!?।])", r"\1", line)
     line = re.sub(r"\s{2,}", " ", line).strip(" ,")
