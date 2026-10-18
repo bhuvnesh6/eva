@@ -123,10 +123,13 @@ def reply_language_rule(lang: str) -> str:
     """Prompt line telling the LLM which language + script to reply in."""
     cfg = LANGUAGES.get(lang)
     if not cfg or lang == "en":
-        return "Reply in English only."
+        return ("Reply in natural spoken Indian English, the way educated Indians talk on a phone call: mostly English "
+                "with everyday Hindi words and phrases mixed in (Hinglish), written in Roman letters only, never Devanagari. "
+                "Mirror the caller - more Hindi if they use more Hindi.")
     name = cfg["name"]
     if not cfg["script"]:
-        return f"Reply in casual {name}, written in Roman/English letters (Hinglish) - do NOT use Devanagari or any native script."
+        return (f"Reply in casual, natural spoken {name} with common English words mixed in (Hinglish), "
+                "written in Roman/English letters - do NOT use Devanagari or any native script.")
     rule = (f"Reply only in casual, natural spoken {name}, written in {cfg['script']} script "
             f"(never Roman letters), the way people actually talk on a phone call.")
     if cfg.get("dialect"):
@@ -206,6 +209,9 @@ SARVAM_SUPPORTED_RATES = (8000, 16000, 22050, 24000)
 SARVAM_TTS_TEMPERATURE = float(os.environ.get("SARVAM_TTS_TEMPERATURE", "0.6"))
 # Internal "en"/"hi" -> Sarvam's BCP-47 target_language_code.
 SARVAM_LANG_CODES = {k: v["tts"] for k, v in LANGUAGES.items()}
+# English agents speak Indian English with Hindi words mixed in; Sarvam's hi-IN voice reads that mix naturally.
+if os.environ.get("EVA_EN_MIX_HINDI_TTS", "1") != "0":
+    SARVAM_LANG_CODES["en"] = SARVAM_LANG_CODES["hi"]
 
 # ---------------- IVR (play recording -> wait -> STT -> hang up) ----------------
 import io
@@ -889,7 +895,9 @@ class EvaSession:
             base_prompt += " " + reply_language_rule(self.forced_language)
         else:
             base_prompt += (
-                " Default to English; if the user speaks Hindi, reply in Hinglish (Roman script, never Devanagari). "
+                " Reply in the language the caller speaks. For English or Hindi (or a mix), use natural Indian-style "
+                "Hinglish: English with everyday Hindi words mixed in, Roman letters only, never Devanagari, matching "
+                "the caller's own ratio of English to Hindi. "
                 "If the user clearly speaks another Indian language (Gujarati, Punjabi, Marathi, Bengali, Tamil, "
                 "Telugu, Kannada, Malayalam, Odia, Haryanvi...), reply in that same language in its own native script."
             )
@@ -906,7 +914,10 @@ class EvaSession:
             " Never reply using only emojis. Stay in character always: never say you're "
             "an AI, bot, or assistant; if asked, answer briefly like a real staff member, "
             "no technical/infra details. Speak like a real phone call - contractions, warm, "
-            "brief, never repeat back what they said."
+            "brief, never repeat back what they said. Your words go straight to a text-to-speech voice, "
+            "so write exactly how it should be SPOKEN: short sentences, commas where a person would pause, "
+            "light fillers used sparingly (achha, haan ji, dekhiye, bilkul), and never any markdown, "
+            "asterisks, bullets, lists, emojis, brackets or symbols."
         )
 
         if self.meeting:

@@ -72,8 +72,8 @@ CLOUDFLARE_TEMPERATURE = float(os.environ.get("CLOUDFLARE_TEMPERATURE", "0.4"))
 # ---------------- Sarvam (LLM) ----------------
 SARVAM_API_KEY = os.environ.get("SARVAM_API_KEY", "")
 SARVAM_LLM_MODEL = os.environ.get("SARVAM_LLM_MODEL", "sarvam-105b-conversations")
-SARVAM_LLM_TEMPERATURE = float(os.environ.get("SARVAM_LLM_TEMPERATURE", "0.4"))
-SARVAM_LLM_MAX_TOKENS = int(os.environ.get("SARVAM_LLM_MAX_TOKENS", "140"))
+SARVAM_LLM_TEMPERATURE = float(os.environ.get("SARVAM_LLM_TEMPERATURE", "0.5"))
+SARVAM_LLM_MAX_TOKENS = int(os.environ.get("SARVAM_LLM_MAX_TOKENS", "200"))   # Indic scripts use more tokens per sentence
 
 # ---------------- Sarvam (TTS) ----------------
 SARVAM_TTS_MODEL = os.environ.get("SARVAM_TTS_MODEL", "bulbul:v3")
@@ -136,7 +136,7 @@ SCRIPT_LANG_RES = [
 SARVAM_STT_MODEL = os.environ.get("SARVAM_STT_MODEL", "saaras:v3")
 SARVAM_STT_MODE = os.environ.get("SARVAM_STT_MODE", "transcribe")   # transcribe | codemix | verbatim | translit | translate
 # Hard ceiling on spoken chars per reply (~15 chars/sec of audio => 200 chars ~ 13s)
-MAX_SPOKEN_CHARS = int(os.environ.get("EVA_MAX_SPOKEN_CHARS", "200"))
+MAX_SPOKEN_CHARS = int(os.environ.get("EVA_MAX_SPOKEN_CHARS", "260"))
 
 # ---------------- Sarvam REALTIME (websocket) STT / TTS ----------------
 SARVAM_STT_RT_MODEL = os.environ.get("SARVAM_STT_RT_MODEL", "saaras:v3-realtime")
@@ -171,9 +171,13 @@ TURN_DETECTION_MODE = os.environ.get("EVA_TURN_DETECTION", "stt").strip().lower(
 # so TTS starts before the LLM finishes the whole first sentence.
 FIRST_CLAUSE_RE = re.compile(r"[,;](?=\s)")
 MIN_FIRST_CHUNK_CHARS = int(os.environ.get("EVA_MIN_FIRST_CHUNK_CHARS", "14"))
-# Sentences are merged into ONE Sarvam TTS request until this many chars (0 = old sentence-by-sentence).
-# One request per reply = no gap between sentences + natural intonation across "Delhi, achha ji. Budget kitna?"
-TTS_BATCH_MIN_CHARS = int(os.environ.get("EVA_TTS_BATCH_MIN_CHARS", "70"))
+# The FIRST chunk of a reply is sent to TTS immediately (>= MIN_FIRST_CHUNK_CHARS) so audio starts fast.
+# After that, sentences are merged into one Sarvam TTS request until this many chars (smooth intonation, no gaps).
+TTS_BATCH_MIN_CHARS = int(os.environ.get("EVA_TTS_BATCH_MIN_CHARS", "60"))
+# English agents speak Indian-style English with Hindi words mixed in (Hinglish). Sarvam's hi-IN voice reads
+# that mix far more naturally than en-IN, and using hi-IN from the start also avoids a TTS socket
+# reconnect on the first sentence. Set EVA_EN_MIX_HINDI_TTS=0 to go back to en-IN.
+EN_MIX_AS_HINDI = os.environ.get("EVA_EN_MIX_HINDI_TTS", "1") != "0"
 
 # Where this worker can reach Eva's Flask app (app.py) to hand over the final
 # transcript. Same container -> http://127.0.0.1:8420 ; otherwise PUBLIC_BASE_URL.
@@ -204,11 +208,21 @@ def _pick_tts_lang(text: str, forced: str = None) -> str:
 def _reply_language_rule(lang: str) -> str:
     cfg = LANGUAGES.get(lang)
     if not cfg or lang == "en":
-        return "Always reply in English only."
+        return (
+            "Always reply in natural spoken Indian English, the way educated Indians really talk on a phone call: "
+            "mostly English with everyday Hindi words and short phrases mixed in (Hinglish), for example "
+            "'Ji bilkul, main check karke batata hoon.' or 'Achha, so budget kitna soch rakha hai?'. "
+            "Write Hindi words in Roman letters only, NEVER Devanagari. If the caller speaks mostly English, keep it "
+            "mostly English with just a light Hindi touch (ji, achha, bilkul, theek hai). If the caller speaks mostly "
+            "Hindi, reply mostly in Hindi. Mirror the caller."
+        )
     name = cfg["name"]
     if not cfg["script"]:
-        return (f"Always reply in casual, natural {name} written in Roman/English letters (Hinglish) - the way "
-                "people actually type it day to day. NEVER use Devanagari or any native script, unless the user explicitly writes in English.")
+        return (
+            f"Always reply in casual, natural spoken {name} the way people actually talk: Hindi sentence structure "
+            "with common English words mixed in naturally (budget, site visit, confirm, location, etc.), written in "
+            "Roman/English letters (Hinglish). NEVER use Devanagari or any native script."
+        )
     rule = (f"Always reply in casual, natural spoken {name}, written in {cfg['script']} script "
             "(never Roman letters), exactly how people talk on a phone call.")
     if cfg.get("dialect"):
@@ -797,7 +811,22 @@ async def _pcm_frames(pcm: bytes, rate: int, chunk_ms: int = 20):
 
 def _sarvam_lang_code(lang: str) -> str:
     """Internal language key -> Sarvam's BCP-47 target_language_code."""
+    if lang == "en" and EN_MIX_AS_HINDI:
+        return LANGUAGES["hi"]["tts"]          # Hinglish-friendly voice for English agents
     return (LANGUAGES.get(lang) or LANGUAGES["en"])["tts"]
+
+
+_EMOJI_RE = re.compile("[\U0001F000-\U0001FAFF\u2600-\u27BF\uFE0F\u200d]")
+_MD_RE = re.compile(r"[*_`#~|]+|^\s*[-•]\s+", re.M)
+
+
+def _tts_sanitize(text: str) -> str:
+    """Last line of defence before TTS: strips markdown, bullets and emojis the LLM may still emit,
+    since the voice would either read them out or stumble on them."""
+    text = _EMOJI_RE.sub("", text or "")
+    text = _MD_RE.sub("", text)
+    text = text.replace("&", " and ")
+    return re.sub(r"\s{2,}", " ", text).strip()
 
 
 def render_call_vars(text: str, lead: dict) -> str:
@@ -961,7 +990,8 @@ class EvaAgent(Agent):
         async def _clean(sentence: str) -> str:
             sentence = await self._handle_booking_tag(sentence)
             sentence = self._strip_end_call(sentence)
-            return IGNORE_RE.sub("", sentence).strip()      # [IGNORE] is never spoken
+            sentence = IGNORE_RE.sub("", sentence).strip()      # [IGNORE] is never spoken
+            return _tts_sanitize(sentence)                      # no markdown/emoji reaches the voice
 
         batch = {"text": ""}
 
@@ -980,7 +1010,10 @@ class EvaAgent(Agent):
 
         async def _say(sentence: str):
             batch["text"] = (batch["text"] + " " + sentence).strip()
-            if len(batch["text"]) >= TTS_BATCH_MIN_CHARS:
+            # First chunk of a reply goes out IMMEDIATELY so audio starts as soon as possible.
+            # Everything after it is batched for smooth intonation and no gaps between sentences.
+            if (not reply.started and len(batch["text"]) >= MIN_FIRST_CHUNK_CHARS) \
+                    or len(batch["text"]) >= TTS_BATCH_MIN_CHARS:
                 await _send_batch()
 
         async def _flush():
@@ -1147,12 +1180,13 @@ def _build_instructions(agent_cfg: dict, lead: dict, meeting: dict, inbound: boo
         )
     else:
         base += (
-            "\nLanguage rule: follow the persona's language style above. Default to casual "
-            "Hinglish (Hindi written in Roman/English letters, never Devanagari). "
-            "Only switch to full English if the caller clearly speaks only English. "
+            "\nLANGUAGE RULE (always follow): reply in the language the caller is speaking. "
+            "If they speak English or Hindi (or a mix), reply in natural Indian-style Hinglish: English with "
+            "everyday Hindi words mixed in, written in Roman letters only, never Devanagari. Match their ratio - "
+            "more English if they use more English, more Hindi if they use more Hindi. "
             "If the caller clearly speaks another Indian language, or asks you to speak in one "
             "(Gujarati, Punjabi, Marathi, Bengali, Tamil, Telugu, Kannada, Malayalam, Odia, Haryanvi...), "
-            "switch to that language and reply in its own native script until they ask to change."
+            "switch to that language and write in its own native script (never Roman letters) until they ask to change."
         )
     # Same gender-agreement rule as app.py's EvaSession - keeps karta/karti
     # consistent with agent_cfg.gender (the same field that picks the voice
@@ -1187,8 +1221,8 @@ def _build_instructions(agent_cfg: dict, lead: dict, meeting: dict, inbound: boo
     )
     base += (
         "\n\nSPEAKING LENGTH RULE (always follow, no exceptions): this is a live "
-        "phone call. Each reply is ONE short sentence, at most two. Target 100-150 "
-        "characters, never above 200. Never read the example lines in the script word "
+        "phone call. Each reply is one or two SHORT sentences. Target 90-180 "
+        "characters, never above 220. Never read the example lines in the script word "
         "for word - compress them to the shortest natural version. Never say 'Sir/Ma'am' "
         "out loud as a pair: use the caller's name with 'ji' (e.g. 'Bhuvi ji'), or just 'ji'. "
         "Keep any closing summary to one sentence."
@@ -1210,9 +1244,14 @@ def _build_instructions(agent_cfg: dict, lead: dict, meeting: dict, inbound: boo
         "even partly an answer to you, answer it normally. Never mention noise or background voices."
     )
     base += (
-        "\n\nSpeak the way a real person talks on a phone call - use contractions "
-        "and everyday words, keep a warm relaxed tone, and avoid stiff, scripted, "
-        "or overly formal phrasing. Don't sound robotic."
+        "\n\nVOICE STYLE (always follow): your words are converted straight to speech, so write exactly how "
+        "they should be SPOKEN. Sound like a warm, relaxed Indian professional on a real phone call: "
+        "contractions, everyday words, and light fillers used sparingly (achha, haan ji, dekhiye, toh, bilkul, "
+        "theek hai). Use short sentences with commas and full stops where a person would naturally pause. "
+        "Never use markdown, asterisks, bullets, numbered lists, emojis, brackets or symbols. Write amounts, "
+        "dates and times the way they would be said aloud (e.g. '1.5 crore', 'kal shaam 5 baje'). "
+        "Never sound scripted, stiff or like a customer-care recording, and never use the same opener or "
+        "filler twice in a row."
     )
     if inbound:
         base += (
