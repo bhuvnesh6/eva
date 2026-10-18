@@ -57,6 +57,7 @@ import livekit_bridge
 
 # Load .env before reading any LiveKit / Eva configuration.
 load_dotenv()
+from settings import get as S      # Sarvam STT/TTS/LLM tuning lives in settings.json
 
 LIVEKIT_URL = os.environ.get("LIVEKIT_URL", "")
 LIVEKIT_API_KEY = os.environ.get("LIVEKIT_API_KEY", "")
@@ -150,12 +151,12 @@ LIVEKIT_TTS_MODEL = os.environ.get("LIVEKIT_TTS_MODEL", "inworld/inworld-tts-2")
 # Male: abhilash/karun/hitesh. Full/updated list: docs.sarvam.ai (TTS).
 # bulbul:v3 speaker catalog (different from v2's). Male: shubh (default),
 # aditya, rahul, rohan, amit, dev... Female: ritu, priya, neha, pooja...
-VOICE_MALE = os.environ.get("EVA_VOICE_MALE", "shubh")
-VOICE_FEMALE = os.environ.get("EVA_VOICE_FEMALE", "priya")
+VOICE_MALE = S("tts.voice_male", "shubh")
+VOICE_FEMALE = S("tts.voice_female", "priya")
 # Speaking-rate multiplier passed to the TTS engine (1.0 = normal). Bump
 # slightly if replies feel slow/robotic; not every provider build accepts
 # this kwarg, so it's applied with a fallback wherever it's used below.
-TTS_SPEED = float(os.environ.get("EVA_TTS_SPEED", "1.0"))
+TTS_SPEED = float(S("tts.speed", 1.0))
 
 MAX_HISTORY_MESSAGES = 16
 
@@ -201,16 +202,16 @@ BARGE_IN_MIN_VOLUME_MULAW = int(os.environ.get("EVA_BARGE_IN_MIN_VOLUME_MULAW", 
 BARGE_IN_MIN_VOLUME_ALAW = int(os.environ.get("EVA_BARGE_IN_MIN_VOLUME_ALAW", 350))
 DEEPGRAM_API_KEY = os.environ.get("DEEPGRAM_API_KEY")
 SARVAM_API_KEY = os.environ.get("SARVAM_API_KEY")
-SARVAM_TTS_MODEL = os.environ.get("SARVAM_TTS_MODEL", "bulbul:v3")
+SARVAM_TTS_MODEL = S("tts.model", "bulbul:v3")
 SARVAM_TTS_URL = "https://api.sarvam.ai/text-to-speech"
 SARVAM_SUPPORTED_RATES = (8000, 16000, 22050, 24000)
 # bulbul:v3 has no pitch/loudness controls (unlike v2) but adds
 # "temperature" (0.01-1.0, default 0.6) - controls expressiveness/randomness.
-SARVAM_TTS_TEMPERATURE = float(os.environ.get("SARVAM_TTS_TEMPERATURE", "0.6"))
+SARVAM_TTS_TEMPERATURE = float(S("tts.temperature", 0.6))
 # Internal "en"/"hi" -> Sarvam's BCP-47 target_language_code.
 SARVAM_LANG_CODES = {k: v["tts"] for k, v in LANGUAGES.items()}
 # English agents speak Indian English with Hindi words mixed in; Sarvam's hi-IN voice reads that mix naturally.
-if os.environ.get("EVA_EN_MIX_HINDI_TTS", "1") != "0":
+if S("tts.en_mix_hindi", True):
     SARVAM_LANG_CODES["en"] = SARVAM_LANG_CODES["hi"]
 
 # ---------------- IVR (play recording -> wait -> STT -> hang up) ----------------
@@ -255,18 +256,18 @@ def ivr_is_negative(text: str) -> bool:
 # Set LLM_PROVIDER=gemini in .env to swap Eva's brain from Groq to Gemini,
 # or LLM_PROVIDER=groq to go back — no code changes needed either way.
 # Both API keys can sit in .env at once; only the selected one is used.
-LLM_PROVIDER = os.environ.get("LLM_PROVIDER", "sarvam").strip().lower()  # "sarvam" | "cloudflare" | "groq" | "gemini"
+LLM_PROVIDER = str(S("llm.provider", "sarvam")).strip().lower()  # "sarvam" | "cloudflare" | "groq" | "gemini"
 
 # ---------------- Sarvam LLM (conversational, voice-agent tuned) ----------------
 # Reuses SARVAM_API_KEY (same key as TTS). Reasoning is disabled in the
 # request because reasoning tokens are billed and add latency on calls.
-SARVAM_LLM_MODEL = os.environ.get("SARVAM_LLM_MODEL", "sarvam-105b-conversations")
+SARVAM_LLM_MODEL = S("llm.model", "sarvam-105b-conversations")
 SARVAM_LLM_URL = "https://api.sarvam.ai/v1/chat/completions"
-SARVAM_LLM_TEMPERATURE = float(os.environ.get("SARVAM_LLM_TEMPERATURE", "0.4"))
+SARVAM_LLM_TEMPERATURE = float(S("llm.temperature", 0.5))
 # ~650 chars is about 1 minute of speech. Token cap is the hard cost ceiling;
 # the char cap below ends the reply cleanly at a sentence boundary.
-SARVAM_LLM_MAX_TOKENS = int(os.environ.get("SARVAM_LLM_MAX_TOKENS", "240"))
-SARVAM_LLM_MAX_REPLY_CHARS = int(os.environ.get("SARVAM_LLM_MAX_REPLY_CHARS", "650"))
+SARVAM_LLM_MAX_TOKENS = int(S("llm.max_tokens", 200))
+SARVAM_LLM_MAX_REPLY_CHARS = int(S("llm.max_reply_chars", 650))
 
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 GROQ_MODEL = os.environ.get("GROQ_MODEL", "openai/gpt-oss-120b")
@@ -723,8 +724,8 @@ def sarvam_tts_synthesize(text: str, lang: str, voice: str, sample_rate: int):
 
 
 SARVAM_CLONE_WS_URL = "wss://api.sarvam.ai/voices/clone/ws?send_completion_event=true"
-CLONE_TTS_CODEC = os.environ.get("EVA_CLONE_CODEC", "linear16")
-CLONE_SEND_SAMPLE_RATE = os.environ.get("EVA_CLONE_SEND_RATE", "1") == "1"
+CLONE_TTS_CODEC = S("clone.codec", "linear16")
+CLONE_SEND_SAMPLE_RATE = bool(S("clone.send_sample_rate", True))
 
 
 def _stream_clone_tts(text: str, lang: str, voice_id: str, sample_rate: int):
@@ -3306,8 +3307,8 @@ def deepgram_transcribe_segments(pcm16: bytes, rate: int):
 
 
 SARVAM_STT_URL = "https://api.sarvam.ai/speech-to-text"
-SARVAM_STT_MODEL = os.environ.get("SARVAM_STT_MODEL", "saaras:v3")
-SARVAM_STT_MODE = os.environ.get("SARVAM_STT_MODE", "transcribe")   # saaras:v3: transcribe | codemix | verbatim | translit | translate
+SARVAM_STT_MODEL = S("stt.batch_model", "saaras:v3")
+SARVAM_STT_MODE = S("stt.mode", "transcribe")   # saaras:v3: transcribe | codemix | verbatim | translit | translate
 
 
 def sarvam_transcribe_pcm(pcm16: bytes, rate: int, language_code: str = "unknown") -> str:

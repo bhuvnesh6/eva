@@ -1,0 +1,41 @@
+{
+  "llm": {
+    "provider": "sarvam",
+    "model": "sarvam-105b-conversations",
+    "temperature": 0.5,
+    "max_tokens": 200,
+    "max_reply_chars": 650,
+    "reasoning_effort": null
+  },
+  "stt": {
+    "realtime_model": "saaras:v3-realtime",
+    "batch_model": "saaras:v3",
+    "mode": "transcribe",
+    "stream_type": "balanced",
+    "language_override": "",
+    "chunk_ms": 50
+  },
+  "tts": {
+    "model": "bulbul:v3",
+    "temperature": 0.6,
+    "speed": 1.0,
+    "sample_rate": 16000,
+    "voice_male": "shubh",
+    "voice_female": "priya",
+    "en_mix_hindi": true,
+    "max_spoken_chars": 260,
+    "min_first_chunk_chars": 14,
+    "batch_min_chars": 60
+  },
+  "clone": {
+    "codec": "linear16",
+    "send_sample_rate": true,
+    "output_rate": 0,
+    "min_first_chunk_chars": 45,
+    "batch_min_chars": 140,
+    "early_comma_flush": false,
+    "tail_timeout_secs": 2.5,
+    "devanagari_hindi": true,
+    "extra_config": {}
+  }
+}

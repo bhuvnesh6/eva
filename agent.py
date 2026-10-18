@@ -51,13 +51,14 @@ from livekit.agents import stt, tts, utils, APIConnectionError, APIConnectOption
 from livekit.agents.types import NOT_GIVEN, NotGivenOr
 
 load_dotenv()
+from settings import get as S      # all Sarvam STT/TTS/LLM tuning lives in settings.json
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("eva-agent")
 
 AGENT_NAME = os.environ.get("AGENT_NAME", "eva-agent")
 
-LLM_PROVIDER = os.environ.get("LLM_PROVIDER", "sarvam").strip().lower()
+LLM_PROVIDER = str(S("llm.provider", "sarvam")).strip().lower()
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 GROQ_MODEL = os.environ.get("GROQ_MODEL", "openai/gpt-oss-120b")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
@@ -71,22 +72,22 @@ CLOUDFLARE_TEMPERATURE = float(os.environ.get("CLOUDFLARE_TEMPERATURE", "0.4"))
 
 # ---------------- Sarvam (LLM) ----------------
 SARVAM_API_KEY = os.environ.get("SARVAM_API_KEY", "")
-SARVAM_LLM_MODEL = os.environ.get("SARVAM_LLM_MODEL", "sarvam-105b-conversations")
-SARVAM_LLM_TEMPERATURE = float(os.environ.get("SARVAM_LLM_TEMPERATURE", "0.5"))
-SARVAM_LLM_MAX_TOKENS = int(os.environ.get("SARVAM_LLM_MAX_TOKENS", "200"))   # Indic scripts use more tokens per sentence
+SARVAM_LLM_MODEL = S("llm.model", "sarvam-105b-conversations")
+SARVAM_LLM_TEMPERATURE = float(S("llm.temperature", 0.5))
+SARVAM_LLM_MAX_TOKENS = int(S("llm.max_tokens", 200))
+SARVAM_LLM_REASONING_EFFORT = S("llm.reasoning_effort", None)
 
 # ---------------- Sarvam (TTS) ----------------
-SARVAM_TTS_MODEL = os.environ.get("SARVAM_TTS_MODEL", "bulbul:v3")
-SARVAM_TTS_TEMPERATURE = float(os.environ.get("SARVAM_TTS_TEMPERATURE", "0.6"))
+SARVAM_TTS_MODEL = S("tts.model", "bulbul:v3")
+SARVAM_TTS_TEMPERATURE = float(S("tts.temperature", 0.6))
 
 EVA_API_SECRET = os.environ.get("EVA_API_SECRET", "")
 PRAVAAH_API_BASE_URL = os.environ.get("PRAVAAH_API_BASE_URL", "").rstrip("/")
 
 GLOBAL_TTS_MODEL = os.environ.get("GLOBAL_TTS_MODEL", "inworld/inworld-tts-2")
-VOICE_MALE = os.environ.get("EVA_VOICE_MALE", "shubh")
-VOICE_FEMALE = os.environ.get("EVA_VOICE_FEMALE", "priya")
-# 1.4 (old default) makes bulbul sound rushed/robotic. 1.0-1.1 sounds like a relaxed phone call.
-TTS_SPEED = max(0.8, min(1.4, float(os.environ.get("EVA_TTS_SPEED", "1.05"))))
+VOICE_MALE = S("tts.voice_male", "shubh")
+VOICE_FEMALE = S("tts.voice_female", "priya")
+TTS_SPEED = max(0.8, min(1.4, float(S("tts.speed", 1.0))))
 
 # Sentence end = . ! ? । or newline, but NOT the dot inside numbers ("1.5 crore", "2.5 BHK"),
 # which used to cut speech in the middle of a number and caused an audible break.
@@ -133,24 +134,29 @@ SCRIPT_LANG_RES = [
     (re.compile(r"[\u0C80-\u0CFF]"), "kn"),
     (re.compile(r"[\u0D00-\u0D7F]"), "ml"),
 ]
-SARVAM_STT_MODEL = os.environ.get("SARVAM_STT_MODEL", "saaras:v3")
-SARVAM_STT_MODE = os.environ.get("SARVAM_STT_MODE", "transcribe")   # transcribe | codemix | verbatim | translit | translate
-# Hard ceiling on spoken chars per reply (~15 chars/sec of audio => 200 chars ~ 13s)
-MAX_SPOKEN_CHARS = int(os.environ.get("EVA_MAX_SPOKEN_CHARS", "260"))
+SARVAM_STT_MODEL = S("stt.batch_model", "saaras:v3")
+SARVAM_STT_MODE = S("stt.mode", "transcribe")   # transcribe | codemix | verbatim | translit | translate
+MAX_SPOKEN_CHARS = int(S("tts.max_spoken_chars", 260))
 
 # ---------------- Sarvam REALTIME (websocket) STT / TTS ----------------
-SARVAM_STT_RT_MODEL = os.environ.get("SARVAM_STT_RT_MODEL", "saaras:v3-realtime")
-SARVAM_STT_STREAM_TYPE = os.environ.get("SARVAM_STT_STREAM_TYPE", "balanced")
-# "" = auto (hi-IN for en/hi/auto agents, own code for regional agents). Set e.g. "unknown" to force auto-detect.
-SARVAM_STT_LANGUAGE_OVERRIDE = os.environ.get("SARVAM_STT_LANGUAGE", "").strip()
-SARVAM_STT_CHUNK_MS = int(os.environ.get("SARVAM_STT_CHUNK_MS", "50"))
+SARVAM_STT_RT_MODEL = S("stt.realtime_model", "saaras:v3-realtime")
+SARVAM_STT_STREAM_TYPE = S("stt.stream_type", "balanced")
+SARVAM_STT_LANGUAGE_OVERRIDE = str(S("stt.language_override", "") or "").strip()
+SARVAM_STT_CHUNK_MS = int(S("stt.chunk_ms", 50))
 SARVAM_TTS_WS_URL = "wss://api.sarvam.ai/text-to-speech/ws?model={model}&send_completion_event=true"
-SARVAM_TTS_SAMPLE_RATE = int(os.environ.get("SARVAM_TTS_SAMPLE_RATE", "16000"))
+SARVAM_TTS_SAMPLE_RATE = int(S("tts.sample_rate", 16000))
 
 # ---------------- Sarvam VOICE CLONE (websocket) ----------------
 SARVAM_CLONE_WS_URL = "wss://api.sarvam.ai/voices/clone/ws?send_completion_event=true"
-CLONE_TTS_CODEC = os.environ.get("EVA_CLONE_CODEC", "linear16")                  # raw PCM, no mp3 decoding
-CLONE_SEND_SAMPLE_RATE = os.environ.get("EVA_CLONE_SEND_RATE", "1") == "1"       # set 0 if Sarvam rejects speech_sample_rate
+CLONE_TTS_CODEC = S("clone.codec", "linear16")
+CLONE_SEND_SAMPLE_RATE = bool(S("clone.send_sample_rate", True))
+CLONE_OUTPUT_RATE = int(S("clone.output_rate", 0) or 0)            # 0 = same as requested rate
+CLONE_MIN_FIRST_CHUNK_CHARS = int(S("clone.min_first_chunk_chars", 45))
+CLONE_BATCH_MIN_CHARS = int(S("clone.batch_min_chars", 140))
+CLONE_EARLY_COMMA = bool(S("clone.early_comma_flush", False))
+CLONE_TAIL_TIMEOUT_SECS = float(S("clone.tail_timeout_secs", 2.5))
+CLONE_DEVANAGARI_HINDI = bool(S("clone.devanagari_hindi", True))
+CLONE_EXTRA_CONFIG = S("clone.extra_config", {}) or {}
 
 # ---------------- background-noise / side-talk protection ----------------
 VAD_ACTIVATION_THRESHOLD = float(os.environ.get("EVA_VAD_ACTIVATION", "0.6"))     # silero default 0.5
@@ -170,14 +176,14 @@ TURN_DETECTION_MODE = os.environ.get("EVA_TURN_DETECTION", "stt").strip().lower(
 # First spoken chunk may be flushed at a comma once it has this many chars,
 # so TTS starts before the LLM finishes the whole first sentence.
 FIRST_CLAUSE_RE = re.compile(r"[,;](?=\s)")
-MIN_FIRST_CHUNK_CHARS = int(os.environ.get("EVA_MIN_FIRST_CHUNK_CHARS", "14"))
+MIN_FIRST_CHUNK_CHARS = int(S("tts.min_first_chunk_chars", 14))
 # The FIRST chunk of a reply is sent to TTS immediately (>= MIN_FIRST_CHUNK_CHARS) so audio starts fast.
 # After that, sentences are merged into one Sarvam TTS request until this many chars (smooth intonation, no gaps).
-TTS_BATCH_MIN_CHARS = int(os.environ.get("EVA_TTS_BATCH_MIN_CHARS", "60"))
+TTS_BATCH_MIN_CHARS = int(S("tts.batch_min_chars", 60))
 # English agents speak Indian-style English with Hindi words mixed in (Hinglish). Sarvam's hi-IN voice reads
 # that mix far more naturally than en-IN, and using hi-IN from the start also avoids a TTS socket
 # reconnect on the first sentence. Set EVA_EN_MIX_HINDI_TTS=0 to go back to en-IN.
-EN_MIX_AS_HINDI = os.environ.get("EVA_EN_MIX_HINDI_TTS", "1") != "0"
+EN_MIX_AS_HINDI = bool(S("tts.en_mix_hindi", True))
 
 # Where this worker can reach Eva's Flask app (app.py) to hand over the final
 # transcript. Same container -> http://127.0.0.1:8420 ; otherwise PUBLIC_BASE_URL.
@@ -441,6 +447,10 @@ class SarvamWSTTS(tts.TTS):
     def provider(self) -> str:
         return "Sarvam"
 
+    @property
+    def is_clone(self) -> bool:
+        return bool(self._voice_id)
+
     def update_options(self, *, target_language_code: str = None, pace: float = None,
                        speaker: str = None, **_ignored):
         if target_language_code:
@@ -488,6 +498,7 @@ class SarvamWSTTS(tts.TTS):
             }
             if CLONE_SEND_SAMPLE_RATE:
                 cfg["speech_sample_rate"] = str(self._sr)
+            cfg.update(CLONE_EXTRA_CONFIG)          # from settings.json -> clone.extra_config
             await ws.send(json.dumps({"type": "config", "data": cfg}))
         else:
             # ---- default Sarvam voice (unchanged) ----
@@ -629,7 +640,78 @@ class _SarvamReply:
     async def _read(self):
         t = self._t
         carry = b""
+        rs_state = None
+        src_rate = (CLONE_OUTPUT_RATE or t.sample_rate) if t.is_clone else t.sample_rate
+        other_logged = 0
         frame_bytes = max(2, int(t.sample_rate * 0.04) * 2)       # 40 ms frames
+        try:
+            while True:
+                if self._finals >= self._sent and not self._input_done:
+                    timeout = 120          # idle: LLM is still thinking, nothing pending on the socket
+                elif self._input_done and self.got_audio:
+                    timeout = CLONE_TAIL_TIMEOUT_SECS if t.is_clone else 4
+                else:
+                    timeout = 15
+                try:
+                    raw = await asyncio.wait_for(self._ws.recv(), timeout=timeout)
+                except asyncio.TimeoutError:
+                    if self._input_done and self.got_audio:
+                        if t.is_clone:
+                            # clone socket does not reliably send 'final' - audio is done, just finish
+                            logger.info("Sarvam clone TTS: no 'final' event, finishing reply after %.1fs of silence", timeout)
+                        else:
+                            logger.warning("Sarvam TTS: no 'final' event after last audio - closing reply")
+                            self._failed = True
+                        break
+                    raise
+                msg = json.loads(raw)
+                mtype = msg.get("type")
+                if mtype == "audio":
+                    b = base64.b64decode(msg["data"]["audio"])
+                    if b[:4] == b"RIFF":
+                        if len(b) >= 28:
+                            hdr_rate = int.from_bytes(b[24:28], "little")
+                            if hdr_rate and hdr_rate != src_rate:
+                                logger.warning("TTS WAV header says %s Hz, expected %s Hz -> resampling from %s Hz",
+                                               hdr_rate, src_rate, hdr_rate)
+                                src_rate, rs_state = hdr_rate, None
+                        b = b[44:]                                 # WAV header on any chunk
+                    b = carry + b
+                    if len(b) % 2:
+                        carry, b = b[-1:], b[:-1]
+                    else:
+                        carry = b""
+                    if b and src_rate != t.sample_rate:
+                        b, rs_state = audioop.ratecv(b, 2, 1, src_rate, t.sample_rate, rs_state)
+                    for i in range(0, len(b), frame_bytes):
+                        piece = b[i:i + frame_bytes]
+                        self._q.put_nowait(rtc.AudioFrame(
+                            data=piece, sample_rate=t.sample_rate, num_channels=1,
+                            samples_per_channel=len(piece) // 2,
+                        ))
+                    if b:
+                        self.got_audio = True
+                elif mtype == "event":
+                    et = (msg.get("data") or {}).get("event_type")
+                    if et in ("final", "completed", "complete", "done"):
+                        self._finals += 1
+                        if self._input_done and self._finals >= self._sent:
+                            break
+                    elif other_logged < 3:
+                        other_logged += 1
+                        logger.info("Sarvam TTS event: %s", str(msg)[:200])
+                elif mtype == "error":
+                    raise RuntimeError((msg.get("data") or {}).get("message", "Sarvam TTS error"))
+                elif other_logged < 3:
+                    other_logged += 1
+                    logger.info("Sarvam TTS unknown message: %s", str(msg)[:200])
+        except asyncio.CancelledError:
+            pass                       # end_input() / abort() cancelled us on purpose
+        except Exception as e:
+            self._failed = True
+            logger.warning("Sarvam TTS reply stream broke: %r", e)
+        finally:
+            self._finish()
         try:
             while True:
                 if self._finals >= self._sent and not self._input_done:
@@ -986,6 +1068,10 @@ class EvaAgent(Agent):
         out_q: asyncio.Queue = asyncio.Queue()
         reply = self._global_tts.open_reply(out_q)
         state = {"finished": False}
+        _clone = self._global_tts.is_clone
+        _min_first = CLONE_MIN_FIRST_CHUNK_CHARS if _clone else MIN_FIRST_CHUNK_CHARS
+        _batch_min = CLONE_BATCH_MIN_CHARS if _clone else TTS_BATCH_MIN_CHARS
+        _early_comma = CLONE_EARLY_COMMA if _clone else True
 
         async def _clean(sentence: str) -> str:
             sentence = await self._handle_booking_tag(sentence)
@@ -1012,8 +1098,8 @@ class EvaAgent(Agent):
             batch["text"] = (batch["text"] + " " + sentence).strip()
             # First chunk of a reply goes out IMMEDIATELY so audio starts as soon as possible.
             # Everything after it is batched for smooth intonation and no gaps between sentences.
-            if (not reply.started and len(batch["text"]) >= MIN_FIRST_CHUNK_CHARS) \
-                    or len(batch["text"]) >= TTS_BATCH_MIN_CHARS:
+            if (not reply.started and len(batch["text"]) >= _min_first) \
+                    or len(batch["text"]) >= _batch_min:
                 await _send_batch()
 
         async def _flush():
@@ -1036,9 +1122,9 @@ class EvaAgent(Agent):
                     sentence = complete.strip()
 
                     # Early flush: first chunk of a reply is cut at the first comma so audio starts sooner
-                    if not sentence and spoken_chars == 0:
+                    if not sentence and spoken_chars == 0 and _early_comma:
                         for m in FIRST_CLAUSE_RE.finditer(buffer):
-                            if m.end() >= MIN_FIRST_CHUNK_CHARS:
+                            if m.end() >= _min_first:
                                 sentence = buffer[:m.end()].strip()
                                 buffer = buffer[m.end():]
                                 break
@@ -1131,7 +1217,7 @@ class EvaAgent(Agent):
 
 
 
-def _build_instructions(agent_cfg: dict, lead: dict, meeting: dict, inbound: bool = False):
+def _build_instructions(agent_cfg: dict, lead: dict, meeting: dict, inbound: bool = False, clone: bool = False):
     """Mirrors app.py's EvaSession.__init__ prompt-building. Returns
     (instructions, forced_lang, persona_name) - the caller needs forced_lang
     separately to drive TTS language selection, and persona_name so the
@@ -1266,6 +1352,13 @@ def _build_instructions(agent_cfg: dict, lead: dict, meeting: dict, inbound: boo
         "Never say END_CALL out loud or explain it. A plain 'okay', 'hmm', 'haan' or 'theek hai' on its own is NOT a "
         "goodbye - only use END_CALL when the caller is really ending the call."
     )
+    if clone:
+        base += (
+            "\n\nVOICE SCRIPT (overrides any earlier instruction about Roman letters): your voice is a cloned "
+            "human voice that reads Devanagari best. Whenever you speak Hindi, write the Hindi words in Devanagari "
+            "script and keep English words (property, budget, plot, flat, site visit, Nisha Homes) in Latin letters, "
+            "for example: 'जी, आपका budget कितना रहेगा?'. Keep sentences short with natural punctuation."
+        )
     if meeting:
         base += (
             "\n\nYou can book a meeting for this lead. Meetings are "
@@ -1384,7 +1477,7 @@ async def entrypoint(ctx: JobContext) -> None:
             api_key=SARVAM_API_KEY,
             base_url="https://api.sarvam.ai/v1",
             temperature=SARVAM_LLM_TEMPERATURE,
-            extra_body={"max_tokens": SARVAM_LLM_MAX_TOKENS, "reasoning_effort": None},
+            extra_body={"max_tokens": SARVAM_LLM_MAX_TOKENS, "reasoning_effort": SARVAM_LLM_REASONING_EFFORT},
         )
         _llm_valid = set(inspect.signature(openai.LLM.__init__).parameters)
         if "extra_body" not in _llm_valid:
@@ -1526,7 +1619,10 @@ async def entrypoint(ctx: JobContext) -> None:
 
     ctx.add_shutdown_callback(_finish_and_callback)
 
-    instructions, forced_lang, persona_name = _build_instructions(agent_cfg, lead, meeting, inbound=inbound)
+    instructions, forced_lang, persona_name = _build_instructions(
+        agent_cfg, lead, meeting, inbound=inbound,
+        clone=bool(_clone_voice_id) and CLONE_DEVANAGARI_HINDI,
+    )
     opening_line = render_call_vars(agent_cfg.get("opening_line") or "", lead)
     opening_line = re.sub(r'[“”„«»"]', "", opening_line).strip()   # drop curly/straight double quotes
     logger.info("resolved persona_name=%r opening_line=%r (empty opening_line falls back to LLM greeting)",
