@@ -34,7 +34,7 @@
     "min_first_chunk_chars": 45,
     "batch_min_chars": 140,
     "early_comma_flush": false,
-    "tail_timeout_secs": 2.5,
+    "tail_timeout_secs": 0.8,
     "devanagari_hindi": true,
     "extra_config": {}
   }

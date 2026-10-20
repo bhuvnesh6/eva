@@ -159,6 +159,8 @@ CLONE_GAP_TIMEOUT_SECS = float(S("clone.gap_timeout_secs", 6.0))        # patien
 CLONE_CHARS_PER_SEC = float(S("clone.chars_per_sec", 15))               # used to estimate how much audio to expect
 CLONE_PREROLL_SECS = float(S("clone.preroll_secs", 0.9))                # audio held back before playback starts, so the clone stays ahead
 CLONE_PREROLL_MAX_WAIT_SECS = float(S("clone.preroll_max_wait_secs", 1.5))
+# Clone websocket drops a 2nd text+flush sent while the 1st is still synthesizing -> send the whole reply as ONE text
+CLONE_SINGLE_SHOT = bool(S("clone.single_shot", True))
 CLONE_DEVANAGARI_HINDI = bool(S("clone.devanagari_hindi", True))
 CLONE_EXTRA_CONFIG = S("clone.extra_config", {}) or {}
 
@@ -1037,9 +1039,14 @@ class EvaAgent(Agent):
         reply = self._global_tts.open_reply(out_q)
         state = {"finished": False}
         _clone = self._global_tts.is_clone
-        _min_first = CLONE_MIN_FIRST_CHUNK_CHARS if _clone else MIN_FIRST_CHUNK_CHARS
-        _batch_min = CLONE_BATCH_MIN_CHARS if _clone else TTS_BATCH_MIN_CHARS
-        _early_comma = CLONE_EARLY_COMMA if _clone else True
+        if _clone and CLONE_SINGLE_SHOT:
+            # never flush early: everything is collected and sent once, by _flush() at the end of the reply
+            _min_first = _batch_min = 10 ** 9
+            _early_comma = False
+        else:
+            _min_first = CLONE_MIN_FIRST_CHUNK_CHARS if _clone else MIN_FIRST_CHUNK_CHARS
+            _batch_min = CLONE_BATCH_MIN_CHARS if _clone else TTS_BATCH_MIN_CHARS
+            _early_comma = CLONE_EARLY_COMMA if _clone else True
 
         async def _clean(sentence: str) -> str:
             sentence = await self._handle_booking_tag(sentence)
