@@ -154,7 +154,11 @@ CLONE_OUTPUT_RATE = int(S("clone.output_rate", 0) or 0)            # 0 = same as
 CLONE_MIN_FIRST_CHUNK_CHARS = int(S("clone.min_first_chunk_chars", 45))
 CLONE_BATCH_MIN_CHARS = int(S("clone.batch_min_chars", 140))
 CLONE_EARLY_COMMA = bool(S("clone.early_comma_flush", False))
-CLONE_TAIL_TIMEOUT_SECS = float(S("clone.tail_timeout_secs", 2.5))
+CLONE_TAIL_TIMEOUT_SECS = float(S("clone.tail_timeout_secs", 0.8))      # short tail once all expected audio has arrived
+CLONE_GAP_TIMEOUT_SECS = float(S("clone.gap_timeout_secs", 6.0))        # patience if audio is clearly still missing (slow clone chunk)
+CLONE_CHARS_PER_SEC = float(S("clone.chars_per_sec", 15))               # used to estimate how much audio to expect
+CLONE_PREROLL_SECS = float(S("clone.preroll_secs", 0.9))                # audio held back before playback starts, so the clone stays ahead
+CLONE_PREROLL_MAX_WAIT_SECS = float(S("clone.preroll_max_wait_secs", 1.5))
 CLONE_DEVANAGARI_HINDI = bool(S("clone.devanagari_hindi", True))
 CLONE_EXTRA_CONFIG = S("clone.extra_config", {}) or {}
 
@@ -562,6 +566,8 @@ class _SarvamReply:
         self._ended = False
         self.started = False
         self.got_audio = False
+        self._chars = 0          # total text chars sent on this reply
+        self._audio_secs = 0.0   # total audio seconds received for this reply
 
     # ---------- lock / lifecycle ----------
     def _release(self):
@@ -576,7 +582,8 @@ class _SarvamReply:
         if self._ended:
             return
         self._ended = True
-        dirty = self._aborted or self._failed
+        # clone socket: if not every flush got its "final", late audio/events could leak into the next reply -> reconnect
+        dirty = self._aborted or self._failed or (self._t.is_clone and self._finals < self._sent)
         if dirty:
             self._t.drop_ws()          # unfinished audio left on the socket must not leak into the next reply
         self._release()
@@ -617,6 +624,7 @@ class _SarvamReply:
         await self._ws.send(json.dumps({"type": "text", "data": {"text": text}}))
         await self._ws.send(json.dumps({"type": "flush"}))
         self._sent += 1
+        self._chars += len(text)
 
     def end_input(self):
         """No more sentences are coming."""
@@ -646,10 +654,18 @@ class _SarvamReply:
         frame_bytes = max(2, int(t.sample_rate * 0.04) * 2)       # 40 ms frames
         try:
             while True:
-                if self._finals >= self._sent and not self._input_done:
+                if not self._input_done and (self._finals >= self._sent or (t.is_clone and self.got_audio)):
                     timeout = 120          # idle: LLM is still thinking, nothing pending on the socket
                 elif self._input_done and self.got_audio:
-                    timeout = CLONE_TAIL_TIMEOUT_SECS if t.is_clone else 4
+                    if t.is_clone:
+                        # clone socket does not reliably send 'final'. If we already got (roughly) as much
+                        # audio as the text should produce, end quickly. If audio is clearly still missing
+                        # (slow clone chunk), be patient instead of cutting the sentence in the middle.
+                        expected = self._chars / max(CLONE_CHARS_PER_SEC, 1.0)
+                        timeout = (CLONE_TAIL_TIMEOUT_SECS if self._audio_secs >= expected * 0.6
+                                   else CLONE_GAP_TIMEOUT_SECS)
+                    else:
+                        timeout = 4
                 else:
                     timeout = 15
                 try:
@@ -657,8 +673,8 @@ class _SarvamReply:
                 except asyncio.TimeoutError:
                     if self._input_done and self.got_audio:
                         if t.is_clone:
-                            # clone socket does not reliably send 'final' - audio is done, just finish
-                            logger.info("Sarvam clone TTS: no 'final' event, finishing reply after %.1fs of silence", timeout)
+                            logger.info("Sarvam clone TTS: no 'final', finishing reply after %.1fs of silence "
+                                        "(got %.1fs audio for %d chars)", timeout, self._audio_secs, self._chars)
                         else:
                             logger.warning("Sarvam TTS: no 'final' event after last audio - closing reply")
                             self._failed = True
@@ -683,6 +699,7 @@ class _SarvamReply:
                         carry = b""
                     if b and src_rate != t.sample_rate:
                         b, rs_state = audioop.ratecv(b, 2, 1, src_rate, t.sample_rate, rs_state)
+                    self._audio_secs += len(b) / 2.0 / t.sample_rate
                     for i in range(0, len(b), frame_bytes):
                         piece = b[i:i + frame_bytes]
                         self._q.put_nowait(rtc.AudioFrame(
@@ -705,55 +722,6 @@ class _SarvamReply:
                 elif other_logged < 3:
                     other_logged += 1
                     logger.info("Sarvam TTS unknown message: %s", str(msg)[:200])
-        except asyncio.CancelledError:
-            pass                       # end_input() / abort() cancelled us on purpose
-        except Exception as e:
-            self._failed = True
-            logger.warning("Sarvam TTS reply stream broke: %r", e)
-        finally:
-            self._finish()
-        try:
-            while True:
-                if self._finals >= self._sent and not self._input_done:
-                    timeout = 120          # idle: LLM is still thinking, nothing pending on the socket
-                elif self._input_done and self.got_audio:
-                    timeout = 4            # tail: all text sent, don't hold the socket if a final goes missing
-                else:
-                    timeout = 15
-                try:
-                    raw = await asyncio.wait_for(self._ws.recv(), timeout=timeout)
-                except asyncio.TimeoutError:
-                    if self._input_done and self.got_audio:
-                        logger.warning("Sarvam TTS: no 'final' event after last audio - closing reply")
-                        self._failed = True
-                        break
-                    raise
-                msg = json.loads(raw)
-                mtype = msg.get("type")
-                if mtype == "audio":
-                    b = base64.b64decode(msg["data"]["audio"])
-                    if b[:4] == b"RIFF":
-                        b = b[44:]                                 # WAV header on any chunk
-                    b = carry + b
-                    if len(b) % 2:
-                        carry, b = b[-1:], b[:-1]
-                    else:
-                        carry = b""
-                    for i in range(0, len(b), frame_bytes):
-                        piece = b[i:i + frame_bytes]
-                        self._q.put_nowait(rtc.AudioFrame(
-                            data=piece, sample_rate=t.sample_rate, num_channels=1,
-                            samples_per_channel=len(piece) // 2,
-                        ))
-                    if b:
-                        self.got_audio = True
-                elif mtype == "event":
-                    if (msg.get("data") or {}).get("event_type") == "final":
-                        self._finals += 1
-                        if self._input_done and self._finals >= self._sent:
-                            break
-                elif mtype == "error":
-                    raise RuntimeError((msg.get("data") or {}).get("message", "Sarvam TTS error"))
         except asyncio.CancelledError:
             pass                       # end_input() / abort() cancelled us on purpose
         except Exception as e:
@@ -1155,12 +1123,43 @@ class EvaAgent(Agent):
                 reply.end_input()
 
         producer = asyncio.create_task(_produce())
+        # Clone voice: LiveKit plays frames in real time, so if the clone synthesizes slower than that,
+        # playback runs dry mid-sentence. Hold back a short pre-roll so synthesis stays ahead of playback.
+        held, held_secs, t_first = [], 0.0, None
+        released = not (_clone and CLONE_PREROLL_SECS > 0)
         try:
             while True:
-                frame = await out_q.get()
+                if released:
+                    frame = await out_q.get()
+                else:
+                    wait = None
+                    if t_first is not None:
+                        wait = max(0.01, CLONE_PREROLL_MAX_WAIT_SECS - (time.monotonic() - t_first))
+                    try:
+                        frame = await asyncio.wait_for(out_q.get(), timeout=wait)
+                    except asyncio.TimeoutError:
+                        released = True                      # waited long enough, start playing what we have
+                        for f in held:
+                            yield f
+                        held = []
+                        continue
                 if frame is None:
+                    for f in held:
+                        yield f
+                    held = []
                     break
-                yield frame
+                if released:
+                    yield frame
+                    continue
+                if t_first is None:
+                    t_first = time.monotonic()
+                held.append(frame)
+                held_secs += frame.samples_per_channel / float(frame.sample_rate)
+                if held_secs >= CLONE_PREROLL_SECS:
+                    released = True
+                    for f in held:
+                        yield f
+                    held = []
             state["finished"] = True
         finally:
             producer.cancel()

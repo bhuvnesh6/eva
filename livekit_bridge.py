@@ -113,6 +113,9 @@ PLAY_PREBUFFER_MS = int(os.environ.get("EVA_PLAY_PREBUFFER_MS", "60"))    # audi
 # (+ a short hangover so natural pauses inside a reply are kept).
 AGENT_SILENCE_RMS = int(os.environ.get("EVA_AGENT_SILENCE_RMS", "12"))        # 16-bit RMS below this = silence
 AGENT_SILENCE_HANG_MS = int(os.environ.get("EVA_AGENT_SILENCE_HANG_MS", "300"))
+# Cloned voices: bigger jitter buffer (smoother) and longer kept pauses (natural commas/breaths instead of rushed speech)
+CLONE_PLAY_PREBUFFER_MS = int(os.environ.get("EVA_CLONE_PLAY_PREBUFFER_MS", "200"))
+CLONE_SILENCE_HANG_MS = int(os.environ.get("EVA_CLONE_SILENCE_HANG_MS", "700"))
 
 # ---------------- caller-audio noise gate (kills background voices / rumble) ----------------
 GATE_ENABLED = os.environ.get("EVA_NOISE_GATE", "1") != "0"
@@ -227,6 +230,9 @@ class VoiceLinkBridge:
         if not greeting_audio:
             self.greeting_done.set()
 
+        _is_clone = bool(((agent_cfg or {}).get("cloned_voice_id") or "").strip())
+        self._play_prebuffer_ms = CLONE_PLAY_PREBUFFER_MS if _is_clone else PLAY_PREBUFFER_MS
+        self._silence_hang_ms = CLONE_SILENCE_HANG_MS if _is_clone else AGENT_SILENCE_HANG_MS
         self._agent_joined = False
         self._hangup_flag = False
         self._hangup_done = False
@@ -504,7 +510,7 @@ class VoiceLinkBridge:
         stream = rtc.AudioStream(track, sample_rate=ROOM_AUDIO_RATE, num_channels=1)
         buf = b""
         first = True
-        hang_samples = int(ROOM_AUDIO_RATE * AGENT_SILENCE_HANG_MS / 1000)
+        hang_samples = int(ROOM_AUDIO_RATE * self._silence_hang_ms / 1000)
         quiet = hang_samples + 1          # start in "silent" state -> leading silence is dropped
         async for event in stream:
             if self._closed.is_set():
@@ -542,7 +548,8 @@ class VoiceLinkBridge:
         Small delays in the LiveKit path are absorbed by the buffer instead of becoming audible
         stutter on the phone. If the buffer ever runs dry we simply re-buffer a little and continue."""
         FRAME_SECS = 0.02
-        prebuf_frames = max(1, PLAY_PREBUFFER_MS // 20)
+        prebuf_ms = self._play_prebuffer_ms
+        prebuf_frames = max(1, prebuf_ms // 20)
         playing = False
         wait_since = None
         next_t = 0.0
@@ -563,7 +570,7 @@ class VoiceLinkBridge:
                 if wait_since is None:
                     wait_since = time.monotonic()
                 # start when enough audio is buffered, or when a short sound (e.g. "ji") has waited long enough
-                if n < prebuf_frames and (time.monotonic() - wait_since) < (PLAY_PREBUFFER_MS / 1000.0) * 2:
+                if n < prebuf_frames and (time.monotonic() - wait_since) < (prebuf_ms / 1000.0) * 2:
                     _real_sleep(0.004)
                     continue
                 playing = True
