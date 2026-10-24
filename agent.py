@@ -157,8 +157,8 @@ CLONE_EARLY_COMMA = bool(S("clone.early_comma_flush", False))
 CLONE_TAIL_TIMEOUT_SECS = float(S("clone.tail_timeout_secs", 0.8))      # short tail once all expected audio has arrived
 CLONE_GAP_TIMEOUT_SECS = float(S("clone.gap_timeout_secs", 6.0))        # patience if audio is clearly still missing (slow clone chunk)
 CLONE_CHARS_PER_SEC = float(S("clone.chars_per_sec", 15))               # used to estimate how much audio to expect
-CLONE_PREROLL_SECS = float(S("clone.preroll_secs", 0.9))                # audio held back before playback starts, so the clone stays ahead
-CLONE_PREROLL_MAX_WAIT_SECS = float(S("clone.preroll_max_wait_secs", 1.5))
+CLONE_PREROLL_SECS = float(S("clone.preroll_secs", 0.35))               # audio held back before playback starts (clone generates ~1.25x real time)
+CLONE_PREROLL_MAX_WAIT_SECS = float(S("clone.preroll_max_wait_secs", 0.8))
 # Clone websocket drops a 2nd text+flush sent while the 1st is still synthesizing -> send the whole reply as ONE text
 CLONE_SINGLE_SHOT = bool(S("clone.single_shot", True))
 CLONE_DEVANAGARI_HINDI = bool(S("clone.devanagari_hindi", True))
@@ -1474,6 +1474,10 @@ def _build_instructions(agent_cfg: dict, lead: dict, meeting: dict, inbound: boo
             "human voice that reads Devanagari best. Whenever you speak Hindi, write the Hindi words in Devanagari "
             "script and keep English words (property, budget, plot, flat, site visit, Nisha Homes) in Latin letters, "
             "for example: 'जी, आपका budget कितना रहेगा?'. Keep sentences short with natural punctuation."
+            "\nCLONE LENGTH RULE (overrides the speaking length rule above): every reply is ONE short sentence of "
+            "40-80 characters, never above 90, with at most one question. Compress any script line that is longer, "
+            "including the closing lines, for example 'ठीक है जी। आप किस area में property देख रहे हैं?'. "
+            "Never use two sentences when one is enough."
         )
     if meeting:
         base += (

@@ -43,8 +43,8 @@
     "tail_timeout_secs": 0.8,
     "gap_timeout_secs": 6.0,
     "chars_per_sec": 15,
-    "preroll_secs": 0.9,
-    "preroll_max_wait_secs": 1.5,
+    "preroll_secs": 0.35,
+    "preroll_max_wait_secs": 0.8,
     "devanagari_hindi": true,
     "extra_config": {}
   }

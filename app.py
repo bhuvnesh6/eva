@@ -3049,6 +3049,9 @@ def api_place_call_voicelink():
             except Exception as _e:
                 log("VOICELINK", f"greeting warm-up failed: {_e}")
         threading.Thread(target=_warm_greeting, daemon=True, name=f"WarmGreeting-{call_id}").start()
+    elif call_mode == "ai" and (agent.get("cloned_voice_id") or "").strip():
+        # cloned voice has no pre-recorded opening: synthesize it NOW, while the phone rings
+        _warm_clone_greeting(agent, lead)
 
     ws_scheme_base = PUBLIC_BASE_URL.replace("https://", "wss://").replace("http://", "ws://")
     call_websocket_url = f"{ws_scheme_base}/ws/voicelink/{call_id}"
@@ -4251,6 +4254,72 @@ def dialer_browser_ws(ws, call_id):
 
 #did update
 
+# ---------------- cloned voice: synthesize the opening line while the phone is still ringing ----------------
+_CLONE_GREETING_CACHE = {}    # (voice_id, lang, line) -> linear16 mono PCM @ VOICELINK_RATE
+_CLONE_GREETING_EVENTS = {}   # same key -> threading.Event, set when synthesis finished (ok or failed)
+_clone_greeting_lock = threading.Lock()
+
+
+def _clone_greeting_key(agent: dict, lead: dict):
+    line = render_call_vars(agent.get("opening_line") or "", lead)
+    line = re.sub(r"\s+([,.!?।])", r"\1", line)
+    line = re.sub(r"\s{2,}", " ", line).strip(" ,")
+    lang = agent.get("language") if agent.get("language") in SUPPORTED_LANGUAGES else "hi"
+    voice_id = (agent.get("cloned_voice_id") or "").strip()
+    return (voice_id, lang, line), line, lang, voice_id
+
+
+def _warm_clone_greeting(agent: dict, lead: dict):
+    """Called the moment the call is queued (the phone rings ~6 s) - by pickup the audio is ready."""
+    key, line, lang, voice_id = _clone_greeting_key(agent, lead)
+    if not (voice_id and line and SPEAKABLE_RE.search(line) and SARVAM_API_KEY):
+        return
+    with _clone_greeting_lock:
+        if key in _CLONE_GREETING_CACHE or key in _CLONE_GREETING_EVENTS:
+            return
+        ev = threading.Event()
+        _CLONE_GREETING_EVENTS[key] = ev
+
+    def _run():
+        t0 = time.time()
+        pcm = b""
+        try:
+            # 16 kHz = the rate the LiveKit agent already uses on the clone socket, then downsample to the line rate
+            pcm = b"".join(c for c, _sr in _stream_clone_tts(line, lang, voice_id, 16000))
+            if pcm:
+                pcm, _ = audioop.ratecv(pcm, 2, 1, 16000, VOICELINK_RATE, None)
+        except Exception as e:
+            pcm = b""    # never cache a half-synthesized greeting
+            log("VOICELINK", f"clone greeting synthesis failed: {type(e).__name__}: {e!r}")
+        if pcm:
+            with _clone_greeting_lock:
+                if len(_CLONE_GREETING_CACHE) > 50:
+                    _CLONE_GREETING_CACHE.clear()
+                _CLONE_GREETING_CACHE[key] = pcm
+            log("VOICELINK", f"clone greeting ready: {len(pcm) / (VOICELINK_RATE * 2):.1f}s of audio, "
+                             f"synthesized in {time.time() - t0:.1f}s")
+        ev.set()
+        with _clone_greeting_lock:
+            _CLONE_GREETING_EVENTS.pop(key, None)
+
+    threading.Thread(target=_run, daemon=True, name="CloneGreeting").start()
+
+
+def _get_clone_greeting_pcm(agent: dict, lead: dict, wait_secs: float = 3.0):
+    """(pcm | None, text). Waits briefly if the warm-up is still running; None -> agent says it live (old behaviour)."""
+    key, line, _lang, voice_id = _clone_greeting_key(agent, lead)
+    if not voice_id:
+        return None, ""
+    with _clone_greeting_lock:
+        pcm = _CLONE_GREETING_CACHE.get(key)
+        ev = _CLONE_GREETING_EVENTS.get(key)
+    if pcm is None and ev is not None:
+        ev.wait(wait_secs)
+        with _clone_greeting_lock:
+            pcm = _CLONE_GREETING_CACHE.get(key)
+    return (pcm, line) if pcm else (None, "")
+
+
 def _prepare_outbound_greeting(agent: dict, lead: dict, codec: str = None):
     """(audio_bytes | None, text) already encoded in the line codec. Pre-recorded opening first
     (cached -> instant), else one quick Sarvam TTS call."""
@@ -4329,6 +4398,11 @@ def _run_voicelink_outbound_ai(ws, call_id, cfg):
     log("VOICELINK", f"outbound {call_id}: start event, line codec={codec}, call_sid={call_sid}")
 
     greeting_audio, greeting_text = _prepare_outbound_greeting(cfg["agent"], cfg["lead"], codec)
+    if not greeting_audio and (cfg["agent"].get("cloned_voice_id") or "").strip():
+        # cloned voice: use the greeting that was synthesized while the phone was ringing
+        _cpcm, _ctxt = _get_clone_greeting_pcm(cfg["agent"], cfg["lead"])
+        if _cpcm:
+            greeting_audio, greeting_text = _ivr_encode(_cpcm, codec), _ctxt
     bridge = livekit_bridge.VoiceLinkBridge(
         call_id=call_id, ws=ws, agent_cfg=cfg["agent"], lead=cfg["lead"],
         meeting=cfg.get("meeting"), callback_url=cfg.get("callback_url"),
