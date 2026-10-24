@@ -129,8 +129,9 @@ def reply_language_rule(lang: str) -> str:
                 "Mirror the caller - more Hindi if they use more Hindi.")
     name = cfg["name"]
     if not cfg["script"]:
-        return (f"Reply in casual, natural spoken {name} with common English words mixed in (Hinglish), "
-                "written in Roman/English letters - do NOT use Devanagari or any native script.")
+        return (f"Reply in casual, natural spoken {name} with everyday English words mixed into the sentence. "
+                "Write Hindi words in Devanagari script and English words in Latin letters, in the same sentence "
+                "(e.g. 'ठीक है जी, आप कब तक property खरीदना चाहेंगे?'). NEVER write Hindi words in Roman letters.")
     rule = (f"Reply only in casual, natural spoken {name}, written in {cfg['script']} script "
             f"(never Roman letters), the way people actually talk on a phone call.")
     if cfg.get("dialect"):
@@ -896,9 +897,10 @@ class EvaSession:
             base_prompt += " " + reply_language_rule(self.forced_language)
         else:
             base_prompt += (
-                " Reply in the language the caller speaks. For English or Hindi (or a mix), use natural Indian-style "
-                "Hinglish: English with everyday Hindi words mixed in, Roman letters only, never Devanagari, matching "
-                "the caller's own ratio of English to Hindi. "
+                " Reply in the language the caller speaks. For Hindi or a Hindi-English mix, reply in natural Hindi "
+                "with everyday English words mixed in: every Hindi word in Devanagari, every English word in Latin "
+                "letters, in the same sentence, never Hindi in Roman letters. For pure English, plain Indian English "
+                "in Latin letters. "
                 "If the user clearly speaks another Indian language (Gujarati, Punjabi, Marathi, Bengali, Tamil, "
                 "Telugu, Kannada, Malayalam, Odia, Haryanvi...), reply in that same language in its own native script."
             )
@@ -917,7 +919,7 @@ class EvaSession:
             "no technical/infra details. Speak like a real phone call - contractions, warm, "
             "brief, never repeat back what they said. Your words go straight to a text-to-speech voice, "
             "so write exactly how it should be SPOKEN: short sentences, commas where a person would pause, "
-            "light fillers used sparingly (achha, haan ji, dekhiye, bilkul), and never any markdown, "
+            "light fillers used sparingly (अच्छा, हाँ जी, देखिए, बिल्कुल), and never any markdown, "
             "asterisks, bullets, lists, emojis, brackets or symbols."
         )
 

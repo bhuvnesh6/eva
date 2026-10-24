@@ -223,6 +223,24 @@ def _pick_tts_lang(text: str, forced: str = None) -> str:
     return forced or detected
 
 
+# Placed LAST in the system prompt so it outranks any Roman-script example lines in the owner's custom script.
+HINDI_SCRIPT_RULE = (
+    "HINDI SCRIPT RULE (highest priority, overrides every example and instruction above): whenever you speak "
+    "Hindi, talk the way ordinary urban Indians talk on a phone call: Hindi with everyday English words mixed "
+    "into the middle of the sentence. Write every HINDI word in Devanagari and every ENGLISH word in Latin "
+    "letters, together in the same sentence. NEVER write a Hindi word in Roman letters - not 'ji', 'achha', "
+    "'theek hai', 'aap', 'kab tak', 'humari', 'karegi', 'hain', 'boliye', 'dobara'. "
+    "Right: 'ठीक है जी, आप कब तक property खरीदना चाहेंगे?' / 'हमारी senior team आपसे जल्दी ही contact करेगी।' "
+    "Wrong: 'Theek hai ji, aap kab tak property kharidna chahenge?' / 'Humari senior team aapse jald hi contact karegi.' "
+    "Right: 'ठीक है जी, note कर लिया।' Wrong: 'ठीक है ji, note कर लिया।' (half-Roman Hindi breaks the voice). "
+    "Keep English words, brand and place names (property, budget, flat, BHK, site visit, confirm, team, "
+    "Nisha Homes, thank you) in Latin letters exactly as spelled; never convert them to Devanagari. "
+    "Write amounts and times like '1.5 करोड़' and 'कल शाम 5 बजे'. "
+    "If the caller speaks only English, answer in plain English (Latin letters) and switch back to this style "
+    "as soon as they use Hindi."
+)
+
+
 def _reply_language_rule(lang: str) -> str:
     cfg = LANGUAGES.get(lang)
     if not cfg or lang == "en":
@@ -237,9 +255,9 @@ def _reply_language_rule(lang: str) -> str:
     name = cfg["name"]
     if not cfg["script"]:
         return (
-            f"Always reply in casual, natural spoken {name} the way people actually talk: Hindi sentence structure "
-            "with common English words mixed in naturally (budget, site visit, confirm, location, etc.), written in "
-            "Roman/English letters (Hinglish). NEVER use Devanagari or any native script."
+            f"Always reply in casual, natural spoken {name} the way urban Indians talk on the phone: Hindi with "
+            "everyday English words mixed into the sentence. Hindi words in Devanagari script, English words in "
+            "Latin letters. NEVER write Hindi words in Roman letters."
         )
     rule = (f"Always reply in casual, natural spoken {name}, written in {cfg['script']} script "
             "(never Roman letters), exactly how people talk on a phone call.")
@@ -1302,7 +1320,8 @@ class EvaAgent(Agent):
                 yield out
         if not state["spoken"]:
             logger.warning("LLM empty twice -> speaking fallback line")
-            yield "Ji, ek baar phir boliye?"
+            yield ("जी, एक बार फिर बोलिए?" if self._forced_lang in (None, "hi")
+                   else "Ji, ek baar phir boliye?")
 
     async def _handle_booking_tag(self, sentence: str) -> str:
         """Strips a BOOK_MEETING: tag out of the spoken text and fires the
@@ -1379,9 +1398,10 @@ def _build_instructions(agent_cfg: dict, lead: dict, meeting: dict, inbound: boo
     else:
         base += (
             "\nLANGUAGE RULE (always follow): reply in the language the caller is speaking. "
-            "If they speak English or Hindi (or a mix), reply in natural Indian-style Hinglish: English with "
-            "everyday Hindi words mixed in, written in Roman letters only, never Devanagari. Match their ratio - "
-            "more English if they use more English, more Hindi if they use more Hindi. "
+            "If they speak Hindi or a Hindi-English mix, reply in natural Hindi with everyday English words mixed "
+            "in: every Hindi word in Devanagari, every English word in Latin letters, in the same sentence (see "
+            "HINDI SCRIPT RULE at the end). If they speak only English, reply in simple Indian English in Latin "
+            "letters. Match their ratio of Hindi to English. "
             "If the caller clearly speaks another Indian language, or asks you to speak in one "
             "(Gujarati, Punjabi, Marathi, Bengali, Tamil, Telugu, Kannada, Malayalam, Odia, Haryanvi...), "
             "switch to that language and write in its own native script (never Roman letters) until they ask to change."
@@ -1391,9 +1411,9 @@ def _build_instructions(agent_cfg: dict, lead: dict, meeting: dict, inbound: boo
     # a few lines up in entrypoint()). Default matches the voice-selection
     # default (female) when gender isn't set.
     gender_forms = (
-        "masculine (e.g. main karta hoon, main bol raha hoon, main tha)"
+        "masculine (e.g. मैं करता हूँ, मैं बोल रहा हूँ, मैं था)"
         if agent_cfg.get("gender") == "male" else
-        "feminine (e.g. main karti hoon, main bol rahi hoon, main thi)"
+        "feminine (e.g. मैं करती हूँ, मैं बोल रही हूँ, मैं थी)"
     )
     base += (
         f"\nGRAMMATICAL GENDER: whenever you speak Hindi, Hinglish or any other gendered Indian "
@@ -1422,36 +1442,36 @@ def _build_instructions(agent_cfg: dict, lead: dict, meeting: dict, inbound: boo
         "phone call. Each reply is one or two SHORT sentences. Target 90-180 "
         "characters, never above 220. Never read the example lines in the script word "
         "for word - compress them to the shortest natural version. Never say 'Sir/Ma'am' "
-        "out loud as a pair: use the caller's name with 'ji' (e.g. 'Bhuvi ji'), or just 'ji'. "
+        "out loud as a pair: use the caller's name followed by जी (e.g. 'Bhuvi जी'), or just जी. "
         "Keep any closing summary to one sentence."
     )
     base += (
         "\n\nNATURAL ACKNOWLEDGEMENT (always follow): start every reply with a 2-4 word "
         "acknowledgement that picks up the SPECIFIC detail the caller just gave, then ask exactly "
-        "ONE question. Example: caller says 'South Delhi mein dekh raha hoon' -> 'South Delhi, achha ji. "
-        "Budget kitna soch rakha hai?'. Vary the openers (Achha, Theek hai, Samajh gaya, Got it, "
-        "Bilkul) and never use the same one twice in a row. Never repeat the caller's sentence back."
+        "ONE question. Example: caller says 'मैं South Delhi में देख रहा हूँ' -> 'South Delhi, अच्छा जी। "
+        "आपका budget कितना सोच रखा है?'. Vary the openers (अच्छा, ठीक है, जी, बिल्कुल, Got it) "
+        "and never use the same one twice in a row. Never repeat the caller's sentence back."
         "\nONE QUESTION RULE: a reply has at most ONE question mark. Never join two questions with "
-        "'aur' or 'and' (for example never 'kaunsi class mein hain aur target exam kaunsa hai')."
+        "'और' or 'and' (for example never 'आप कौन सी class में हैं और target exam कौन सा है')."
         "\nMEMORY RULE: before asking anything, check the whole conversation. If the caller already "
         "gave their class, exam, subject, location or online/offline choice, never ask it again. If "
-        "the caller says they already told you something, say 'Sorry ji, note kar liya' and move on."
+        "the caller says they already told you something, say 'Sorry जी, note कर लिया' and move on."
     )
     base += (
         "\n\nBACKGROUND VOICES: the line may pick up other people talking nearby. If the caller's "
         "latest message is UNMISTAKABLY a conversation between other people about something unrelated "
         "to this call (cars, family chatter, directions) and contains no answer or question for you, "
         "output exactly [IGNORE] and nothing else. If a message is only half-heard or unclear, do not "
-        "guess - say a very short 'Ji, dobara bolenge?' in the call's language. If the message is "
+        "guess - say a very short 'जी, दोबारा बोलिए?' in the call's language and script. If the message is "
         "even partly an answer to you, answer it normally. Never mention noise or background voices."
     )
     base += (
         "\n\nVOICE STYLE (always follow): your words are converted straight to speech, so write exactly how "
         "they should be SPOKEN. Sound like a warm, relaxed Indian professional on a real phone call: "
-        "contractions, everyday words, and light fillers used sparingly (achha, haan ji, dekhiye, toh, bilkul, "
-        "theek hai). Use short sentences with commas and full stops where a person would naturally pause. "
+        "contractions, everyday words, and light fillers used sparingly (अच्छा, हाँ जी, देखिए, तो, बिल्कुल, "
+        "ठीक है). Use short sentences with commas and full stops where a person would naturally pause. "
         "Never use markdown, asterisks, bullets, numbered lists, emojis, brackets or symbols. Write amounts, "
-        "dates and times the way they would be said aloud (e.g. '1.5 crore', 'kal shaam 5 baje'). "
+        "dates and times the way they would be said aloud (e.g. '1.5 करोड़', 'कल शाम 5 बजे'). "
         "Never sound scripted, stiff or like a customer-care recording, and never use the same opener or "
         "filler twice in a row."
     )
@@ -1489,6 +1509,9 @@ def _build_instructions(agent_cfg: dict, lead: dict, meeting: dict, inbound: boo
             "BOOK_MEETING: YYYY-MM-DD HH:MM (24-hour clock, UTC). Do not say this "
             "line out loud or explain it - it's processed automatically."
         )
+    # Last on purpose: the most recent instruction wins over Roman-script lines in the owner's custom prompt.
+    if forced_lang in (None, "hi"):
+        base += "\n\n" + HINDI_SCRIPT_RULE
     return base, forced_lang, persona_name
 
 def prewarm(proc: JobProcess) -> None:
@@ -1845,7 +1868,11 @@ async def entrypoint(ctx: JobContext) -> None:
             await asyncio.sleep(max_duration_secs)
             logger.info("call_id=%r hit max duration (%ss), closing.", call_id, max_duration_secs)
             try:
-                await session.say("Thank you ji, aapse baat karke achha laga.", allow_interruptions=False)
+                await session.say(
+                    "Thank you जी, आपसे बात करके अच्छा लगा।" if tts_lang == "hi"
+                    else "Thank you ji, aapse baat karke achha laga.",
+                    allow_interruptions=False,
+                )
             except Exception:
                 pass
             ctx.shutdown(reason="max_duration_reached")
