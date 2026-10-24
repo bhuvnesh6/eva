@@ -5,7 +5,8 @@
     "temperature": 0.5,
     "max_tokens": 200,
     "max_reply_chars": 650,
-    "reasoning_effort": null
+    "reasoning_effort": null,
+    "empty_retry": true
   },
   "stt": {
     "realtime_model": "saaras:v3-realtime",
@@ -25,7 +26,11 @@
     "en_mix_hindi": true,
     "max_spoken_chars": 260,
     "min_first_chunk_chars": 14,
-    "batch_min_chars": 60
+    "first_chunk_split_min_chars": 48,
+    "batch_min_chars": 60,
+    "keeper_interval_secs": 3.0,
+    "timing_log": true,
+    "extra_config": {}
   },
   "clone": {
     "codec": "linear16",
@@ -34,7 +39,12 @@
     "min_first_chunk_chars": 45,
     "batch_min_chars": 140,
     "early_comma_flush": false,
+    "single_shot": true,
     "tail_timeout_secs": 0.8,
+    "gap_timeout_secs": 6.0,
+    "chars_per_sec": 15,
+    "preroll_secs": 0.9,
+    "preroll_max_wait_secs": 1.5,
     "devanagari_hindi": true,
     "extra_config": {}
   }

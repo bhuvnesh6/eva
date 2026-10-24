@@ -107,14 +107,14 @@ PREBUF_PRE_ROLL_MS = 300          # keep this much audio before the first spoken
 INBOUND_LIVE_FALLBACK_SECS = 10   # go live anyway if the agent never reports subscribing
 GREETING_LEAD_SECS = 0.3          # send greeting audio this far ahead of real time
 HANGUP_TAIL_SECS = 0.8            # let the last agent words play before cutting the call
-PLAY_PREBUFFER_MS = int(os.environ.get("EVA_PLAY_PREBUFFER_MS", "60"))    # audio collected before each burst of speech starts playing
+PLAY_PREBUFFER_MS = int(os.environ.get("EVA_PLAY_PREBUFFER_MS", "40"))    # audio collected before each burst of speech starts playing
 # Agent audio from LiveKit arrives as a never-ending stream (silence while idle). If we queue that silence,
 # it builds a multi-second backlog and every reply is heard late. We drop silence and keep only real speech
 # (+ a short hangover so natural pauses inside a reply are kept).
 AGENT_SILENCE_RMS = int(os.environ.get("EVA_AGENT_SILENCE_RMS", "12"))        # 16-bit RMS below this = silence
 AGENT_SILENCE_HANG_MS = int(os.environ.get("EVA_AGENT_SILENCE_HANG_MS", "300"))
 # Cloned voices: bigger jitter buffer (smoother) and longer kept pauses (natural commas/breaths instead of rushed speech)
-CLONE_PLAY_PREBUFFER_MS = int(os.environ.get("EVA_CLONE_PLAY_PREBUFFER_MS", "200"))
+CLONE_PLAY_PREBUFFER_MS = int(os.environ.get("EVA_CLONE_PLAY_PREBUFFER_MS", "60"))
 CLONE_SILENCE_HANG_MS = int(os.environ.get("EVA_CLONE_SILENCE_HANG_MS", "700"))
 
 # ---------------- caller-audio noise gate (kills background voices / rumble) ----------------
@@ -519,10 +519,12 @@ class VoiceLinkBridge:
             if len(pcm) < 2:
                 continue
             if audioop.rms(pcm, 2) >= AGENT_SILENCE_RMS:
+                if quiet > hang_samples:      # silence -> speech: a new burst of agent speech starts
+                    print(f"[VOICELINK-BRIDGE] agent speech burst START "
+                          f"{time.strftime('%H:%M:%S')}.{int(time.time() * 1000) % 1000:03d} "
+                          f"out_queue={len(self._out)}", flush=True)
                 quiet = 0
-                if first:
-                    first = False
-                    print("[VOICELINK-BRIDGE] first agent SPEECH frame received from LiveKit", flush=True)
+                first = False
             else:
                 quiet += len(pcm) // 2
             if quiet > hang_samples:

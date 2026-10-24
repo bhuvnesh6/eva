@@ -163,6 +163,12 @@ CLONE_PREROLL_MAX_WAIT_SECS = float(S("clone.preroll_max_wait_secs", 1.5))
 CLONE_SINGLE_SHOT = bool(S("clone.single_shot", True))
 CLONE_DEVANAGARI_HINDI = bool(S("clone.devanagari_hindi", True))
 CLONE_EXTRA_CONFIG = S("clone.extra_config", {}) or {}
+# extra keys merged into the NON-clone Sarvam TTS config (settings.json -> tts.extra_config)
+SARVAM_TTS_EXTRA_CONFIG = S("tts.extra_config", {}) or {}
+TTS_KEEPER_INTERVAL_SECS = float(S("tts.keeper_interval_secs", 3.0))
+TTS_TIMING_LOG = bool(S("tts.timing_log", True))
+FIRST_CHUNK_SPLIT_MIN_CHARS = int(S("tts.first_chunk_split_min_chars", 48))
+LLM_EMPTY_RETRY = bool(S("llm.empty_retry", True))
 
 # ---------------- background-noise / side-talk protection ----------------
 VAD_ACTIVATION_THRESHOLD = float(os.environ.get("EVA_VAD_ACTIVATION", "0.6"))     # silero default 0.5
@@ -474,6 +480,31 @@ class SarvamWSTTS(tts.TTS):
             except Exception as e:
                 logger.warning("Sarvam TTS prewarm failed: %r", e)
         asyncio.ensure_future(_warm())
+        # keeper: background loop that reconnects a dropped socket BEFORE the next reply needs it
+        if getattr(self, "_keeper_task", None) is None or self._keeper_task.done():
+            self._keeper_task = asyncio.ensure_future(self._keeper())
+
+    def ensure_warm(self):
+        ws = self._ws
+        if ws is not None and getattr(ws, "close_code", None) is None:
+            return
+        self.prewarm()
+
+    async def _keeper(self):
+        while True:
+            await asyncio.sleep(TTS_KEEPER_INTERVAL_SECS)
+            try:
+                ws = self._ws
+                alive = ws is not None and getattr(ws, "close_code", None) is None
+                if alive or self.lock.locked():
+                    continue
+                async with self.lock:
+                    await self.get_ws(self._language_code, self._pace)
+                logger.info("TTS keeper: socket was down, reconnected in background")
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.warning("TTS keeper reconnect failed: %r", e)
 
     def drop_ws(self):
         ws, self._ws, self._ws_key = self._ws, None, None
@@ -489,6 +520,7 @@ class SarvamWSTTS(tts.TTS):
         if ws is not None and self._ws_key == key and getattr(ws, "close_code", None) is None:
             return ws
         self.drop_ws()
+        _t_conn = time.monotonic()
         if self._voice_id:
             # ---- cloned voice: /voices/clone/ws ----
             ws = await websockets.connect(
@@ -523,8 +555,13 @@ class SarvamWSTTS(tts.TTS):
                 "output_audio_codec": "linear16",       # raw PCM, no mp3 decoding needed
                 "enable_preprocessing": True,
                 # if Sarvam ever 400s on a config key, delete that key here
+                **SARVAM_TTS_EXTRA_CONFIG,
             }}))
         self._ws, self._ws_key = ws, key
+        self._language_code, self._pace = language, pace     # keeper reconnects with last-used settings
+        if TTS_TIMING_LOG:
+            logger.info("TTS-TIMING socket connect+config %.0f ms (lang=%s)",
+                        (time.monotonic() - _t_conn) * 1000, language)
         return ws
 
     def synthesize(self, text: str, *, conn_options: APIConnectOptions = DEFAULT_API_CONNECT_OPTIONS,
@@ -539,6 +576,9 @@ class SarvamWSTTS(tts.TTS):
         return _SarvamReply(self, out_q)
 
     async def aclose(self) -> None:
+        kt = getattr(self, "_keeper_task", None)
+        if kt is not None:
+            kt.cancel()
         self.drop_ws()
         await super().aclose()
 
@@ -570,6 +610,8 @@ class _SarvamReply:
         self.got_audio = False
         self._chars = 0          # total text chars sent on this reply
         self._audio_secs = 0.0   # total audio seconds received for this reply
+        self._t_start = time.monotonic()
+        self._t_send = None
 
     # ---------- lock / lifecycle ----------
     def _release(self):
@@ -620,9 +662,14 @@ class _SarvamReply:
             self._release()
             raise
         self.started = True
+        if TTS_TIMING_LOG:
+            logger.info("TTS-TIMING lock+socket ready %.0f ms after reply start",
+                        (time.monotonic() - self._t_start) * 1000)
         self._reader = asyncio.create_task(self._read())
 
     async def send(self, text: str):
+        if self._t_send is None:
+            self._t_send = time.monotonic()
         await self._ws.send(json.dumps({"type": "text", "data": {"text": text}}))
         await self._ws.send(json.dumps({"type": "flush"}))
         self._sent += 1
@@ -709,6 +756,9 @@ class _SarvamReply:
                             samples_per_channel=len(piece) // 2,
                         ))
                     if b:
+                        if not self.got_audio and TTS_TIMING_LOG and self._t_send:
+                            logger.info("TTS-TIMING Sarvam FIRST AUDIO %.0f ms after text was sent (%d chars)",
+                                        (time.monotonic() - self._t_send) * 1000, self._chars)
                         self.got_audio = True
                 elif mtype == "event":
                     et = (msg.get("data") or {}).get("event_type")
@@ -879,6 +929,30 @@ def _tts_sanitize(text: str) -> str:
     text = _MD_RE.sub("", text)
     text = text.replace("&", " and ")
     return re.sub(r"\s{2,}", " ", text).strip()
+
+
+def _split_sentences(text: str) -> list:
+    """Same boundary rule as the streaming splitter, but returns the sentences as a list."""
+    parts = SENTENCE_END_RE.split(text)
+    out, i = [], 0
+    while i + 1 < len(parts):
+        piece = (parts[i] + parts[i + 1]).strip()
+        if piece:
+            out.append(piece)
+        i += 2
+    if i < len(parts) and parts[i].strip():
+        out.append(parts[i].strip())
+    return out or [text.strip()]
+
+
+def _split_first_clause(piece: str):
+    """Long first sentence -> (first clause, rest) so the first TTS request is small. Else (piece, '')."""
+    if len(piece) <= FIRST_CHUNK_SPLIT_MIN_CHARS:
+        return piece, ""
+    for m in FIRST_CLAUSE_RE.finditer(piece):
+        if m.end() >= MIN_FIRST_CHUNK_CHARS and len(piece) - m.end() >= 12:
+            return piece[:m.end()].strip(), piece[m.end():].strip()
+    return piece, ""
 
 
 def render_call_vars(text: str, lead: dict) -> str:
@@ -1106,14 +1180,22 @@ class EvaAgent(Agent):
 
                     if not sentence:
                         continue
-                    has_tag = bool(BOOK_MEETING_RE.search(sentence))
-                    sentence = await _clean(sentence)
-                    if not sentence or not SPEAKABLE_RE.search(sentence) or (capped and not has_tag):
-                        continue
-                    await _say(sentence)
-                    spoken_chars += len(sentence)
-                    if spoken_chars >= MAX_SPOKEN_CHARS:
-                        capped = True
+                    # a fast LLM sends the whole reply in ONE chunk -> send sentence 1 alone, the rest right after
+                    for piece in _split_sentences(sentence):
+                        has_tag = bool(BOOK_MEETING_RE.search(piece))
+                        piece = await _clean(piece)
+                        if not piece or not SPEAKABLE_RE.search(piece) or (capped and not has_tag):
+                            continue
+                        if not reply.started and _early_comma and not batch["text"]:
+                            head, rest = _split_first_clause(piece)
+                            if rest:
+                                await _say(head)            # >= _min_first chars -> goes out immediately
+                                spoken_chars += len(head)
+                                piece = rest
+                        await _say(piece)
+                        spoken_chars += len(piece)
+                        if spoken_chars >= MAX_SPOKEN_CHARS:
+                            capped = True
 
                 tail = buffer.strip()
                 if tail:
@@ -1177,26 +1259,50 @@ class EvaAgent(Agent):
 
     async def llm_node(self, chat_ctx, tools, model_settings):
         # Sarvam sometimes returns the END_CALL marker as a *tool call* even though we declare no tools.
-        # LiveKit then stores a function_call in the history and every later request fails with
-        # HTTP 400 "Tool messages found but no tools provided" -> Eva goes silent for the rest of the call.
         # 1) never send tool messages back to the LLM  2) turn any stray tool call back into spoken text.
+        # 3) NEW: if the model returns no spoken text at all (seen in your log: 200 tokens, ttft=-1),
+        #    retry once, then fall back to a short line - the caller must never get dead air.
         try:
             chat_ctx = chat_ctx.copy(exclude_function_call=True)
         except TypeError:
             pass
-        async for chunk in Agent.default.llm_node(self, chat_ctx, tools, model_settings):
-            delta = getattr(chunk, "delta", None)
-            calls = getattr(delta, "tool_calls", None) if delta is not None else None
-            if not calls:
-                yield chunk
-                continue
-            if getattr(delta, "content", None):
-                yield delta.content
-            for c in calls:
-                txt = (getattr(c, "name", "") or "").strip()
-                logger.warning("LLM returned a tool call although no tools exist - speaking it as text: %r", txt[:80])
-                if txt:
-                    yield txt + "\n"
+        try:
+            self._global_tts.ensure_warm()      # socket handshake overlaps the LLM call
+        except Exception:
+            pass
+
+        state = {"spoken": False}
+
+        async def _run_once():
+            async for chunk in Agent.default.llm_node(self, chat_ctx, tools, model_settings):
+                delta = getattr(chunk, "delta", None)
+                calls = getattr(delta, "tool_calls", None) if delta is not None else None
+                if not calls:
+                    txt = chunk if isinstance(chunk, str) else (
+                        getattr(delta, "content", None) if delta is not None else None)
+                    if txt and str(txt).strip():
+                        state["spoken"] = True
+                    yield chunk
+                    continue
+                if getattr(delta, "content", None):
+                    state["spoken"] = True
+                    yield delta.content
+                for c in calls:
+                    txt = (getattr(c, "name", "") or "").strip()
+                    logger.warning("LLM returned a tool call although no tools exist - speaking it as text: %r", txt[:80])
+                    if txt:
+                        state["spoken"] = True
+                        yield txt + "\n"
+
+        async for out in _run_once():
+            yield out
+        if not state["spoken"] and LLM_EMPTY_RETRY:
+            logger.warning("LLM produced NO spoken text (empty / reasoning-only) -> retrying once")
+            async for out in _run_once():
+                yield out
+        if not state["spoken"]:
+            logger.warning("LLM empty twice -> speaking fallback line")
+            yield "Ji, ek baar phir boliye?"
 
     async def _handle_booking_tag(self, sentence: str) -> str:
         """Strips a BOOK_MEETING: tag out of the spoken text and fires the
@@ -1538,8 +1644,8 @@ async def entrypoint(ctx: JobContext) -> None:
     _pending_interim = {"text": "", "t": 0.0}
 
     def _on_user_transcribed(ev):
-        logger.info("USER SAID (final=%s): %s", ev.is_final, ev.transcript)
         if ev.is_final:
+            logger.info("USER SAID: %s", ev.transcript)
             _pending_interim["text"] = ""
         else:
             _pending_interim["text"] = ev.transcript
@@ -1555,7 +1661,6 @@ async def entrypoint(ctx: JobContext) -> None:
             if type(m).__name__ == "VADMetrics":
                 return          # one every second - just noise
             logger.info("LATENCY %s %s", type(m).__name__, m)
-            print(f"[EVA-LATENCY] {type(m).__name__} {m}", flush=True)
         except Exception:
             pass
 
