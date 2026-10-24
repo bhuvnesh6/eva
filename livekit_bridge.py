@@ -19,6 +19,7 @@ import threading
 import time
 import uuid
 from collections import deque
+import wave
 
 from livekit import rtc, api
 
@@ -122,8 +123,8 @@ GATE_ENABLED = os.environ.get("EVA_NOISE_GATE", "1") != "0"
 GATE_HPF_HZ = float(os.environ.get("EVA_GATE_HPF_HZ", "250"))          # removes low-frequency rumble
 GATE_MIN_RMS = float(os.environ.get("EVA_GATE_MIN_RMS", "200"))        # absolute floor (16-bit RMS)
 GATE_NOISE_MULT = float(os.environ.get("EVA_GATE_NOISE_MULT", "3.0"))  # must be 3x the measured noise floor
-GATE_REL_RATIO = float(os.environ.get("EVA_GATE_REL_RATIO", "0.35"))   # must be >= 35% of the caller's usual level
-GATE_HANG_SECS = float(os.environ.get("EVA_GATE_HANG_SECS", "0.35"))   # keep gate open this long after speech
+GATE_REL_RATIO = float(os.environ.get("EVA_GATE_REL_RATIO", "0.15"))   # must be >= 15% of the caller's usual level
+GATE_HANG_SECS = float(os.environ.get("EVA_GATE_HANG_SECS", "0.6"))    # keep gate open this long after speech
 
 
 class _CallerAudioFilter:
@@ -233,6 +234,7 @@ class VoiceLinkBridge:
         _is_clone = bool(((agent_cfg or {}).get("cloned_voice_id") or "").strip())
         self._play_prebuffer_ms = CLONE_PLAY_PREBUFFER_MS if _is_clone else PLAY_PREBUFFER_MS
         self._silence_hang_ms = CLONE_SILENCE_HANG_MS if _is_clone else AGENT_SILENCE_HANG_MS
+        self._dbg = bytearray() if os.environ.get("EVA_DEBUG_SAVE_GATED") == "1" else None
         self._agent_joined = False
         self._hangup_flag = False
         self._hangup_done = False
@@ -328,6 +330,8 @@ class VoiceLinkBridge:
             try:
                 dispatches = await lkapi.agent_dispatch.list_dispatch(room_name=self.room_name)
                 for d in dispatches:
+                    if d.agent_name != AGENT_NAME:
+                        continue   # unnamed auto-dispatch with no worker: not ours, not an error
                     print(f"[VOICELINK-BRIDGE] dispatch {d.id} agent={d.agent_name} jobs={len(d.state.jobs)}", flush=True)
                     for j in d.state.jobs:
                         print(f"[VOICELINK-BRIDGE]   job {j.id} status={j.state.status} "
@@ -409,6 +413,8 @@ class VoiceLinkBridge:
             return
         if self._filter is not None:
             pcm16 = self._filter.process(pcm16)
+        if self._dbg is not None and len(self._dbg) < ROOM_AUDIO_RATE * 2 * 600:
+            self._dbg.extend(pcm16)
         if not self._live:
             self._prebuf.extend(pcm16)
             cap = ROOM_AUDIO_RATE * 2 * PREBUF_MAX_SECS
@@ -646,6 +652,16 @@ class VoiceLinkBridge:
             return
         self._closed.set()
         self.greeting_done.set()
+        if self._dbg:
+            try:
+                with wave.open(f"/tmp/gated_{self.call_id}.wav", "wb") as wf:
+                    wf.setnchannels(1)
+                    wf.setsampwidth(2)
+                    wf.setframerate(ROOM_AUDIO_RATE)
+                    wf.writeframes(bytes(self._dbg))
+                print(f"[VOICELINK-BRIDGE] saved gated caller audio to /tmp/gated_{self.call_id}.wav", flush=True)
+            except Exception as e:
+                print(f"[VOICELINK-BRIDGE] debug wav save failed: {e!r}", flush=True)
         if self._in_q is not None:
             try:
                 _bridge_loop.loop.call_soon_threadsafe(self._in_q.put_nowait, None)

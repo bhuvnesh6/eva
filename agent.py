@@ -53,8 +53,8 @@ from livekit.agents.types import NOT_GIVEN, NotGivenOr
 load_dotenv()
 from settings import get as S      # all Sarvam STT/TTS/LLM tuning lives in settings.json
 
-logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("eva-agent")
+logger.setLevel(logging.INFO)
 
 AGENT_NAME = os.environ.get("AGENT_NAME", "eva-agent")
 
@@ -180,7 +180,7 @@ IGNORE_RE = re.compile(r"\[IGNORE\]")       # LLM emits this when the "caller" t
 # ---------------- Latency tuning ----------------
 # How long the agent waits after the caller stops before replying, worst case.
 # Was hard-coded 3.0 -> this was the biggest source of the 4-7s delay.
-MIN_ENDPOINTING_DELAY = float(os.environ.get("EVA_MIN_ENDPOINTING_DELAY", "0.15"))
+MIN_ENDPOINTING_DELAY = float(os.environ.get("EVA_MIN_ENDPOINTING_DELAY", "0.05"))
 MAX_ENDPOINTING_DELAY = float(os.environ.get("EVA_MAX_ENDPOINTING_DELAY", "1.2"))
 # "multilingual" = smart turn-detector model (default). "vad" = plain silence-based,
 # fastest, but may cut in on slow talkers. Try "vad" if still too slow.
@@ -1427,11 +1427,15 @@ def _build_instructions(agent_cfg: dict, lead: dict, meeting: dict, inbound: boo
     )
     base += (
         "\n\nNATURAL ACKNOWLEDGEMENT (always follow): start every reply with a 2-4 word "
-        "acknowledgement that echoes the SPECIFIC detail the caller just gave, then ask ONE next "
-        "question. Example: caller says 'South Delhi mein dekh raha hoon' -> 'South Delhi, achha ji. "
+        "acknowledgement that picks up the SPECIFIC detail the caller just gave, then ask exactly "
+        "ONE question. Example: caller says 'South Delhi mein dekh raha hoon' -> 'South Delhi, achha ji. "
         "Budget kitna soch rakha hai?'. Vary the openers (Achha, Theek hai, Samajh gaya, Got it, "
-        "Bilkul) and never use the same one twice in a row. Never ask something the caller has "
-        "already told you earlier in the call."
+        "Bilkul) and never use the same one twice in a row. Never repeat the caller's sentence back."
+        "\nONE QUESTION RULE: a reply has at most ONE question mark. Never join two questions with "
+        "'aur' or 'and' (for example never 'kaunsi class mein hain aur target exam kaunsa hai')."
+        "\nMEMORY RULE: before asking anything, check the whole conversation. If the caller already "
+        "gave their class, exam, subject, location or online/offline choice, never ask it again. If "
+        "the caller says they already told you something, say 'Sorry ji, note kar liya' and move on."
     )
     base += (
         "\n\nBACKGROUND VOICES: the line may pick up other people talking nearby. If the caller's "
