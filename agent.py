@@ -1024,6 +1024,7 @@ class EvaAgent(Agent):
                  opening_audio_rate: int = 22050,
                  greeting_played: bool = False, greeting_text: str = ""):
         super().__init__(instructions=instructions)
+        self._raw_instructions = instructions
         self._greeting_played = greeting_played     # inbound: Eva already played the greeting on the line
         self._greeting_text = greeting_text
         self._end_call_requested = False
@@ -1115,12 +1116,24 @@ class EvaAgent(Agent):
                     if self._persona_name else
                     "Do not state any name for yourself."
                 )
-                await self.session.generate_reply(
-                    instructions=(
-                        "Greet the caller warmly in ONE short sentence and ask how you "
-                        f"can help today. {name_hint}"
+                _raw = self._raw_instructions or ""
+                _m = re.search(r"CALL SCENARIO:\s*(first|followup|incoming)", _raw)
+                _scn = _m.group(1) if _m else ""
+                _has_ctx = "PAST CONTEXT ABOUT THIS PERSON" in _raw
+                if _scn == "followup" and _has_ctx:
+                    _greet = (
+                        "You are calling someone you have already spoken with. In ONE short sentence greet them by "
+                        "name, say your name, and mention in a few words what you discussed last time (use the PAST "
+                        "CONTEXT), then ask if it is a good time to continue. Do not summarise everything. "
                     )
-                )
+                elif _scn == "incoming" and _has_ctx:
+                    _greet = (
+                        "The caller phoned in and you already know them. In ONE short sentence welcome them back by "
+                        "name and ask how you can help; you may refer to their earlier requirement in a few words. "
+                    )
+                else:
+                    _greet = "Greet the caller warmly in ONE short sentence and ask how you can help today. "
+                await self.session.generate_reply(instructions=_greet + name_hint)
         except Exception:
             logger.exception("on_enter failed for call_id=%r - greeting was not spoken", self._call_id)
 
@@ -1348,7 +1361,7 @@ class EvaAgent(Agent):
 
 
 
-def _build_instructions(agent_cfg: dict, lead: dict, meeting: dict, inbound: bool = False, clone: bool = False):
+def _build_instructions(agent_cfg: dict, lead: dict, meeting: dict, inbound: bool = False, clone: bool = False, greeting_played: bool = True):
     """Mirrors app.py's EvaSession.__init__ prompt-building. Returns
     (instructions, forced_lang, persona_name) - the caller needs forced_lang
     separately to drive TTS language selection, and persona_name so the
@@ -1475,11 +1488,17 @@ def _build_instructions(agent_cfg: dict, lead: dict, meeting: dict, inbound: boo
         "Never sound scripted, stiff or like a customer-care recording, and never use the same opener or "
         "filler twice in a row."
     )
-    if inbound:
+    if inbound and greeting_played:
         base += (
             "\n\nINBOUND CALL: the person phoned the business - you did NOT call them. Never say you are "
             "calling them and never ask 'do you have a minute'. The greeting was already said at the start "
             "of the call, so do NOT greet again or re-introduce yourself; just respond to what they say and help them."
+        )
+    elif inbound:
+        base += (
+            "\n\nINBOUND CALL: the person phoned the business - you did NOT call them. Never say you are "
+            "calling them and never ask 'do you have a minute'. You open the call yourself with one short, warm "
+            "greeting, then respond to what they say and help them."
         )
     base += (
         "\n\nENDING THE CALL: when the caller clearly wants to finish the conversation (for example 'ok bye', "
@@ -1764,6 +1783,9 @@ async def entrypoint(ctx: JobContext) -> None:
     instructions, forced_lang, persona_name = _build_instructions(
         agent_cfg, lead, meeting, inbound=inbound,
         clone=bool(_clone_voice_id) and CLONE_DEVANAGARI_HINDI,
+        greeting_played=(greeting_played
+                         or bool((agent_cfg.get("opening_line") or "").strip())
+                         or bool((agent_cfg.get("opening_audio_url") or "").strip())),
     )
     opening_line = render_call_vars(agent_cfg.get("opening_line") or "", lead)
     opening_line = re.sub(r'[“”„«»"]', "", opening_line).strip()   # drop curly/straight double quotes
