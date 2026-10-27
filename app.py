@@ -589,6 +589,13 @@ def render_call_vars(text: str, lead: dict) -> str:
 app = Flask(__name__, template_folder="templates", static_folder="static", static_url_path="/static")
 sock = Sock(app)
 
+
+@app.before_request
+def _log_voicelink_ws_attempts():
+    if request.path.startswith("/ws/voicelink/"):
+        log("VOICELINK", f"WS handshake from {request.headers.get('X-Forwarded-For') or request.remote_addr} "
+                         f"path={request.path} upgrade={request.headers.get('Upgrade')!r}")
+
 # ---------------- LiveKit TTS: sync/async bridge ----------------
 # inference.TTS is async-only; everything else in this file is sync
 # (Flask + flask-sock under gunicorn's gevent worker). One persistent
@@ -3093,6 +3100,11 @@ def voicelink_webhook(call_id):
     if not re.fullmatch(r"[0-9a-f]{24}", call_id or ""):
         mapped = _lookup_inbound_call(payload)
         if not mapped:
+            if payload.get("direction") == "inbound" and (event == "call.failed" or str(payload.get("status") or "").lower() == "failed"):
+                log("VOICELINK", f"INBOUND CALL REJECTED BY VOICELINK before Eva answered: from={payload.get('from')} "
+                                 f"to={payload.get('to')} reason={payload.get('hangupReason') or payload.get('hangupCause')} "
+                                 f"sip={payload.get('sipStatus')}. If there is NO 'WS handshake' line just before this, VoiceLink "
+                                 "never opened our websocket -> fix the inbound bot / websocket URL / channels for this DID in the VoiceLink panel.")
             return jsonify({"received": True})   # e.g. call.initiated - websocket not connected yet
         log("VOICELINK", f"inbound webhook mapped via id/number -> call_id={mapped}")
         call_id = mapped

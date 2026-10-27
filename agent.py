@@ -1117,10 +1117,16 @@ class EvaAgent(Agent):
                     "Do not state any name for yourself."
                 )
                 _raw = self._raw_instructions or ""
-                _m = re.search(r"CALL SCENARIO:\s*(first|followup|incoming)", _raw)
+                _m = re.search(r"CALL SCENARIO:\s*(first|followup|incoming|callback)", _raw)
                 _scn = _m.group(1) if _m else ""
                 _has_ctx = "PAST CONTEXT ABOUT THIS PERSON" in _raw
-                if _scn == "followup" and _has_ctx:
+                if _scn == "callback":
+                    _greet = (
+                        "You are calling this person back because they asked you to call at this time. In ONE short "
+                        "sentence greet them by name, say your name and that you are calling back as they requested, "
+                        "and ask if it is a good time to talk. "
+                    )
+                elif _scn == "followup" and _has_ctx:
                     _greet = (
                         "You are calling someone you have already spoken with. In ONE short sentence greet them by "
                         "name, say your name, and mention in a few words what you discussed last time (use the PAST "
