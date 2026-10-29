@@ -53,6 +53,17 @@ ROOM_AUDIO_RATE = 8000   # A-law is 8kHz on the wire; publish/subscribe at
 def init(url, api_key, api_secret, agent_name):
     global LIVEKIT_URL, LIVEKIT_API_KEY, LIVEKIT_API_SECRET, AGENT_NAME
     LIVEKIT_URL, LIVEKIT_API_KEY, LIVEKIT_API_SECRET, AGENT_NAME = url, api_key, api_secret, agent_name
+    print(f"[VOICELINK-BRIDGE] LiveKit server = {LIVEKIT_URL}", flush=True)
+
+
+def _http_url(url: str) -> str:
+    """Admin/Twirp API (create_room, dispatch) wants http(s)://."""
+    return (url or "").replace("wss://", "https://").replace("ws://", "http://")
+
+
+def _ws_url(url: str) -> str:
+    """Realtime room connection wants ws(s)://."""
+    return (url or "").replace("https://", "wss://").replace("http://", "ws://")
 
 
 _task_errors = 0
@@ -250,12 +261,14 @@ class VoiceLinkBridge:
         _submit(self._diagnose_dispatch())
 
     def _lk_api(self):
-        return api.LiveKitAPI(LIVEKIT_URL, LIVEKIT_API_KEY, LIVEKIT_API_SECRET)
+        return api.LiveKitAPI(_http_url(LIVEKIT_URL), LIVEKIT_API_KEY, LIVEKIT_API_SECRET)
 
     async def _async_start(self):
         lkapi = self._lk_api()
         try:
-            await lkapi.room.create_room(api.CreateRoomRequest(name=self.room_name))
+            await lkapi.room.create_room(api.CreateRoomRequest(
+                name=self.room_name, empty_timeout=60, departure_timeout=20,
+            ))
             print(f"[VOICELINK-BRIDGE] room created: {self.room_name}", flush=True)
         finally:
             await lkapi.aclose()

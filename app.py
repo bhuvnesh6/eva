@@ -69,6 +69,8 @@ livekit_bridge.init(
     LIVEKIT_API_SECRET,
     os.environ.get("AGENT_NAME", "eva-agent"),
 )
+if "livekit.cloud" in LIVEKIT_URL:
+    print("[WARN] LIVEKIT_URL still points to LiveKit Cloud, not your local server", flush=True)
 
 # ---------------- Config ----------------
 PORT = int(os.environ.get("PORT", 8420))
