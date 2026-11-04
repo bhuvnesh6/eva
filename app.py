@@ -154,12 +154,27 @@ LIVEKIT_TTS_MODEL = os.environ.get("LIVEKIT_TTS_MODEL", "inworld/inworld-tts-2")
 # Male: abhilash/karun/hitesh. Full/updated list: docs.sarvam.ai (TTS).
 # bulbul:v3 speaker catalog (different from v2's). Male: shubh (default),
 # aditya, rahul, rohan, amit, dev... Female: ritu, priya, neha, pooja...
-VOICE_MALE = S("tts.voice_male", "shubh")
-VOICE_FEMALE = S("tts.voice_female", "priya")
+VOICE_MALE = os.environ.get("EVA_VOICE_MALE") or S("tts.voice_male", "shubh")
+VOICE_FEMALE = os.environ.get("EVA_VOICE_FEMALE") or S("tts.voice_female", "priya")
 # Speaking-rate multiplier passed to the TTS engine (1.0 = normal). Bump
 # slightly if replies feel slow/robotic; not every provider build accepts
 # this kwarg, so it's applied with a fallback wherever it's used below.
 TTS_SPEED = float(S("tts.speed", 1.0))
+
+_SPEAKER_RE = re.compile(r"^[a-z0-9_]{2,40}$")
+
+
+def pick_voice(agent: dict) -> str:
+    """cloned voice > speaker chosen in the Pravah dashboard > default voice for the gender."""
+    agent = agent or {}
+    cloned = (agent.get("cloned_voice_id") or "").strip()
+    if cloned:
+        return cloned
+    sp = (agent.get("speaker") or "").strip().lower()
+    if _SPEAKER_RE.match(sp):
+        return sp
+    return VOICE_MALE if agent.get("gender") == "male" else VOICE_FEMALE
+
 
 MAX_HISTORY_MESSAGES = 16
 
@@ -875,7 +890,7 @@ class EvaSession:
         agent_gender = agent.get("gender") if agent.get("gender") in ("male", "female") else "female"
         self.gender = agent_gender
         # cloned voice (svc-...) wins; otherwise the default voice for the gender
-        self.voice_name = (agent.get("cloned_voice_id") or "").strip() or (VOICE_MALE if agent_gender == "male" else VOICE_FEMALE)
+        self.voice_name = pick_voice(agent)
 
         self.max_duration_secs = int(agent.get("max_duration_secs") or 0) or None
         self.min_duration_secs = int(agent.get("min_duration_secs") or 0) or None
@@ -3742,7 +3757,7 @@ def _prepare_inbound_greeting(agent: dict, codec: str = None):
     if line and SPEAKABLE_RE.search(line) and SARVAM_API_KEY:
         try:
             lang = agent.get("language") if agent.get("language") in SUPPORTED_LANGUAGES else "hi"
-            voice = VOICE_MALE if agent.get("gender") == "male" else VOICE_FEMALE
+            voice = pick_voice(agent)
             pcm, sr = sarvam_tts_synthesize(line, lang, voice, VOICELINK_RATE)
             if sr != VOICELINK_RATE:
                 pcm, _ = audioop.ratecv(pcm, 2, 1, sr, VOICELINK_RATE, None)
@@ -4357,7 +4372,7 @@ def _prepare_outbound_greeting(agent: dict, lead: dict, codec: str = None):
     if line and SPEAKABLE_RE.search(line) and SARVAM_API_KEY:
         try:
             lang = agent.get("language") if agent.get("language") in SUPPORTED_LANGUAGES else "hi"
-            voice = VOICE_MALE if agent.get("gender") == "male" else VOICE_FEMALE
+            voice = pick_voice(agent)
             pcm, sr = sarvam_tts_synthesize(line, lang, voice, VOICELINK_RATE)
             if sr != VOICELINK_RATE:
                 pcm, _ = audioop.ratecv(pcm, 2, 1, sr, VOICELINK_RATE, None)

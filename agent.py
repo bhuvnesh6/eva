@@ -85,8 +85,8 @@ EVA_API_SECRET = os.environ.get("EVA_API_SECRET", "")
 PRAVAAH_API_BASE_URL = os.environ.get("PRAVAAH_API_BASE_URL", "").rstrip("/")
 
 GLOBAL_TTS_MODEL = os.environ.get("GLOBAL_TTS_MODEL", "inworld/inworld-tts-2")
-VOICE_MALE = S("tts.voice_male", "shubh")
-VOICE_FEMALE = S("tts.voice_female", "priya")
+VOICE_MALE = os.environ.get("EVA_VOICE_MALE") or S("tts.voice_male", "shubh")
+VOICE_FEMALE = os.environ.get("EVA_VOICE_FEMALE") or S("tts.voice_female", "priya")
 TTS_SPEED = max(0.8, min(1.4, float(S("tts.speed", 1.0))))
 
 # Sentence end = . ! ? । or newline, but NOT the dot inside numbers ("1.5 crore", "2.5 BHK"),
@@ -1606,7 +1606,10 @@ async def entrypoint(ctx: JobContext) -> None:
     print(f"[EVA-DEBUG] FULL lead for call_id={call_id}: {json.dumps(lead, default=str)}", flush=True)
     print(f"[EVA-DEBUG] FULL meeting for call_id={call_id}: {json.dumps(meeting, default=str)}", flush=True)
 
-    voice = VOICE_MALE if agent_cfg.get("gender") == "male" else VOICE_FEMALE
+    _sp = (agent_cfg.get("speaker") or "").strip().lower()
+    voice = _sp if re.fullmatch(r"[a-z0-9_]{2,40}", _sp) else (
+     VOICE_MALE if agent_cfg.get("gender") == "male" else VOICE_FEMALE
+     )
     _lang0 = agent_cfg.get("language") if agent_cfg.get("language") in SUPPORTED_LANGUAGES else "hi"
     _clone_voice_id = (agent_cfg.get("cloned_voice_id") or "").strip()
     if _clone_voice_id:
