@@ -161,12 +161,33 @@ VOICE_FEMALE = os.environ.get("EVA_VOICE_FEMALE") or S("tts.voice_female", "priy
 # this kwarg, so it's applied with a fallback wherever it's used below.
 TTS_SPEED = float(S("tts.speed", 1.0))
 
+# ---------------- TTS provider switch: "sarvam" | "gemini" (set TTS_PROVIDER in .env) ----------------
+TTS_PROVIDER = os.environ.get("TTS_PROVIDER", "sarvam").strip().lower()
+if TTS_PROVIDER not in ("sarvam", "gemini"):
+    TTS_PROVIDER = "sarvam"
+GEMINI_TTS_MODEL = os.environ.get("GEMINI_TTS_MODEL", "gemini-3.8-flash-tts")
+GEMINI_VOICE_MALE = os.environ.get("GEMINI_VOICE_MALE", "Puck")
+GEMINI_VOICE_FEMALE = os.environ.get("GEMINI_VOICE_FEMALE", "Kore")
+GEMINI_TTS_STYLE = os.environ.get("GEMINI_TTS_STYLE", "").strip()
+print(f"[TTS] provider={TTS_PROVIDER}", flush=True)
+
 _SPEAKER_RE = re.compile(r"^[a-z0-9_]{2,40}$")
 
 
+def _clone_voice_id(agent: dict) -> str:
+    """Sarvam cloned voice id. Ignored when TTS_PROVIDER=gemini (Gemini has no Sarvam clones)."""
+    if TTS_PROVIDER == "gemini":
+        return ""
+    return ((agent or {}).get("cloned_voice_id") or "").strip()
+
+
 def pick_voice(agent: dict) -> str:
-    """cloned voice > speaker chosen in the Pravah dashboard > default voice for the gender."""
+    """sarvam: cloned voice > speaker chosen in the Pravah dashboard > default voice for the gender.
+    gemini: agent.gemini_voice (optional) > GEMINI_VOICE_MALE / GEMINI_VOICE_FEMALE by gender."""
     agent = agent or {}
+    if TTS_PROVIDER == "gemini":
+        gv = (agent.get("gemini_voice") or "").strip()
+        return gv or (GEMINI_VOICE_MALE if agent.get("gender") == "male" else GEMINI_VOICE_FEMALE)
     cloned = (agent.get("cloned_voice_id") or "").strip()
     if cloned:
         return cloned
@@ -327,6 +348,8 @@ def check_missing_keys():
     else:
         checks.append(("GROQ_API_KEY", GROQ_API_KEY))
     checks.append(("SARVAM_API_KEY", SARVAM_API_KEY))
+    if TTS_PROVIDER == "gemini" and LLM_PROVIDER != "gemini":
+        checks.append(("GEMINI_API_KEY", GEMINI_API_KEY))
     return [n for n, v in checks if not v]
 # ---------------- Twilio (phone call) config ----------------
 PHONE_RATE = 8000               # Twilio Media Streams is fixed at 8kHz mu-law
@@ -715,7 +738,88 @@ def _stream_livekit_tts(tts_client, text, lang):
             raise item
         yield item
 
+# ---------------- Gemini TTS (used when TTS_PROVIDER=gemini) ----------------
+GEMINI_SRC_RATE = 24000      # Gemini streaming default: headerless PCM16 mono @ 24 kHz
+_gemini_client = None
+_gemini_client_lock = threading.Lock()
+_gemini_style_disabled = False
+
+
+def _get_gemini_client():
+    global _gemini_client
+    if _gemini_client is None:
+        with _gemini_client_lock:
+            if _gemini_client is None:
+                from google import genai
+                _gemini_client = genai.Client(api_key=GEMINI_API_KEY, http_options={"api_version": "v1beta"})
+    return _gemini_client
+
+
+def _gemini_tts_chunks(text: str, voice: str):
+    """Yields raw PCM16 mono 24 kHz byte chunks from Gemini streaming TTS (retries once)."""
+    global _gemini_style_disabled
+    client = _get_gemini_client()
+    for attempt in (0, 1):
+        use_style = bool(GEMINI_TTS_STYLE) and not _gemini_style_disabled
+        got = False
+        try:
+            content = {"type": "text", "text": text}
+            if use_style:
+                content["annotations"] = [{"type": "speech_metadata", "style": GEMINI_TTS_STYLE}]
+            stream = client.interactions.create(
+                model=GEMINI_TTS_MODEL,
+                input=[{"type": "user_input", "content": [content]}],
+                response_format={"type": "audio"},
+                generation_config={"speech_config": [{"voice": voice}]},
+                stream=True,
+            )
+            carry = b""
+            for event in stream:
+                if getattr(event, "event_type", "") != "step.delta":
+                    continue
+                d = getattr(event, "delta", None)
+                if d is None or getattr(d, "type", "") != "audio":
+                    continue
+                got = True
+                b = carry + base64.b64decode(d.data)
+                if len(b) % 2:
+                    carry, b = b[-1:], b[:-1]
+                else:
+                    carry = b""
+                if b:
+                    yield b
+            if got:
+                return
+            log("TTS", f"Gemini returned no audio for {text[:40]!r}" + (" - retrying" if attempt == 0 else ""))
+        except Exception as e:
+            if got or attempt == 1:
+                raise
+            msg = str(e).lower()
+            if use_style and ("annotation" in msg or "speech_metadata" in msg or "invalid" in msg or "400" in msg):
+                log("TTS", f"Gemini rejected the style annotation ({e}); disabling style")
+                _gemini_style_disabled = True
+            else:
+                log("TTS", f"Gemini TTS error ({e}); retrying once")
+
+
+def gemini_tts_synthesize(text: str, lang: str, voice: str, sample_rate: int):
+    """Whole sentence in one go -> (pcm16, 24000). Callers resample if they need another rate."""
+    return b"".join(_gemini_tts_chunks(text, voice)), GEMINI_SRC_RATE
+
+
+def _stream_gemini_tts(text: str, lang: str, voice: str, sample_rate: int):
+    for chunk in _gemini_tts_chunks(text, voice):
+        yield chunk, GEMINI_SRC_RATE
+
+
 def sarvam_tts_synthesize(text: str, lang: str, voice: str, sample_rate: int):
+    """Provider switch (TTS_PROVIDER). Name kept so existing callers don't change."""
+    if TTS_PROVIDER == "gemini":
+        return gemini_tts_synthesize(text, lang, voice, sample_rate)
+    return _sarvam_rest_synthesize(text, lang, voice, sample_rate)
+
+
+def _sarvam_rest_synthesize(text: str, lang: str, voice: str, sample_rate: int):
     """One blocking REST call to Sarvam TTS. Returns (pcm16_bytes,
     actual_sample_rate). Sarvam has no TTS websocket/streaming, so this is
     a plain requests.post() - fine since it only ever runs on the per-call
@@ -807,6 +911,14 @@ def _stream_clone_tts(text: str, lang: str, voice_id: str, sample_rate: int):
 
 
 def _stream_sarvam_tts(text: str, lang: str, voice: str, sample_rate: int, chunk_ms: int = 100):
+    """Provider switch (TTS_PROVIDER). Name kept so _tts_loop doesn't change."""
+    if TTS_PROVIDER == "gemini":
+        yield from _stream_gemini_tts(text, lang, voice, sample_rate)
+    else:
+        yield from _stream_sarvam_only(text, lang, voice, sample_rate, chunk_ms)
+
+
+def _stream_sarvam_only(text: str, lang: str, voice: str, sample_rate: int, chunk_ms: int = 100):
     """Same (pcm_bytes, src_rate) generator contract _tts_loop already
     consumes (previously satisfied by _stream_livekit_tts). Sarvam gives us
     the whole sentence in one shot, so we chunk it ourselves afterward -
@@ -4296,7 +4408,7 @@ def _clone_greeting_key(agent: dict, lead: dict):
     line = re.sub(r"\s+([,.!?।])", r"\1", line)
     line = re.sub(r"\s{2,}", " ", line).strip(" ,")
     lang = agent.get("language") if agent.get("language") in SUPPORTED_LANGUAGES else "hi"
-    voice_id = (agent.get("cloned_voice_id") or "").strip()
+    voice_id = _clone_voice_id(agent)
     return (voice_id, lang, line), line, lang, voice_id
 
 
@@ -4354,8 +4466,8 @@ def _get_clone_greeting_pcm(agent: dict, lead: dict, wait_secs: float = 3.0):
 def _prepare_outbound_greeting(agent: dict, lead: dict, codec: str = None):
     """(audio_bytes | None, text) already encoded in the line codec. Pre-recorded opening first
     (cached -> instant), else one quick Sarvam TTS call."""
-    if (agent.get("cloned_voice_id") or "").strip():
-        return None, ""     # cloned voice: the LiveKit agent says the opening line itself, in that voice
+    if _clone_voice_id(agent):
+        return None, ""     # cloned voice (sarvam only): the LiveKit agent says the opening line itself, in that voice
 
     line = render_call_vars(agent.get("opening_line") or "", lead)
     line = re.sub(r"\s+([,.!?।])", r"\1", line)

@@ -89,6 +89,24 @@ VOICE_MALE = os.environ.get("EVA_VOICE_MALE") or S("tts.voice_male", "shubh")
 VOICE_FEMALE = os.environ.get("EVA_VOICE_FEMALE") or S("tts.voice_female", "priya")
 TTS_SPEED = max(0.8, min(1.4, float(S("tts.speed", 1.0))))
 
+# ---------------- TTS provider switch: "sarvam" | "gemini" (set TTS_PROVIDER in .env) ----------------
+import threading
+from concurrent.futures import ThreadPoolExecutor
+
+TTS_PROVIDER = os.environ.get("TTS_PROVIDER", "sarvam").strip().lower()
+if TTS_PROVIDER not in ("sarvam", "gemini"):
+    TTS_PROVIDER = "sarvam"
+GEMINI_TTS_MODEL = os.environ.get("GEMINI_TTS_MODEL", "gemini-3.8-flash-tts")
+GEMINI_VOICE_MALE = os.environ.get("GEMINI_VOICE_MALE", "Puck")
+GEMINI_VOICE_FEMALE = os.environ.get("GEMINI_VOICE_FEMALE", "Kore")
+GEMINI_TTS_STYLE = os.environ.get("GEMINI_TTS_STYLE", "").strip()
+GEMINI_TTS_OUT_RATE = int(os.environ.get("GEMINI_TTS_OUT_RATE", "16000"))
+GEMINI_TTS_THREADS = int(os.environ.get("GEMINI_TTS_THREADS", "32"))
+# Gemini is an LLM-based TTS: very short fragments sound choppy, so the first chunk is a bit longer
+GEMINI_MIN_FIRST_CHUNK_CHARS = int(os.environ.get("GEMINI_MIN_FIRST_CHUNK_CHARS", "30"))
+GEMINI_BATCH_MIN_CHARS = int(os.environ.get("GEMINI_BATCH_MIN_CHARS", "90"))
+logger.info("TTS provider = %s", TTS_PROVIDER)
+
 # Sentence end = . ! ? । or newline, but NOT the dot inside numbers ("1.5 crore", "2.5 BHK"),
 # which used to cut speech in the middle of a number and caused an audible break.
 SENTENCE_END_RE = re.compile(r"([!?।\n]|\.(?!\d)|(?<!\d)\.)")
@@ -862,6 +880,289 @@ class _SarvamChunkedStream(tts.ChunkedStream):
                     logger.warning("Sarvam TTS ws error (%r) - reconnecting once", e)
 
 
+# ======================================================================
+#  Gemini streaming TTS  (active when TTS_PROVIDER=gemini)
+#  Same interface as SarvamWSTTS: open_reply / prewarm / ensure_warm / is_clone /
+#  update_options / synthesize, so EvaAgent.tts_node and AgentSession work unchanged.
+# ======================================================================
+def _gemini_pump(tts_obj, text, cancel, loop, q):
+    """Runs in a worker thread: streams Gemini audio and hands each chunk to the asyncio loop."""
+    def _post(item):
+        try:
+            loop.call_soon_threadsafe(q.put_nowait, item)
+        except RuntimeError:
+            pass          # event loop already closed
+    try:
+        for chunk in tts_obj.stream_pcm(text, cancel):
+            if cancel.is_set():
+                break
+            _post(chunk)
+    except BaseException as e:
+        _post(e)
+    finally:
+        _post(None)
+
+
+class GeminiTTS(tts.TTS):
+    SRC_RATE = 24000      # Gemini streaming default: headerless PCM16 mono @ 24 kHz
+
+    def __init__(self, *, api_key: str, model: str, voice: str, style: str = "", sample_rate: int = 16000):
+        super().__init__(capabilities=tts.TTSCapabilities(streaming=False),
+                         sample_rate=sample_rate, num_channels=1)
+        self._api_key = api_key
+        self._model = model
+        self._voice = voice
+        self._style = style
+        self._client = None
+        self._client_lock = threading.Lock()
+        self._style_disabled = False
+        self.executor = ThreadPoolExecutor(max_workers=GEMINI_TTS_THREADS, thread_name_prefix="gemini-tts")
+
+    @property
+    def model(self) -> str:
+        return self._model
+
+    @property
+    def provider(self) -> str:
+        return "Google"
+
+    @property
+    def is_clone(self) -> bool:
+        return False
+
+    def update_options(self, **_ignored):
+        pass              # language is auto-detected from the text; Sarvam-style options don't apply
+
+    def _get_client(self):
+        if self._client is None:
+            with self._client_lock:
+                if self._client is None:
+                    from google import genai
+                    self._client = genai.Client(api_key=self._api_key, http_options={"api_version": "v1beta"})
+        return self._client
+
+    def prewarm(self):
+        try:
+            asyncio.get_running_loop().run_in_executor(self.executor, self._get_client)
+        except RuntimeError:
+            pass
+
+    def ensure_warm(self):
+        pass
+
+    def stream_pcm(self, text: str, cancel: threading.Event):
+        """BLOCKING generator (runs in a worker thread): yields PCM16 mono 24 kHz chunks. Retries once."""
+        client = self._get_client()
+        for attempt in (0, 1):
+            use_style = bool(self._style) and not self._style_disabled
+            got = False
+            try:
+                content = {"type": "text", "text": text}
+                if use_style:
+                    content["annotations"] = [{"type": "speech_metadata", "style": self._style}]
+                stream = client.interactions.create(
+                    model=self._model,
+                    input=[{"type": "user_input", "content": [content]}],
+                    response_format={"type": "audio"},
+                    generation_config={"speech_config": [{"voice": self._voice}]},
+                    stream=True,
+                )
+                carry = b""
+                for event in stream:
+                    if cancel.is_set():
+                        return
+                    if getattr(event, "event_type", "") != "step.delta":
+                        continue
+                    d = getattr(event, "delta", None)
+                    if d is None or getattr(d, "type", "") != "audio":
+                        continue
+                    got = True
+                    b = carry + base64.b64decode(d.data)
+                    if len(b) % 2:
+                        carry, b = b[-1:], b[:-1]
+                    else:
+                        carry = b""
+                    if b:
+                        yield b
+                if got:
+                    return
+                logger.warning("Gemini TTS returned no audio for %r%s", text[:40],
+                               " - retrying" if attempt == 0 else "")
+            except Exception as e:
+                if got or attempt == 1 or cancel.is_set():
+                    raise
+                msg = str(e).lower()
+                if use_style and ("annotation" in msg or "speech_metadata" in msg
+                                  or "invalid" in msg or "400" in msg):
+                    logger.warning("Gemini rejected the style annotation (%r) - disabling style", e)
+                    self._style_disabled = True
+                else:
+                    logger.warning("Gemini TTS error (%r) - retrying once", e)
+
+    def synthesize(self, text: str, *, conn_options: APIConnectOptions = DEFAULT_API_CONNECT_OPTIONS,
+                   **_ignored) -> "_GeminiChunkedStream":
+        return _GeminiChunkedStream(tts_obj=self, input_text=text, conn_options=conn_options)
+
+    def open_reply(self, out_q: "asyncio.Queue") -> "_GeminiReply":
+        """One whole agent reply = one _GeminiReply."""
+        return _GeminiReply(self, out_q)
+
+    async def aclose(self) -> None:
+        try:
+            self.executor.shutdown(wait=False)
+        except Exception:
+            pass
+        await super().aclose()
+
+
+class _GeminiReply:
+    """ONE whole agent reply. Every sentence handed to send() starts streaming from Gemini immediately
+    (requests run concurrently), but audio frames are pushed to out_q strictly in spoken order, so the
+    reply plays as one continuous stream even though sentence 2 is already being generated."""
+
+    def __init__(self, tts_obj, out_q):
+        self._t = tts_obj
+        self._q = out_q
+        self._loop = None
+        self._cancel = threading.Event()
+        self._pending = asyncio.Queue()       # per-sentence audio queues, in spoken order (None = no more)
+        self._drainer = None
+        self._tasks = set()
+        self._ended = False
+        self._chars = 0
+        self._t_send = None
+        self.started = False
+        self.got_audio = False
+
+    def _finish(self):
+        if self._ended:
+            return
+        self._ended = True
+        self._cancel.set()                    # stops any worker thread still streaming
+        for t in list(self._tasks):
+            t.cancel()
+        self._q.put_nowait(None)              # tells tts_node the stream is over
+
+    async def start(self, language: str = "", pace: float = 1.0):
+        self._loop = asyncio.get_running_loop()
+        self.started = True
+        self._drainer = asyncio.create_task(self._drain())
+
+    async def send(self, text: str):
+        if self._ended or self._cancel.is_set():
+            return
+        if self._t_send is None:
+            self._t_send = time.monotonic()
+        self._chars += len(text)
+        buf: asyncio.Queue = asyncio.Queue()
+        self._pending.put_nowait(buf)
+        task = asyncio.create_task(self._fetch(text, buf))
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
+
+    async def _fetch(self, text: str, buf: "asyncio.Queue"):
+        await self._loop.run_in_executor(
+            self._t.executor, _gemini_pump, self._t, text, self._cancel, self._loop, buf
+        )
+
+    def end_input(self):
+        """No more sentences are coming."""
+        if self._ended:
+            return
+        if self._drainer is None:
+            self._finish()
+        else:
+            self._pending.put_nowait(None)
+
+    def abort(self):
+        """Caller barged in / reply cancelled."""
+        if self._ended:
+            return
+        self._cancel.set()
+        for t in list(self._tasks):
+            t.cancel()
+        if self._drainer is not None and not self._drainer.done():
+            self._drainer.cancel()
+        self._finish()
+
+    async def _drain(self):
+        t = self._t
+        frame_bytes = max(2, int(t.sample_rate * 0.04) * 2)       # 40 ms frames
+        try:
+            while True:
+                buf = await self._pending.get()
+                if buf is None:
+                    break
+                rs_state = None
+                while True:
+                    item = await buf.get()
+                    if item is None:
+                        break
+                    if isinstance(item, BaseException):
+                        logger.warning("Gemini TTS sentence failed: %r", item)
+                        break
+                    b = item
+                    if t.SRC_RATE != t.sample_rate:
+                        b, rs_state = audioop.ratecv(b, 2, 1, t.SRC_RATE, t.sample_rate, rs_state)
+                    for i in range(0, len(b), frame_bytes):
+                        piece = b[i:i + frame_bytes]
+                        self._q.put_nowait(rtc.AudioFrame(
+                            data=piece, sample_rate=t.sample_rate, num_channels=1,
+                            samples_per_channel=len(piece) // 2,
+                        ))
+                    if b and not self.got_audio:
+                        self.got_audio = True
+                        if TTS_TIMING_LOG and self._t_send:
+                            logger.info("TTS-TIMING Gemini FIRST AUDIO %.0f ms after text was sent (%d chars)",
+                                        (time.monotonic() - self._t_send) * 1000, self._chars)
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            logger.warning("Gemini TTS reply stream broke: %r", e)
+        finally:
+            self._finish()
+
+
+class _GeminiChunkedStream(tts.ChunkedStream):
+    """Fallback path used by the framework's own synthesize() calls (e.g. session.say without a custom tts_node)."""
+
+    def __init__(self, *, tts_obj: GeminiTTS, input_text: str, conn_options: APIConnectOptions):
+        super().__init__(tts=tts_obj, input_text=input_text, conn_options=conn_options)
+
+    async def _run(self, output_emitter: tts.AudioEmitter) -> None:
+        t = self._tts
+        text = (self._input_text or "").strip()
+        output_emitter.initialize(request_id=utils.shortuuid(), sample_rate=t.sample_rate,
+                                  num_channels=1, mime_type="audio/pcm")
+        if not text:
+            return
+        loop = asyncio.get_running_loop()
+        q: asyncio.Queue = asyncio.Queue()
+        cancel = threading.Event()
+        fut = loop.run_in_executor(t.executor, _gemini_pump, t, text, cancel, loop, q)
+        rs_state = None
+        got = False
+        try:
+            while True:
+                item = await q.get()
+                if item is None:
+                    break
+                if isinstance(item, BaseException):
+                    if got:
+                        logger.warning("Gemini TTS broke mid-sentence: %r", item)
+                        break
+                    raise APIConnectionError(f"Gemini TTS failed: {item!r}") from item
+                b = item
+                if t.SRC_RATE != t.sample_rate:
+                    b, rs_state = audioop.ratecv(b, 2, 1, t.SRC_RATE, t.sample_rate, rs_state)
+                if b:
+                    output_emitter.push(b)
+                    got = True
+            output_emitter.flush()
+        finally:
+            cancel.set()
+
+
 def _build_stt(language):
     """Sarvam saaras:v3-realtime over websocket. en / hi / auto agents are LOCKED to hi-IN (handles
     Hindi + English code-mix) because 'unknown' auto-detect was what produced the Telugu/Bengali/
@@ -1153,6 +1454,12 @@ class EvaAgent(Agent):
         if _clone and CLONE_SINGLE_SHOT:
             # never flush early: everything is collected and sent once, by _flush() at the end of the reply
             _min_first = _batch_min = 10 ** 9
+            _early_comma = False
+        elif TTS_PROVIDER == "gemini":
+            # Gemini: no comma-splitting of the first sentence (short fragments sound choppy);
+            # later sentences already stream concurrently inside _GeminiReply
+            _min_first = GEMINI_MIN_FIRST_CHUNK_CHARS
+            _batch_min = GEMINI_BATCH_MIN_CHARS
             _early_comma = False
         else:
             _min_first = CLONE_MIN_FIRST_CHUNK_CHARS if _clone else MIN_FIRST_CHUNK_CHARS
@@ -1606,25 +1913,43 @@ async def entrypoint(ctx: JobContext) -> None:
     print(f"[EVA-DEBUG] FULL lead for call_id={call_id}: {json.dumps(lead, default=str)}", flush=True)
     print(f"[EVA-DEBUG] FULL meeting for call_id={call_id}: {json.dumps(meeting, default=str)}", flush=True)
 
-    _sp = (agent_cfg.get("speaker") or "").strip().lower()
-    voice = _sp if re.fullmatch(r"[a-z0-9_]{2,40}", _sp) else (
-     VOICE_MALE if agent_cfg.get("gender") == "male" else VOICE_FEMALE
-     )
     _lang0 = agent_cfg.get("language") if agent_cfg.get("language") in SUPPORTED_LANGUAGES else "hi"
-    _clone_voice_id = (agent_cfg.get("cloned_voice_id") or "").strip()
-    if _clone_voice_id:
-        logger.info("call_id=%r using CLONED voice %s", call_id, _clone_voice_id)
-    global_tts = SarvamWSTTS(
-        api_key=SARVAM_API_KEY,
-        voice_id=_clone_voice_id,
-        model=SARVAM_TTS_MODEL,
-        speaker=voice,
-        language_code=_sarvam_lang_code(_lang0),   # same language the opening line will use -> no reconnect
-        pace=TTS_SPEED,
-        temperature=SARVAM_TTS_TEMPERATURE,
-        sample_rate=SARVAM_TTS_SAMPLE_RATE,
-    )
-    global_tts.prewarm()   # opens the Sarvam TTS websocket now, not on the first sentence
+    if TTS_PROVIDER == "gemini":
+        # Sarvam speaker names / cloned voices don't exist on Gemini -> use Gemini voices by gender
+        _clone_voice_id = ""
+        if (agent_cfg.get("cloned_voice_id") or "").strip():
+            logger.warning("call_id=%r agent has a Sarvam cloned voice, ignored because TTS_PROVIDER=gemini", call_id)
+        voice = (agent_cfg.get("gemini_voice") or "").strip() or (
+            GEMINI_VOICE_MALE if agent_cfg.get("gender") == "male" else GEMINI_VOICE_FEMALE
+        )
+        logger.info("call_id=%r TTS = Gemini (%s, voice=%s)", call_id, GEMINI_TTS_MODEL, voice)
+        global_tts = GeminiTTS(
+            api_key=GEMINI_API_KEY,
+            model=GEMINI_TTS_MODEL,
+            voice=voice,
+            style=GEMINI_TTS_STYLE,
+            sample_rate=GEMINI_TTS_OUT_RATE,
+        )
+        global_tts.prewarm()   # builds the Gemini client now, not on the first sentence
+    else:
+        _sp = (agent_cfg.get("speaker") or "").strip().lower()
+        voice = _sp if re.fullmatch(r"[a-z0-9_]{2,40}", _sp) else (
+         VOICE_MALE if agent_cfg.get("gender") == "male" else VOICE_FEMALE
+         )
+        _clone_voice_id = (agent_cfg.get("cloned_voice_id") or "").strip()
+        if _clone_voice_id:
+            logger.info("call_id=%r using CLONED voice %s", call_id, _clone_voice_id)
+        global_tts = SarvamWSTTS(
+            api_key=SARVAM_API_KEY,
+            voice_id=_clone_voice_id,
+            model=SARVAM_TTS_MODEL,
+            speaker=voice,
+            language_code=_sarvam_lang_code(_lang0),   # same language the opening line will use -> no reconnect
+            pace=TTS_SPEED,
+            temperature=SARVAM_TTS_TEMPERATURE,
+            sample_rate=SARVAM_TTS_SAMPLE_RATE,
+        )
+        global_tts.prewarm()   # opens the Sarvam TTS websocket now, not on the first sentence
 
     # Pre-recorded opening line: start downloading NOW (in parallel with session
     # setup) so it's ready the instant on_enter runs.

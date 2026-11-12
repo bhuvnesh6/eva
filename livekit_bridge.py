@@ -242,9 +242,16 @@ class VoiceLinkBridge:
         if not greeting_audio:
             self.greeting_done.set()
 
-        _is_clone = bool(((agent_cfg or {}).get("cloned_voice_id") or "").strip())
-        self._play_prebuffer_ms = CLONE_PLAY_PREBUFFER_MS if _is_clone else PLAY_PREBUFFER_MS
-        self._silence_hang_ms = CLONE_SILENCE_HANG_MS if _is_clone else AGENT_SILENCE_HANG_MS
+        _tts_provider = os.environ.get("TTS_PROVIDER", "sarvam").strip().lower()
+        if _tts_provider == "gemini":
+            # Gemini: bigger jitter buffer (HTTP streaming is burstier than Sarvam's websocket)
+            # and longer kept pauses so natural breaths/commas aren't clipped
+            self._play_prebuffer_ms = int(os.environ.get("GEMINI_PLAY_PREBUFFER_MS", "120"))
+            self._silence_hang_ms = int(os.environ.get("GEMINI_SILENCE_HANG_MS", "500"))
+        else:
+            _is_clone = bool(((agent_cfg or {}).get("cloned_voice_id") or "").strip())
+            self._play_prebuffer_ms = CLONE_PLAY_PREBUFFER_MS if _is_clone else PLAY_PREBUFFER_MS
+            self._silence_hang_ms = CLONE_SILENCE_HANG_MS if _is_clone else AGENT_SILENCE_HANG_MS
         self._dbg = bytearray() if os.environ.get("EVA_DEBUG_SAVE_GATED") == "1" else None
         self._agent_joined = False
         self._hangup_flag = False
