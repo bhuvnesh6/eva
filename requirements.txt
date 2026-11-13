@@ -3,9 +3,13 @@ flask-sock==0.7.0
 gunicorn==22.0.0
 gevent==24.2.1
 python-dotenv==1.0.1
-httpx==0.27.2
+# was httpx==0.27.2 -> google-genai needs httpx 0.28+, the old pin will conflict
+httpx>=0.28.1,<1.0
 numpy==1.26.4
 requests==2.32.3
+
+# Gemini TTS (new). Interactions API is recent, so keep this up to date: pip install -U google-genai
+google-genai
 
 # Telephony / audio
 sounddevice>=0.5
