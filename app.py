@@ -3210,6 +3210,45 @@ def api_place_call_voicelink():
     log("MAIN", f"Outbound VoiceLink call requested: call_id={call_id} -> {customer_number} (did={did_number}, mode={call_mode})")
     return jsonify({"ok": True, "call_sid": queue_id or call_id})
 
+_MISSED_REPORTED = {}
+_missed_reported_lock = threading.Lock()
+
+
+def report_missed_inbound_call(payload: dict):
+    """Tells Pravah that someone dialed our DID but the call never reached the agent, so Pravah can
+    record it, notify the owner and schedule an outbound callback."""
+    if not PRAVAAH_API_BASE_URL or not EVA_API_SECRET:
+        return
+    from_number = str(payload.get("from") or "")
+    did_number = str(payload.get("to") or "")
+    if not did_number:
+        return
+    ref = str(payload.get("id") or payload.get("callSid") or payload.get("call_sid") or "")
+    key = ref or f"{_last10(from_number)}:{_last10(did_number)}"
+    now = time.time()
+    with _missed_reported_lock:
+        for k in [k for k, ts in _MISSED_REPORTED.items() if now - ts > 600]:
+            _MISSED_REPORTED.pop(k, None)
+        if key in _MISSED_REPORTED:
+            return                      # call.failed + call.ended for the same call -> report once
+        _MISSED_REPORTED[key] = now
+    reason = str(payload.get("hangupReason") or payload.get("hangupCause") or payload.get("callStatus")
+                 or payload.get("status") or "call ended before it was answered")
+    body = {"did_number": did_number, "from_number": from_number, "provider_call_ref": ref, "reason": reason}
+    for attempt in range(3):
+        try:
+            r = requests.post(
+                f"{PRAVAAH_API_BASE_URL}/api/eva-webhook/missed-inbound-call",
+                headers={"X-Eva-Secret": EVA_API_SECRET, "Content-Type": "application/json"},
+                json=body, timeout=10,
+            )
+            log("VOICELINK", f"missed inbound reported -> Pravah HTTP {r.status_code} {r.text[:160]}")
+            if r.status_code < 500:
+                return
+        except Exception as e:
+            log("VOICELINK", f"missed inbound report failed (try {attempt + 1}): {e}")
+        time.sleep(2)
+
 @app.route("/api/voicelink/webhook/<call_id>", methods=["POST"])
 def voicelink_webhook(call_id):
     payload = request.get_json(silent=True) or {}
@@ -3229,11 +3268,14 @@ def voicelink_webhook(call_id):
     if not re.fullmatch(r"[0-9a-f]{24}", call_id or ""):
         mapped = _lookup_inbound_call(payload)
         if not mapped:
-            if payload.get("direction") == "inbound" and (event == "call.failed" or str(payload.get("status") or "").lower() == "failed"):
-                log("VOICELINK", f"INBOUND CALL REJECTED BY VOICELINK before Eva answered: from={payload.get('from')} "
-                                 f"to={payload.get('to')} reason={payload.get('hangupReason') or payload.get('hangupCause')} "
+            if event in ("call.failed", "call.ended", "call.completed") and str(payload.get("direction") or "inbound").lower() != "outbound":
+                log("VOICELINK", f"INBOUND CALL NOT HANDLED BY EVA: from={payload.get('from')} to={payload.get('to')} "
+                                 f"event={event} reason={payload.get('hangupReason') or payload.get('hangupCause')} "
                                  f"sip={payload.get('sipStatus')}. If there is NO 'WS handshake' line just before this, VoiceLink "
-                                 "never opened our websocket -> fix the inbound bot / websocket URL / channels for this DID in the VoiceLink panel.")
+                                 "never opened our websocket -> fix the inbound bot / websocket URL / channels for this DID in the VoiceLink panel. "
+                                 "Reporting it to Pravah as a MISSED call (callback will be scheduled).")
+                threading.Thread(target=report_missed_inbound_call, args=(dict(payload),),
+                                 daemon=True, name="MissedInbound").start()
             return jsonify({"received": True})   # e.g. call.initiated - websocket not connected yet
         log("VOICELINK", f"inbound webhook mapped via id/number -> call_id={mapped}")
         call_id = mapped
@@ -3827,29 +3869,44 @@ def _lookup_inbound_call(payload):
 
 
 def fetch_inbound_call_context(did_number, from_number, provider_call_ref=""):
-    """Asks Pravah which agent owns this DID; Pravah also creates the lead + call record."""
+    """Asks Pravah which agent owns this DID; Pravah also creates the lead + call record.
+    One quick retry on network errors / 5xx so a hiccup never drops a live caller."""
     if not PRAVAAH_API_BASE_URL or not EVA_API_SECRET:
-        return None, "Eva is not configured to talk to PravaahAI"
-    try:
-        resp = requests.post(
-            f"{PRAVAAH_API_BASE_URL}/api/eva-webhook/inbound-call",
-            headers={"X-Eva-Secret": EVA_API_SECRET, "Content-Type": "application/json"},
-            json={"did_number": did_number, "from_number": from_number,
-                  "provider": "voicelink", "provider_call_ref": provider_call_ref},
-            timeout=8,
-        )
-        data = resp.json()
-        if resp.status_code >= 400:
-            return None, data.get("error", f"HTTP {resp.status_code}")
-        return data, None
-    except Exception as e:
-        return None, str(e)
+        return None, "Eva is not configured to talk to PravaahAI (PRAVAAH_API_BASE_URL / EVA_API_SECRET)"
+    last_err = "unknown error"
+    for attempt in (1, 2):
+        try:
+            resp = requests.post(
+                f"{PRAVAAH_API_BASE_URL}/api/eva-webhook/inbound-call",
+                headers={"X-Eva-Secret": EVA_API_SECRET, "Content-Type": "application/json"},
+                json={"did_number": did_number, "from_number": from_number,
+                      "provider": "voicelink", "provider_call_ref": provider_call_ref},
+                timeout=8,
+            )
+            try:
+                data = resp.json()
+            except ValueError:
+                data = {}
+            if resp.status_code >= 500 and attempt == 1:
+                last_err = f"HTTP {resp.status_code}"
+                time.sleep(0.4)
+                continue
+            if resp.status_code >= 400:
+                return None, data.get("error", f"HTTP {resp.status_code}")
+            return data, None
+        except Exception as e:
+            last_err = str(e)
+            if attempt == 1:
+                time.sleep(0.4)
+    return None, last_err
+
+
+_INBOUND_GREETING_PCM = {}   # (line, lang, voice) -> linear16 mono @ VOICELINK_RATE
 
 
 def _prepare_inbound_greeting(agent: dict, codec: str = None):
-    """Returns (audio_bytes | None, text) already encoded in the line's codec. Prefers the
-    agent's pre-recorded opening audio (instant, cached after the first call); falls back
-    to one quick Sarvam TTS call."""
+    """Returns (audio_bytes | None, text) already encoded in the line's codec. Pravah sends a proper
+    'thank you for calling' line for incoming calls; it is synthesized once and cached."""
     if (agent.get("cloned_voice_id") or "").strip():
         return None, ""     # cloned voice: the LiveKit agent says the opening line itself, in that voice
 
@@ -3870,9 +3927,15 @@ def _prepare_inbound_greeting(agent: dict, codec: str = None):
         try:
             lang = agent.get("language") if agent.get("language") in SUPPORTED_LANGUAGES else "hi"
             voice = pick_voice(agent)
-            pcm, sr = sarvam_tts_synthesize(line, lang, voice, VOICELINK_RATE)
-            if sr != VOICELINK_RATE:
-                pcm, _ = audioop.ratecv(pcm, 2, 1, sr, VOICELINK_RATE, None)
+            key = (line, lang, voice)
+            pcm = _INBOUND_GREETING_PCM.get(key)
+            if pcm is None:
+                pcm, sr = sarvam_tts_synthesize(line, lang, voice, VOICELINK_RATE)
+                if sr != VOICELINK_RATE:
+                    pcm, _ = audioop.ratecv(pcm, 2, 1, sr, VOICELINK_RATE, None)
+                if len(_INBOUND_GREETING_PCM) > 50:
+                    _INBOUND_GREETING_PCM.clear()
+                _INBOUND_GREETING_PCM[key] = pcm
             return _ivr_encode(pcm, codec), line
         except Exception as e:
             log("INBOUND", f"greeting TTS fallback failed: {e}")
@@ -3930,8 +3993,17 @@ def _run_voicelink_inbound(ws, placeholder_id):
                   or start_data.get("stream_sid") or start_data.get("streamSid"))
     call_sid = (start_obj.get("call_sid") or start_obj.get("callSid")
                 or start_data.get("call_sid") or start_data.get("callSid"))
-    from_number = str(start_obj.get("from") or "")
-    to_number = str(start_obj.get("to") or "")
+    def _pick(*keys):
+        for src in (start_obj, start_data):
+            for k in keys:
+                v = src.get(k)
+                if v:
+                    return str(v)
+        return ""
+    from_number = _pick("from", "from_number", "caller")
+    to_number = _pick("to", "to_number", "did_number", "did", "called")
+    if not to_number:
+        log("VOICELINK", "inbound start event carried NO dialed number (DID) - cannot find the agent. Payload logged above.")
     log("VOICELINK", f"inbound start: from={from_number} to={to_number} call_sid={call_sid} payload={str(start_data)[:600]}")
 
     ctx, err = fetch_inbound_call_context(to_number, from_number, call_sid or "")

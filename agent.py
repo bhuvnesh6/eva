@@ -1421,7 +1421,13 @@ class EvaAgent(Agent):
                 _m = re.search(r"CALL SCENARIO:\s*(first|followup|incoming|callback)", _raw)
                 _scn = _m.group(1) if _m else ""
                 _has_ctx = "PAST CONTEXT ABOUT THIS PERSON" in _raw
-                if _scn == "callback":
+                if _scn == "callback" and "MISSED INCOMING CALL" in _raw:
+                    _greet = (
+                        "You are calling this person back because they phoned the business earlier and nobody could "
+                        "take the call. In ONE short sentence greet them by name, say your name, say sorry for missing "
+                        "their call and that you are calling back, and ask how you can help. "
+                    )
+                elif _scn == "callback":
                     _greet = (
                         "You are calling this person back because they asked you to call at this time. In ONE short "
                         "sentence greet them by name, say your name and that you are calling back as they requested, "
