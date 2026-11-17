@@ -632,9 +632,10 @@ sock = Sock(app)
 
 @app.before_request
 def _log_voicelink_ws_attempts():
-    if request.path.startswith("/ws/voicelink/"):
+    if request.path.startswith("/ws/") or (request.headers.get("Upgrade") or "").lower() == "websocket":
         log("VOICELINK", f"WS handshake from {request.headers.get('X-Forwarded-For') or request.remote_addr} "
-                         f"path={request.path} upgrade={request.headers.get('Upgrade')!r}")
+                         f"path={request.path} upgrade={request.headers.get('Upgrade')!r} "
+                         f"ua={request.headers.get('User-Agent')!r}")
 
 # ---------------- LiveKit TTS: sync/async bridge ----------------
 # inference.TTS is async-only; everything else in this file is sync
