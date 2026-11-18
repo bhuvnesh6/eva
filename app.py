@@ -630,10 +630,17 @@ app = Flask(__name__, template_folder="templates", static_folder="static", stati
 sock = Sock(app)
 
 
+_RECENT_WS_HANDSHAKES = collections.deque(maxlen=10)
+
+
 @app.before_request
 def _log_voicelink_ws_attempts():
     if request.path.startswith("/ws/") or (request.headers.get("Upgrade") or "").lower() == "websocket":
-        log("VOICELINK", f"WS handshake from {request.headers.get('X-Forwarded-For') or request.remote_addr} "
+        _ip = request.headers.get('X-Forwarded-For') or request.remote_addr
+        _RECENT_WS_HANDSHAKES.append({
+            "at": time.strftime("%H:%M:%S"), "ip": _ip, "path": request.path,
+        })
+        log("VOICELINK", f"WS handshake from {_ip} "
                          f"path={request.path} upgrade={request.headers.get('Upgrade')!r} "
                          f"ua={request.headers.get('User-Agent')!r}")
 
@@ -3250,6 +3257,72 @@ def report_missed_inbound_call(payload: dict):
             log("VOICELINK", f"missed inbound report failed (try {attempt + 1}): {e}")
         time.sleep(2)
 
+
+@app.route("/api/voicelink/ws-selftest", methods=["GET"])
+def voicelink_ws_selftest():
+    """Open https://<host>/api/voicelink/ws-selftest?key=<EVA_API_SECRET>
+    Opens a real websocket to our own inbound URL (the one VoiceLink should use), both through the
+    public URL and directly on localhost, so you can tell app problems from proxy/firewall problems."""
+    import hmac as _hmac
+    key = (request.args.get("key") or request.headers.get("X-Eva-Secret") or "").strip()
+    if not EVA_API_SECRET or not _hmac.compare_digest(key.encode(), EVA_API_SECRET.encode()):
+        return jsonify({"ok": False, "error": "Invalid or missing key"}), 401
+
+    missing = check_missing_keys()
+    report = {
+        "ok": False,
+        "public_base_url": PUBLIC_BASE_URL,
+        "missing_env_keys": missing,
+        "pravaah_configured": bool(PRAVAAH_API_BASE_URL and EVA_API_SECRET),
+        "registered_voicelink_routes": sorted(
+            r.rule for r in app.url_map.iter_rules() if "voicelink" in r.rule
+        ),
+        "tests": {},
+        "hints": [],
+    }
+
+    def _try(name, url):
+        t0 = time.time()
+        try:
+            c = vanisetu_ws_lib.create_connection(url, timeout=8)
+            try:
+                c.send(json.dumps({"event": "connected", "protocol": "Call", "version": "1.0.0"}))
+            finally:
+                try:
+                    c.close()
+                except Exception:
+                    pass
+            report["tests"][name] = {"url": url, "ok": True, "ms": int((time.time() - t0) * 1000)}
+        except Exception as e:
+            report["tests"][name] = {"url": url, "ok": False, "error": f"{type(e).__name__}: {e}"}
+
+    _try("local_app", f"ws://127.0.0.1:{PORT}/ws/voicelink/placeholder")
+    if PUBLIC_BASE_URL:
+        ws_base = PUBLIC_BASE_URL.replace("https://", "wss://").replace("http://", "ws://")
+        _try("public_inbound_url", f"{ws_base}/ws/voicelink/placeholder")
+    else:
+        report["tests"]["public_inbound_url"] = {"ok": False, "error": "PUBLIC_BASE_URL is not set"}
+
+    local_ok = report["tests"].get("local_app", {}).get("ok", False)
+    public_ok = report["tests"].get("public_inbound_url", {}).get("ok", False)
+
+    if not local_ok:
+        report["hints"].append("Websocket fails even on localhost: gunicorn has too few threads (use --threads 50+) "
+                               "or the app is not serving websockets.")
+    elif not public_ok:
+        report["hints"].append("App works locally but not through the public URL: fix the nginx/Cloudflare websocket "
+                               "proxy (proxy_http_version 1.1; Upgrade/Connection headers; long proxy_read_timeout).")
+    else:
+        report["hints"].append("Eva's inbound websocket is reachable. If real inbound calls still show no "
+                               "'WS handshake' line, VoiceLink is not connecting: check that this DID has an "
+                               "inbound bot with this exact WebSocket URL, enough channels, and nothing blocks VoiceLink's IPs.")
+    if missing:
+        report["hints"].append(f"Missing env keys: {', '.join(missing)}")
+
+    report["recent_ws_handshakes"] = list(_RECENT_WS_HANDSHAKES)
+    report["ok"] = bool(local_ok and public_ok and not missing)
+    return jsonify(report)
+
 @app.route("/api/voicelink/webhook/<call_id>", methods=["POST"])
 def voicelink_webhook(call_id):
     payload = request.get_json(silent=True) or {}
@@ -3273,8 +3346,9 @@ def voicelink_webhook(call_id):
                 def _ws_watchdog(p=dict(payload)):
                     if not _lookup_inbound_call(p):
                         log("VOICELINK", f"INBOUND ANSWERED BUT NO WEBSOCKET: VoiceLink answered from={p.get('from')} to={p.get('to')} "
-                                         "but never opened our websocket within 4s. The DID's inbound bot websocket URL is blank, wrong "
-                                         "or unreachable - fix it in the VoiceLink panel (must be wss://<host>/ws/voicelink/placeholder).")
+                                         "but never opened our websocket within 4s. Nothing reached Eva. Check: (1) this DID has an inbound bot "
+                                         "with WebSocket URL wss://<host>/ws/voicelink/placeholder, (2) nginx/firewall/WAF access log for "
+                                         "'/ws/voicelink', (3) run /api/voicelink/ws-selftest?key=<EVA_API_SECRET>.")
                 _wd = threading.Timer(4.0, _ws_watchdog)
                 _wd.daemon = True
                 _wd.start()
@@ -4694,6 +4768,23 @@ def _run_voicelink_outbound_ai(ws, call_id, cfg):
         _arm_finalize_timer(call_id)
         log("VOICELINK", f"Outbound call {call_id} disconnected.")
 
+
+@sock.route("/ws/voicelink")
+def voicelink_ws_bare(ws):
+    _run_voicelink_inbound(ws, "placeholder")
+
+
+@sock.route("/ws/voicelink/")
+def voicelink_ws_bare_slash(ws):
+    _run_voicelink_inbound(ws, "placeholder")
+
+
+@sock.route("/ws/voicelink/<call_id>/<path:rest>")
+def voicelink_ws_extra_path(ws, call_id, rest):
+    # same handler, tolerates e.g. /ws/voicelink/placeholder/anything
+    if re.fullmatch(r"[0-9a-f]{24}", call_id or ""):
+        return
+    _run_voicelink_inbound(ws, call_id)
 
 @sock.route("/ws/voicelink/<call_id>")
 def voicelink_ws(ws, call_id):
