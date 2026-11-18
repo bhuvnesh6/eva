@@ -3269,6 +3269,15 @@ def voicelink_webhook(call_id):
     if not re.fullmatch(r"[0-9a-f]{24}", call_id or ""):
         mapped = _lookup_inbound_call(payload)
         if not mapped:
+            if event == "call.answered" and str(payload.get("direction") or "").lower() == "inbound":
+                def _ws_watchdog(p=dict(payload)):
+                    if not _lookup_inbound_call(p):
+                        log("VOICELINK", f"INBOUND ANSWERED BUT NO WEBSOCKET: VoiceLink answered from={p.get('from')} to={p.get('to')} "
+                                         "but never opened our websocket within 4s. The DID's inbound bot websocket URL is blank, wrong "
+                                         "or unreachable - fix it in the VoiceLink panel (must be wss://<host>/ws/voicelink/placeholder).")
+                _wd = threading.Timer(4.0, _ws_watchdog)
+                _wd.daemon = True
+                _wd.start()
             if event in ("call.failed", "call.ended", "call.completed") and str(payload.get("direction") or "inbound").lower() != "outbound":
                 log("VOICELINK", f"INBOUND CALL NOT HANDLED BY EVA: from={payload.get('from')} to={payload.get('to')} "
                                  f"event={event} reason={payload.get('hangupReason') or payload.get('hangupCause')} "
